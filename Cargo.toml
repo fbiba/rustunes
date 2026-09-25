@@ -7,3 +7,8 @@ license = "MIT"
 repository = "https://github.com/fbiba/rustunes"
 readme = "README.md"
 rust-version = "1.89"
+
+[workspace.dependencies]
+anyhow = "1"
+idevice = { version = "=0.1.68", default-features = false, features = ["usbmuxd", "ring", "syslog_relay", "afc", "heartbeat", "mdns"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "net"] }
