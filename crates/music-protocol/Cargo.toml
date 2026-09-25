@@ -1,0 +1,9 @@
+[package]
+name = "music-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable ATC protocol, media and catalogue mechanisms for the native iPhone Music library"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+rust-version.workspace = true
