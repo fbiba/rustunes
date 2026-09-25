@@ -1,6 +1,7 @@
 //! Bounded AFC copy, status classification, and file observations.
 
 pub mod copy;
+pub mod stat;
 
 /// An `AfcClient` over an in-memory stream and the phone's end of it, so the
 /// primitives' exact requests are checked offline. No device is involved.
