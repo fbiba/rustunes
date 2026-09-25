@@ -5,3 +5,4 @@
 //! authority; callers retain those obligations around every mutating operation.
 
 pub mod afc;
+pub mod trace;
