@@ -15,7 +15,11 @@ default = []
 offline-test-support = []
 
 [dependencies]
+aes.workspace = true
 anyhow.workspace = true
+cbc.workspace = true
+hmac.workspace = true
+sha1.workspace = true
 idevice.workspace = true
 plist.workspace = true
 tokio.workspace = true
@@ -24,4 +28,5 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+clap.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

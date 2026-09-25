@@ -6,5 +6,7 @@
 
 pub mod afc;
 pub mod framing;
+pub mod operations;
+pub mod signing;
 pub mod trace;
 pub mod transfer;
