@@ -8,7 +8,20 @@ repository.workspace = true
 readme = "README.md"
 rust-version.workspace = true
 
+[features]
+default = []
+# Offline test fixtures (in-memory AFC, synthetic catalogues, MPEG frames) for the
+# tests of this crate and of crates built on it; excluded from production builds.
+offline-test-support = []
+
 [dependencies]
 anyhow.workspace = true
 idevice.workspace = true
+plist.workspace = true
 tokio.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
