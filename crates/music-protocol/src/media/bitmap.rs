@@ -115,4 +115,43 @@ pub fn to_jpeg(bytes: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A real picture of `format`: a transparent red pixel and an opaque
+    /// blue one, written by the image crate's own encoder. A GIF gets a
+    /// second, all-blue frame, which conversion leaves out.
+    pub(crate) fn picture(format: Format) -> Vec<u8> {
+        let first = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 0, 0, 0, 255, 255]).unwrap();
+        let mut out = Cursor::new(Vec::new());
+        if format == Format::Gif {
+            let second = image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 0, 255, 255]));
+            image::codecs::gif::GifEncoder::new(&mut out)
+                .encode_frames([first, second].map(image::Frame::new))
+                .unwrap();
+        } else {
+            image::DynamicImage::ImageRgba8(first)
+                .write_to(&mut out, format.image_format())
+                .unwrap();
+        }
+        out.into_inner()
+    }
+
+    #[test]
+    fn converts_the_first_frame_of_each_format_onto_white() {
+        for format in [Format::Gif, Format::Bmp, Format::Tiff] {
+            let bytes = picture(format);
+            assert_eq!(Format::of(&bytes), Some(format));
+            assert_eq!(dimensions(&bytes, format).unwrap(), (2, 1));
+            let jpeg = to_jpeg(&bytes).unwrap();
+            assert_eq!(crate::media::jpeg::dimensions(&jpeg).unwrap(), (2, 1));
+            assert_eq!(to_jpeg(&bytes).unwrap(), jpeg, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn refuses_other_data_and_a_declared_format_it_does_not_hold() {
+        let gif = picture(Format::Gif);
+        assert!(dimensions(&gif, Format::Bmp).is_err());
+        assert!(to_jpeg(&crate::media::png::tests::png(2, 2)).is_err());
+        assert!(to_jpeg(&gif[..gif.len() / 2]).is_err());
+    }
 }
