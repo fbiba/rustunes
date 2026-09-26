@@ -3,6 +3,7 @@
 
 pub mod artwork;
 pub mod bitmap;
+pub mod container;
 pub mod fingerprint;
 pub mod format;
 pub mod pcm;
