@@ -3,6 +3,7 @@
 
 pub mod artwork;
 pub mod bitmap;
+pub mod fingerprint;
 pub mod format;
 pub mod jpeg;
 pub mod png;
