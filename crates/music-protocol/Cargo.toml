@@ -26,6 +26,10 @@ tokio.workspace = true
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+flate2.workspace = true
+image.workspace = true
+jpeg-encoder.workspace = true
+png.workspace = true
 
 [dev-dependencies]
 clap.workspace = true
