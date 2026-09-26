@@ -117,4 +117,63 @@ pub fn inspect(input: &mut (impl Read + Seek), size: u64) -> Result<Layout> {
 pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
+
+    pub(crate) fn streaminfo(rate: u32, channels: u8, bits: u8, samples: u64) -> Vec<u8> {
+        let mut info = vec![0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0];
+        info.push((rate >> 12) as u8);
+        info.push((rate >> 4) as u8);
+        info.push(((rate & 0xf) as u8) << 4 | ((channels - 1) << 1) | ((bits - 1) >> 4));
+        info.push(((bits - 1) & 0xf) << 4 | ((samples >> 32) as u8 & 0xf));
+        info.extend((samples as u32).to_be_bytes());
+        info.extend([7; 16]);
+        info
+    }
+
+    pub(crate) fn flac(comment: &[u8], padding: usize) -> Vec<u8> {
+        let mut out = b"fLaC".to_vec();
+        out.extend([0, 0, 0, 34]);
+        out.extend(streaminfo(44_100, 2, 16, 4096));
+        out.push(4);
+        out.extend(&(comment.len() as u32).to_be_bytes()[1..]);
+        out.extend(comment);
+        out.push(0x81);
+        out.extend(&(padding as u32).to_be_bytes()[1..]);
+        out.extend(vec![0; padding]);
+        out.extend([0xff, 0xf8, 0x69, 0x08]);
+        out.extend((0..400u32).map(|n| n as u8));
+        out
+    }
+
+    #[test]
+    fn reads_streaminfo_and_keeps_identity_across_tags_and_padding() {
+        let a = flac(b"", 0);
+        let b = flac(b"\x00\x00\x00\x00\x01\x00\x00\x00", 100);
+        let la = inspect(&mut Cursor::new(&a), a.len() as u64).unwrap();
+        let lb = inspect(&mut Cursor::new(&b), b.len() as u64).unwrap();
+        assert_eq!(la.encoded.sha256(), lb.encoded.sha256());
+        assert_eq!(
+            (
+                la.encoded.sample_rate,
+                la.encoded.channels,
+                la.encoded.bits_per_sample
+            ),
+            (44_100, 2, 16)
+        );
+        assert_eq!(la.encoded.coded_samples, 4096);
+        assert_eq!(lb.tags[0].kind, TagKind::VorbisComment);
+    }
+
+    #[test]
+    fn refuses_missing_frames_and_late_streaminfo() {
+        let mut no_sync = flac(b"", 0);
+        let at = no_sync.len() - 404;
+        no_sync[at] = 0;
+        assert!(inspect(&mut Cursor::new(&no_sync), no_sync.len() as u64).is_err());
+        let mut late = b"fLaC".to_vec();
+        late.extend([1, 0, 0, 0]);
+        late.extend([0x80, 0, 0, 34]);
+        late.extend(streaminfo(44_100, 2, 16, 4096));
+        late.extend([0xff, 0xf8, 0, 0]);
+        assert!(inspect(&mut Cursor::new(&late), late.len() as u64).is_err());
+    }
 }

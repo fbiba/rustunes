@@ -12,6 +12,7 @@ use crate::media::{fingerprint::EncodedAudio, format::Format};
 
 pub mod aiff;
 pub mod flac;
+pub mod mp4;
 
 pub(crate) const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Tag data a reader may hold in memory (pictures included).
