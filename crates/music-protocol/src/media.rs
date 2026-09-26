@@ -5,6 +5,7 @@ pub mod artwork;
 pub mod bitmap;
 pub mod fingerprint;
 pub mod format;
+pub mod pcm;
 pub mod renditions;
 pub mod timing;
 
