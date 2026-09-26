@@ -5,13 +5,15 @@
 //! accepts one self-contained audio track whose chunks cover one entire `mdat`
 //! payload, in order, without gaps or overlaps. No metadata is normalized.
 
-use anyhow::{Context, Result, ensure};
-use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, Metadata},
     io::{BufReader, Read, Seek, SeekFrom},
     path::Path,
 };
+
+use super::held_source::same_observed_file as same_metadata;
+use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 
 const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BOXES: usize = 128;
@@ -60,6 +62,32 @@ impl EncodedAlac {
         composite.update(self.media_sha256);
         composite.finalize().into()
     }
+}
+
+/// Inspect a bounded regular source without following an accepted symlink.
+/// Metadata is checked before opening, against the opened file, and after the
+/// streamed read. Unix additionally compares device/inode and nanosecond change
+/// times; other platforms use the portable size/modified/created metadata.
+pub fn read(path: &Path) -> Result<SourceFingerprint> {
+    let path_before = fs::symlink_metadata(path).context("reading source path metadata")?;
+    regular(&path_before)?; // Reject FIFO/device/directory/symlink before open.
+    let file = File::open(path).context("opening fingerprint source read-only")?;
+    let opened = file.metadata()?;
+    regular(&opened)?;
+    ensure!(
+        same_metadata(&path_before, &opened)?,
+        "source changed before open"
+    );
+    let mut reader = BufReader::new(file);
+    let result = inspect(&mut reader, opened.len())?;
+    let after = reader.get_ref().metadata()?;
+    let path_after = fs::symlink_metadata(path)?;
+    regular(&path_after)?;
+    ensure!(
+        same_metadata(&opened, &after)? && same_metadata(&opened, &path_after)?,
+        "source changed during fingerprinting"
+    );
+    Ok(result)
 }
 
 fn regular(metadata: &Metadata) -> Result<()> {
@@ -436,4 +464,8 @@ pub(crate) fn u32_at(bytes: &[u8], at: usize) -> Result<u32> {
     Ok(u32::from_be_bytes(value.try_into()?))
 }
 
+#[cfg(test)]
+mod tests;
+
 mod transferred;
+pub use transferred::{EncodedAudio, EncodedIdentity, EncodedMpeg1Layer3, TransferredSource};

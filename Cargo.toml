@@ -18,6 +18,7 @@ hmac = "=0.12.1"
 jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
 image = { version = "=0.25.10", default-features = false, features = ["gif", "bmp", "tiff"] }
 idevice = { version = "=0.1.68", default-features = false, features = ["usbmuxd", "ring", "syslog_relay", "afc", "heartbeat", "mdns"] }
+libc = "=0.2.190"
 plist = "1.8"
 png = { version = "=0.18.1", default-features = false }
 serde = { version = "=1.0.229", features = ["derive"] }

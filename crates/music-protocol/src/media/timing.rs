@@ -305,3 +305,6 @@ fn identity_edit(source: &mut (impl Read + Seek), atom: BoxInfo, full_span: u128
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

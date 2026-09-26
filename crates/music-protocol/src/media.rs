@@ -5,7 +5,10 @@ pub mod artwork;
 pub mod bitmap;
 pub mod fingerprint;
 pub mod format;
-pub mod jpeg;
-pub mod png;
 pub mod renditions;
 pub mod timing;
+
+// Held inputs and codec-specific facts share the same bounded media boundary.
+pub mod held_source;
+pub mod jpeg;
+pub mod png;

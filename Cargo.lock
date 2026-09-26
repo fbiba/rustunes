@@ -692,6 +692,7 @@ dependencies = [
  "idevice",
  "image",
  "jpeg-encoder",
+ "libc",
  "plist",
  "png",
  "serde",
