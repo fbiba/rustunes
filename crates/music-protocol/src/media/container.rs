@@ -13,6 +13,8 @@ use crate::media::{fingerprint::EncodedAudio, format::Format};
 pub mod aiff;
 pub mod flac;
 pub mod mp4;
+pub mod mpeg;
+pub mod wav;
 
 pub(crate) const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Tag data a reader may hold in memory (pictures included).
@@ -77,6 +79,31 @@ pub enum TagKind {
     FlacPicture,
     /// An MP4 `moov` (its `udta/meta/ilst`).
     Mp4Movie,
+}
+
+/// Recognise the container by its first bytes and read it. `None` means none
+/// of these containers (an MPEG-1 stream, an ALAC MP4 or something else).
+pub fn inspect(input: &mut (impl Read + Seek), size: u64) -> Result<Option<Layout>> {
+    ensure!(
+        (12..=MAX_FILE_BYTES).contains(&size),
+        "audio file size outside bounds"
+    );
+    input.seek(SeekFrom::Start(0))?;
+    let mut head = [0; 12];
+    input.read_exact(&mut head)?;
+    Ok(Some(match (&head[..4], &head[4..8], &head[8..12]) {
+        (b"RIFF", _, b"WAVE") => wav::inspect(input, size)?,
+        (b"FORM", _, b"AIFF" | b"AIFC") => aiff::inspect(input, size)?,
+        (b"fLaC", _, _) => flac::inspect(input, size)?,
+        (_, b"ftyp", _) => match mp4::inspect(input, size)? {
+            Some(layout) => layout,
+            None => return Ok(None),
+        },
+        _ => match mpeg::inspect(input, size)? {
+            Some(layout) => layout,
+            None => return Ok(None),
+        },
+    }))
 }
 
 /// SHA-256 of `bytes` bytes at `offset`.
@@ -256,5 +283,67 @@ mod tests {
         let file = File::open(path).unwrap();
         let size = file.metadata().unwrap().len();
         (file, size)
+    }
+
+    #[test]
+    fn reads_every_fixture_format() {
+        for (name, format, rate, channels, bits, tag) in [
+            (
+                "tone-aac.m4a",
+                Format::AacLc,
+                44_100,
+                2,
+                0,
+                TagKind::Mp4Movie,
+            ),
+            (
+                "tone-flac.flac",
+                Format::Flac,
+                44_100,
+                2,
+                16,
+                TagKind::VorbisComment,
+            ),
+            (
+                "tone-wav.wav",
+                Format::Wav,
+                44_100,
+                2,
+                16,
+                TagKind::RiffInfo,
+            ),
+            ("tone-aiff.aif", Format::Aiff, 44_100, 2, 24, TagKind::Id3v2),
+            (
+                "tone-mpeg2.mp3",
+                Format::Mpeg2Layer3,
+                22_050,
+                1,
+                0,
+                TagKind::Id3v2,
+            ),
+        ] {
+            let (mut file, size) = fixture(name);
+            let layout = inspect(&mut file, size).unwrap().unwrap();
+            let e = &layout.encoded;
+            assert_eq!(
+                (e.format, e.sample_rate, e.channels, e.bits_per_sample),
+                (format, rate, channels, bits),
+                "{name}"
+            );
+            assert!(layout.tags.iter().any(|t| t.kind == tag), "{name}");
+            e.validate(size).unwrap();
+        }
+        // FFmpeg's AAC primes 1024 samples and names them in an edit list.
+        let (mut file, size) = fixture("tone-aac.m4a");
+        let aac = inspect(&mut file, size).unwrap().unwrap();
+        assert_eq!(aac.stream.encoder_delay, 1024);
+        assert_eq!(
+            aac.stream.valid_samples(aac.encoded.coded_samples).unwrap(),
+            4410
+        );
+        for name in ["tone-alac.m4a", "tone-mp3-vbr.mp3"] {
+            let (mut file, size) = fixture(name);
+            assert!(inspect(&mut file, size).unwrap().is_none(), "{name}");
+        }
     }
 }

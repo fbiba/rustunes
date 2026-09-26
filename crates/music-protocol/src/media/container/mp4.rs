@@ -492,4 +492,128 @@ mod tests {
         }
         out
     }
+
+    #[test]
+    fn audio_specific_configs() {
+        // AAC-LC 44.1 kHz stereo: 0x12 0x10.
+        assert_eq!(
+            audio_specific_config(&[0x12, 0x10]).unwrap(),
+            AudioConfig {
+                format: Format::AacLc,
+                output_rate: 44_100,
+                channels: Some(2)
+            }
+        );
+        // Explicit HE-AAC: SBR at 44.1 kHz over a 22.05 kHz core.
+        let he = bits(&[(5, 5), (7, 4), (2, 4), (4, 4), (2, 5), (0, 3)]);
+        assert_eq!(
+            audio_specific_config(&he).unwrap(),
+            AudioConfig {
+                format: Format::HeAac,
+                output_rate: 44_100,
+                channels: Some(2)
+            }
+        );
+        // Explicit HE-AAC v2: mono core, two output channels.
+        let v2 = bits(&[(29, 5), (7, 4), (1, 4), (4, 4), (2, 5), (0, 3)]);
+        assert_eq!(audio_specific_config(&v2).unwrap().format, Format::HeAacV2);
+        assert_eq!(audio_specific_config(&v2).unwrap().channels, Some(2));
+        // Backward-compatible signalling after an AAC-LC core.
+        let compatible = bits(&[
+            (2, 5),
+            (7, 4),
+            (2, 4),
+            (0, 3),
+            (0x2b7, 11),
+            (5, 5),
+            (1, 1),
+            (4, 4),
+        ]);
+        let config = audio_specific_config(&compatible).unwrap();
+        assert_eq!((config.format, config.output_rate), (Format::HeAac, 44_100));
+        // xHE-AAC: USAC at 48 kHz stereo.
+        let usac = bits(&[(31, 5), (10, 6), (3, 4), (2, 4), (3, 5), (1, 3), (2, 5)]);
+        let config = audio_specific_config(&usac).unwrap();
+        assert_eq!(
+            (config.format, config.output_rate, config.channels),
+            (Format::Usac, 48_000, Some(2))
+        );
+        // AAC Main and AAC-LD are refused.
+        assert!(audio_specific_config(&bits(&[(1, 5), (4, 4), (2, 4), (0, 3)])).is_err());
+        assert!(audio_specific_config(&bits(&[(23, 5), (4, 4), (2, 4), (0, 3)])).is_err());
+    }
+
+    #[test]
+    fn esds_bit_rates_stay_outside_the_identity() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tone-aac.m4a");
+        let original = std::fs::read(path).unwrap();
+        let read = |bytes: &[u8]| {
+            let mut input = std::io::Cursor::new(bytes);
+            inspect(&mut input, bytes.len() as u64)
+                .unwrap()
+                .unwrap()
+                .encoded
+        };
+        // Object type 0x40, stream type 0x15, buffer size, then the bit rates.
+        let esds = original.windows(4).position(|w| w == b"esds").unwrap();
+        let config = esds
+            + original[esds..]
+                .windows(2)
+                .position(|w| w == [0x40, 0x15])
+                .unwrap();
+        let mut remuxed = original.clone();
+        remuxed[config + 5..config + 13].copy_from_slice(&[0, 3, 0x4f, 0x7a, 0, 3, 0x4f, 0x7a]);
+        assert_ne!(remuxed, original);
+        assert_eq!(read(&remuxed), read(&original));
+    }
+
+    #[test]
+    fn unused_media_bytes_stay_outside_the_identity() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tone-aac.m4a");
+        let original = std::fs::read(path).unwrap();
+        let read = |bytes: &[u8]| {
+            let mut input = std::io::Cursor::new(bytes);
+            inspect(&mut input, bytes.len() as u64)
+                .unwrap()
+                .unwrap()
+                .encoded
+        };
+        let u32_at =
+            |bytes: &[u8], at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        // Two bytes before the first chunk, as exhale writes, and three after
+        // the last: `mdat` grows by five and every chunk moves by two.
+        let mdat = original.windows(4).position(|w| w == b"mdat").unwrap() - 4;
+        let size = u32_at(&original, mdat) as usize;
+        let mut padded = original[..mdat + 8].to_vec();
+        padded.extend([0x7a, 0x32]);
+        padded.extend(&original[mdat + 8..mdat + size]);
+        padded.extend([0, 0, 0]);
+        padded.extend(&original[mdat + size..]);
+        padded[mdat..mdat + 4].copy_from_slice(&(size as u32 + 5).to_be_bytes());
+        let stco = padded.windows(4).position(|w| w == b"stco").unwrap() + 4;
+        for entry in 0..u32_at(&padded, stco + 4) as usize {
+            let at = stco + 8 + entry * 4;
+            let moved = u32_at(&padded, at) + 2;
+            padded[at..at + 4].copy_from_slice(&moved.to_be_bytes());
+        }
+        let (before, after) = (read(&original), read(&padded));
+        assert_eq!(after.audio_offset, before.audio_offset + 2);
+        assert_eq!(after.sha256(), before.sha256());
+    }
+
+    #[test]
+    fn edits_and_descriptors() {
+        let mut v0 = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        v0.extend(441_000u32.to_be_bytes());
+        v0.extend(1024u32.to_be_bytes());
+        v0.extend(0x0001_0000u32.to_be_bytes());
+        assert_eq!(edit(&v0).unwrap(), (441_000, 1024));
+        let mut empty = v0.clone();
+        empty[12..16].copy_from_slice(&(-1i32).to_be_bytes());
+        assert!(edit(&empty).is_err());
+        let (tag, payload, rest) = descriptor(&[5, 0x80, 0x80, 0x02, 0x12, 0x10, 6]).unwrap();
+        assert_eq!((tag, payload, rest), (5, &[0x12, 0x10][..], &[6][..]));
+    }
 }
