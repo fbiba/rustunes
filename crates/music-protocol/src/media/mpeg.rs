@@ -17,6 +17,7 @@ use std::{
 };
 
 pub mod gapless;
+pub mod projection;
 pub mod timing;
 
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -122,6 +123,100 @@ pub struct Picture {
     /// The JPEG's markers or the PNG's chunks were checked (not a decode).
     pub structure_verified: bool,
     pub image_decode_verified: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Source {
+    /// The format's name (`mpeg1-layer3`, `aac-lc`, `flac`, ...).
+    pub codec: &'static str,
+    pub fingerprint: Fingerprint,
+    /// MPEG-1 Layer III frame timing; `None` for every other format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<timing::TimingEvidence>,
+    /// Every other format's stream; `None` for MPEG-1 Layer III.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<crate::media::audio_source::Stream>,
+    /// The timing and gapless fields Apple's sync sends for an MPEG Layer III
+    /// stream; `None` for every other format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apple_timing: Option<gapless::AppleTiming>,
+    pub metadata: Tags,
+    pub id3_version: Option<u8>,
+    pub frames: Vec<FrameEvidence>,
+    pub artwork: Vec<Picture>,
+    pub audio_offset: u64,
+    pub trailing_tag_bytes: u32,
+}
+impl Source {
+    pub fn format(&self) -> crate::media::format::Format {
+        self.stream
+            .as_ref()
+            .map_or(crate::media::format::Format::Mpeg1Layer3, |s| s.format)
+    }
+    /// The frame timing of an MPEG-1 Layer III source.
+    pub fn frame_timing(&self) -> Result<&timing::TimingEvidence> {
+        self.timing
+            .as_ref()
+            .context("the source is not MPEG-1 Layer III")
+    }
+    pub fn transferred_identity(&self) -> Result<crate::media::fingerprint::TransferredSource> {
+        fn digest(s: &str) -> Result<[u8; 32]> {
+            ensure!(
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "invalid MP3 digest"
+            );
+            let mut out = [0; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
+            }
+            Ok(out)
+        }
+        if let Some(stream) = &self.stream {
+            ensure!(
+                self.codec == stream.format.name()
+                    && self.timing.is_none()
+                    && self.fingerprint.audio.format == "encoded-audio",
+                "audio inspection identity differs"
+            );
+            let value = crate::media::fingerprint::TransferredSource::encoded(
+                self.fingerprint.file_bytes,
+                digest(&self.fingerprint.full_file_sha256)?,
+                stream.encoded.clone(),
+            )?;
+            ensure!(
+                value.audio.sha256 == digest(&self.fingerprint.audio.sha256)?,
+                "audio report and identity differ"
+            );
+            return Ok(value);
+        }
+        ensure!(
+            self.codec == "mpeg1-layer3"
+                && self.fingerprint.audio.format == "encoded-mpeg1-layer3"
+                && self.fingerprint.audio.coded_samples
+                    == u64::from(self.fingerprint.audio.frame_count) * 1152,
+            "MP3 inspection identity differs"
+        );
+        let a = &self.fingerprint.audio;
+        let value = crate::media::fingerprint::TransferredSource::mpeg(
+            self.fingerprint.file_bytes,
+            digest(&self.fingerprint.full_file_sha256)?,
+            crate::media::fingerprint::EncodedMpeg1Layer3 {
+                sample_rate: a.sample_rate,
+                channels: a.channels,
+                frame_count: a.frame_count,
+                audio_offset: self.audio_offset,
+                audio_bytes: a.audio_bytes,
+                trailing_bytes: u64::from(self.trailing_tag_bytes),
+                frame_bytes_sha256: digest(&a.frame_bytes_sha256)?,
+            },
+        )?;
+        ensure!(
+            value.audio.sha256 == digest(&a.sha256)?,
+            "MP3 report/frame identity differs"
+        );
+        Ok(value)
+    }
 }
 pub fn is_mp3(path: &Path) -> bool {
     path.extension()
@@ -576,4 +671,43 @@ impl EmbeddedCover {
     pub fn facts(&self) -> &Picture {
         &self.facts
     }
+}
+pub fn read_front_cover(path: &Path, expected: &Source) -> Result<Option<EmbeddedCover>> {
+    let identity = expected.transferred_identity()?;
+    let mut held = crate::media::held_source::BoundSource::open_observed(
+        path,
+        identity.file_bytes,
+        identity.full_file_sha256,
+    )?;
+    let bytes = held.read_for_retention()?;
+    if expected.stream.is_some() {
+        return crate::media::audio_source::front_cover(&bytes, expected);
+    }
+    let tag = bytes
+        .get(..usize::try_from(expected.audio_offset)?)
+        .context("MP3 tag span differs")?;
+    let chosen = cover_index(&expected.artwork);
+    let (mut front, mut at) = (None, 0);
+    let (tags, version, frames, pictures) = parse_id3_with_picture(tag, &mut |facts, image| {
+        if Some(at) == chosen {
+            front = Some(EmbeddedCover {
+                bytes: image.to_vec(),
+                facts: facts.clone(),
+            });
+        }
+        at += 1;
+        Ok(())
+    })?;
+    ensure!(
+        tags == expected.metadata
+            && version == expected.id3_version
+            && frames == expected.frames
+            && pictures == expected.artwork,
+        "MP3 artwork/source inspection differs"
+    );
+    ensure!(
+        chosen.is_none() || front.is_some(),
+        "MP3 cover picture is absent"
+    );
+    Ok(front)
 }

@@ -2,6 +2,7 @@
 //! These facts do not confer device execution or application ownership authority.
 
 pub mod artwork;
+pub mod audio_source;
 pub mod bitmap;
 pub mod container;
 pub mod fingerprint;
