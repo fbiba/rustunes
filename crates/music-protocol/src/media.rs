@@ -6,6 +6,7 @@ pub mod bitmap;
 pub mod container;
 pub mod fingerprint;
 pub mod format;
+pub mod metadata;
 pub mod pcm;
 pub mod renditions;
 pub mod timing;

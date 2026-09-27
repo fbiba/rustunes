@@ -259,21 +259,25 @@ pub(crate) fn parse_id3_with_picture(
         } else if matches!(id.as_str(), "TRCK" | "TPOS" | "TCMP") {
             ensure!(seen[&id] == 1, "duplicate ID3 numeric frame");
             let values = text_frame(data, version)?;
-            ensure!(values.len() == 1, "ambiguous ID3 numeric frame");
-            if id == "TCMP" {
-                tags.compilation = Some(match values[0].as_str() {
-                    "0" => false,
-                    "1" => true,
-                    _ => anyhow::bail!("invalid ID3 compilation"),
-                });
-            } else {
-                let (number, total) = number_pair(&values[0])?;
-                if id == "TRCK" {
-                    tags.track = Some(number);
-                    tags.track_total = total;
+            // An empty number is no number, as an empty text is no text.
+            let values: Vec<_> = crate::media::metadata::tag_values(&values).collect();
+            ensure!(values.len() <= 1, "ambiguous ID3 numeric frame");
+            if let Some(&value) = values.first() {
+                if id == "TCMP" {
+                    tags.compilation = Some(match value {
+                        "0" => false,
+                        "1" => true,
+                        _ => anyhow::bail!("invalid ID3 compilation"),
+                    });
                 } else {
-                    tags.disc = Some(number);
-                    tags.disc_total = total;
+                    let (number, total) = number_pair(value)?;
+                    if id == "TRCK" {
+                        tags.track = Some(number);
+                        tags.track_total = total;
+                    } else {
+                        tags.disc = Some(number);
+                        tags.disc_total = total;
+                    }
                 }
             }
         } else if matches!(id.as_str(), "TENC" | "TSSE") {
