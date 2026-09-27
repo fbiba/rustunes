@@ -15,6 +15,8 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::Path,
 };
+
+pub mod gapless;
 pub mod timing;
 
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -37,6 +39,59 @@ pub struct EncodedMpeg {
     pub frame_count: u32,
     pub audio_bytes: u64,
     pub coded_samples: u64,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Tags {
+    pub title: Vec<String>,
+    pub artist: Vec<String>,
+    pub album: Vec<String>,
+    pub album_artist: Vec<String>,
+    pub genre: Vec<String>,
+    pub composer: Vec<String>,
+    pub copyright: Vec<String>,
+    pub release_date: Vec<String>,
+    pub track: Option<u32>,
+    pub track_total: Option<u32>,
+    pub disc: Option<u32>,
+    pub disc_total: Option<u32>,
+    pub compilation: Option<bool>,
+    /// COMM frames that say something. A frame with an empty description and
+    /// empty text is left out: it has nothing a catalogue could hold.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<Comment>,
+    /// Explicit sort names: ID3 TSOT, TSOP, TSOA, TSO2 and TSOC, MP4 sonm,
+    /// soar, soal, soaa and soco, and the Vorbis `*SORT` comments.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sort_title: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sort_artist: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sort_album: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sort_album_artist: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sort_composer: Vec<String>,
+    /// What Apple's sync reads from an ID3v2 tag for an MP3's gapless fields.
+    #[serde(skip_serializing_if = "gapless::EncoderHints::is_empty")]
+    pub encoder_hints: gapless::EncoderHints,
+}
+impl Tags {
+    /// The distinct texts a catalogue comment can come from: comments
+    /// without a description. Apple's sync takes an ID3 comment only from a
+    /// COMM frame with an empty description, in any language; a described
+    /// frame (iTunNORM, iTunSMPB and the like) holds other data.
+    pub fn catalogue_comments(&self) -> Vec<&str> {
+        let mut texts: Vec<&str> = Vec::new();
+        for comment in &self.comments {
+            if comment.description.is_empty()
+                && !comment.text.is_empty()
+                && !texts.contains(&comment.text.as_str())
+            {
+                texts.push(&comment.text);
+            }
+        }
+        texts
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Comment {
@@ -105,12 +160,217 @@ fn syncsafe(b: &[u8]) -> Result<usize> {
     );
     Ok(b.iter().fold(0, |n, v| (n << 7) | usize::from(*v)))
 }
+pub(crate) type Parsed = (Tags, Option<u8>, Vec<FrameEvidence>, Vec<Picture>);
+pub(crate) fn parse_id3(bytes: &[u8]) -> Result<Parsed> {
+    parse_id3_with_picture(bytes, &mut |_, _| Ok(()))
+}
+pub(crate) fn parse_id3_with_picture(
+    bytes: &[u8],
+    on_picture: &mut impl FnMut(&Picture, &[u8]) -> Result<()>,
+) -> Result<Parsed> {
+    let mut tags = Tags::default();
+    let mut evidence = Vec::new();
+    let mut pictures = Vec::new();
+    if bytes.is_empty() {
+        return Ok((tags, None, evidence, pictures));
+    }
+    ensure!(
+        bytes.len() >= 10 && &bytes[..3] == b"ID3" && matches!(bytes[3], 3 | 4) && bytes[4] == 0,
+        "unsupported ID3 version"
+    );
+    // Refuse unsynchronisation, extended headers, encryption/compression and
+    // experimental layouts rather than treating encoded bytes as metadata.
+    ensure!(
+        bytes[5] == 0 || (bytes[3] == 4 && bytes[5] == 0x10),
+        "unsupported ID3 header flags"
+    );
+    let version = bytes[3];
+    let end = 10 + syncsafe(&bytes[6..10])?;
+    ensure!(
+        end <= bytes.len() && bytes.len() == end + if bytes[5] & 0x10 != 0 { 10 } else { 0 },
+        "ID3 span mismatch"
+    );
+    let mut offset = 10;
+    let mut seen = BTreeMap::<String, usize>::new();
+    let mut text_total = 0usize;
+    while offset < end {
+        if bytes[offset] == 0 {
+            ensure!(
+                bytes[offset..end].iter().all(|b| *b == 0),
+                "nonzero ID3 padding"
+            );
+            break;
+        }
+        ensure!(
+            evidence.len() < 4096 && end - offset >= 10,
+            "ID3 frame count/header bound"
+        );
+        let id = &bytes[offset..offset + 4];
+        ensure!(
+            id.iter()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+            "invalid ID3 frame ID"
+        );
+        let id = std::str::from_utf8(id)?.to_owned();
+        let len = if version == 4 {
+            syncsafe(&bytes[offset + 4..offset + 8])?
+        } else {
+            u32::from_be_bytes(bytes[offset + 4..offset + 8].try_into()?) as usize
+        };
+        ensure!(
+            len > 0 && len <= end - offset - 10,
+            "invalid ID3 frame extent"
+        );
+        ensure!(
+            bytes[offset + 8..offset + 10] == [0, 0],
+            "unsupported ID3 frame flags"
+        );
+        let data = &bytes[offset + 10..offset + 10 + len];
+        evidence.push(FrameEvidence {
+            id: id.clone(),
+            bytes: len,
+            sha256: hex(&Sha256::digest(data)),
+        });
+        *seen.entry(id.clone()).or_default() += 1;
+        let target = match id.as_str() {
+            "TIT2" => Some(&mut tags.title),
+            "TPE1" => Some(&mut tags.artist),
+            "TALB" => Some(&mut tags.album),
+            "TPE2" => Some(&mut tags.album_artist),
+            "TCON" => Some(&mut tags.genre),
+            "TCOM" => Some(&mut tags.composer),
+            "TCOP" => Some(&mut tags.copyright),
+            "TDRC" | "TYER" => Some(&mut tags.release_date),
+            "TSOT" => Some(&mut tags.sort_title),
+            "TSOP" => Some(&mut tags.sort_artist),
+            "TSOA" => Some(&mut tags.sort_album),
+            "TSO2" => Some(&mut tags.sort_album_artist),
+            "TSOC" => Some(&mut tags.sort_composer),
+            _ => None,
+        };
+        if let Some(target) = target {
+            let values = text_frame(data, version)?;
+            text_total += values.iter().map(String::len).sum::<usize>();
+            target.extend(values);
+            ensure!(
+                target.len() <= 32 && text_total <= MAX_TEXT,
+                "ID3 text exceeds bound"
+            );
+        } else if matches!(id.as_str(), "TRCK" | "TPOS" | "TCMP") {
+            ensure!(seen[&id] == 1, "duplicate ID3 numeric frame");
+            let values = text_frame(data, version)?;
+            ensure!(values.len() == 1, "ambiguous ID3 numeric frame");
+            if id == "TCMP" {
+                tags.compilation = Some(match values[0].as_str() {
+                    "0" => false,
+                    "1" => true,
+                    _ => anyhow::bail!("invalid ID3 compilation"),
+                });
+            } else {
+                let (number, total) = number_pair(&values[0])?;
+                if id == "TRCK" {
+                    tags.track = Some(number);
+                    tags.track_total = total;
+                } else {
+                    tags.disc = Some(number);
+                    tags.disc_total = total;
+                }
+            }
+        } else if matches!(id.as_str(), "TENC" | "TSSE") {
+            // Only Apple's gapless rule reads these; one it cannot decode
+            // names no encoder.
+            if let Some(text) = text_frame(data, version)
+                .ok()
+                .and_then(|v| v.into_iter().next())
+            {
+                tags.encoder_hints.encoder(&text);
+            }
+        } else if id == "COMM" {
+            if let Some(comment) = comment_frame(data, version)? {
+                tags.encoder_hints
+                    .comment(&comment.description, &comment.text);
+                text_total += comment.description.len() + comment.text.len();
+                tags.comments.push(comment);
+                ensure!(
+                    tags.comments.len() <= 32 && text_total <= MAX_TEXT,
+                    "ID3 comments exceed bound"
+                );
+            }
+        } else if id == "APIC" {
+            ensure!(pictures.len() < 8, "too many ID3 pictures");
+            let (facts, image) = picture_payload(data, version)?;
+            on_picture(&facts, image)?;
+            pictures.push(facts);
+        }
+        offset += 10 + len;
+    }
+    Ok((tags, Some(version), evidence, pictures))
+}
+/// Encoding, three-byte language, a terminated description, then the text.
+/// None when both description and text are empty.
+fn comment_frame(data: &[u8], version: u8) -> Result<Option<Comment>> {
+    ensure!(
+        data.len() >= 4 && data.len() <= MAX_TEXT,
+        "ID3 comment size bound"
+    );
+    let (encoding, language, rest) = (data[0], &data[1..4], &data[4..]);
+    ensure!(
+        language.iter().all(|b| b.is_ascii_alphabetic()) || language == [0, 0, 0],
+        "invalid ID3 comment language"
+    );
+    let width = if matches!(encoding, 1 | 2) { 2 } else { 1 };
+    let terminator = rest
+        .chunks_exact(width)
+        .position(|c| c.iter().all(|b| *b == 0))
+        .context("ID3 comment description terminator missing")?
+        * width;
+    let decode = |bytes: &[u8]| -> Result<String> {
+        if bytes.is_empty() {
+            ensure!(
+                encoding <= 3 && (version == 4 || encoding <= 1),
+                "invalid ID3 comment encoding"
+            );
+            return Ok(String::new());
+        }
+        decode_text(encoding, bytes, version)
+    };
+    let description = decode(&rest[..terminator])?;
+    let text = decode(&rest[terminator + width..])?
+        .trim_end_matches('\0')
+        .to_owned();
+    ensure!(
+        !description.contains('\0') && !text.contains('\0'),
+        "ambiguous ID3 comment text"
+    );
+    if description.is_empty() && text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Comment {
+        language: language.iter().map(|b| char::from(*b)).collect(),
+        description,
+        text,
+    }))
+}
 pub(crate) fn number_pair(s: &str) -> Result<(u32, Option<u32>)> {
     let mut p = s.split('/');
     let number = p.next().context("empty numeric tag")?.parse()?;
     let total = p.next().map(str::parse).transpose()?;
     ensure!(p.next().is_none(), "invalid numeric pair");
     Ok((number, total))
+}
+fn text_frame(data: &[u8], version: u8) -> Result<Vec<String>> {
+    ensure!(
+        !data.is_empty() && data.len() <= MAX_TEXT,
+        "ID3 text size bound"
+    );
+    let text = decode_text(data[0], &data[1..], version)?;
+    let values: Vec<_> = text
+        .trim_end_matches('\0')
+        .split('\0')
+        .map(str::to_owned)
+        .collect();
+    ensure!(values.len() <= 32, "ID3 text value bound");
+    Ok(values)
 }
 fn decode_text(encoding: u8, data: &[u8], version: u8) -> Result<String> {
     ensure!(
@@ -278,6 +538,23 @@ pub fn cover_index(pictures: &[Picture]) -> Option<usize> {
 /// The picture [`cover_index`] chooses.
 pub fn cover_picture(pictures: &[Picture]) -> Option<&Picture> {
     cover_index(pictures).map(|index| &pictures[index])
+}
+
+/// Why a source that holds pictures goes without a cover; `None` when it
+/// has its cover or holds no picture.
+pub fn cover_left_out(pictures: &[Picture]) -> Option<String> {
+    if pictures.is_empty() || cover_index(pictures).is_some() {
+        return None;
+    }
+    let fronts = pictures.iter().filter(|p| p.picture_type == 3).count();
+    Some(if fronts == 0 {
+        format!(
+            "it holds {} pictures and none is marked as the front cover, so it goes without a cover",
+            pictures.len()
+        )
+    } else {
+        format!("it holds {fronts} pictures marked as the front cover, so it goes without a cover")
+    })
 }
 
 /// Exact cover bytes (the picture [`cover_index`] chooses, as the file holds

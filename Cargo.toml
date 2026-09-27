@@ -26,4 +26,6 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1 = "=0.10.6"
 sha2 = "=0.10.9"
+symphonia-bundle-mp3 = { version = "=0.5.4", default-features = false, features = ["mp3"] }
+symphonia-core = { version = "=0.5.4", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "net"] }
