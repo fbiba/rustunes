@@ -891,6 +891,7 @@ mod tests {
             }
         })
         .unwrap();
+        let fields = ProjectedFields::from_source(&removed).unwrap();
         for empty in empty_values() {
             let emptied = retagged(|tag| {
                 for atom in optional {
@@ -908,6 +909,7 @@ mod tests {
                 (s.comment, s.sort_title, s.sort_composer),
                 (None, None, None)
             );
+            assert!(ProjectedFields::from_source(&emptied).unwrap() == fields);
         }
         // A terminator alone reads as an empty text, which inspection keeps.
         let kept = retagged(|tag| {
