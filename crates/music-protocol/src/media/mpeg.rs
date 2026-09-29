@@ -232,6 +232,82 @@ pub fn is_other_audio(path: &Path) -> bool {
     })
 }
 use crate::media::held_source::same_file as same;
+fn read_file(file: &mut File, size: u64) -> Result<Source> {
+    if size >= 12 {
+        let mut reader = std::io::BufReader::new(&mut *file);
+        if let Some(layout) = crate::media::container::inspect(&mut reader, size)? {
+            return crate::media::audio_source::read_layout(&mut reader, size, layout);
+        }
+    }
+    let crate::media::other_audio::OtherCodec::Mpeg1Layer3 {
+        sample_rate,
+        channels,
+        frame_count,
+        audio_offset,
+        audio_bytes,
+        trailing_tag_bytes,
+    } = crate::media::other_audio::inspect(file, size)?
+    else {
+        anyhow::bail!("not a supported audio format (ALAC goes by its own reader)");
+    };
+    let frame_hash = hash_span(file, audio_offset, audio_bytes)?;
+    let mut encoded = Sha256::new();
+    encoded.update(b"music-protocol/encoded-mpeg1-layer3\0");
+    encoded.update(sample_rate.to_le_bytes());
+    encoded.update([channels]);
+    encoded.update(frame_count.to_le_bytes());
+    encoded.update(audio_bytes.to_le_bytes());
+    encoded.update(frame_hash);
+    let timing = timing::inspect(
+        file,
+        timing::FrameSpan {
+            offset: audio_offset,
+            bytes: audio_bytes,
+            frames: frame_count,
+            sample_rate,
+            channels,
+            sha256: frame_hash,
+        },
+    )?;
+    let full = hash_span(file, 0, size)?;
+    ensure!(audio_offset <= MAX_TAG as u64 + 20, "ID3 exceeds bound");
+    file.rewind()?;
+    let mut tag = vec![0; audio_offset as usize];
+    file.read_exact(&mut tag)?;
+    let (metadata, version, frames, artwork) = parse_id3(&tag)?;
+    let apple_timing = gapless::analyse(file, audio_offset, audio_bytes, &metadata.encoder_hints)
+        .context("Apple's MPEG timing")?;
+    // ID3v1 is retained by full-file identity but cannot silently override or
+    // fill projected ID3v2 fields. Its presence is explicit; insertion stays shut.
+    let source = Source {
+        codec: "mpeg1-layer3",
+        fingerprint: Fingerprint {
+            file_bytes: size,
+            full_file_sha256: hex(&full),
+            audio: EncodedMpeg {
+                format: "encoded-mpeg1-layer3",
+                sha256: hex(&encoded.finalize()),
+                frame_bytes_sha256: hex(&frame_hash),
+                sample_rate,
+                channels,
+                frame_count,
+                audio_bytes,
+                coded_samples: u64::from(frame_count) * 1152,
+            },
+        },
+        timing: Some(timing),
+        stream: None,
+        apple_timing: Some(apple_timing),
+        metadata,
+        id3_version: version,
+        frames,
+        artwork,
+        audio_offset,
+        trailing_tag_bytes,
+    };
+    source.transferred_identity()?;
+    Ok(source)
+}
 fn hash_span(file: &mut File, start: u64, bytes: u64) -> Result<[u8; 32]> {
     file.seek(SeekFrom::Start(start))?;
     let mut left = bytes;
