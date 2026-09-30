@@ -998,4 +998,361 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn music_path_union_preserves_distinct_locations_for_shared_track_pid() {
+        let first = track(
+            17,
+            19,
+            false,
+            &[text(
+                2,
+                ":iTunes_Control:Music:F39:A.m4a",
+                Order::Little,
+                false,
+            )],
+            Order::Little,
+        );
+        let second = track(
+            17,
+            19,
+            false,
+            &[text(
+                2,
+                ":iTunes_Control:Music:F39:B.m4a",
+                Order::Little,
+                true,
+            )],
+            Order::Little,
+        );
+        let state = parse(&simple(&[first], &[list(10, &[second], Order::Little)])).unwrap();
+        assert_eq!(state.track_pids().len(), 1);
+        assert_eq!(state.music_paths().unwrap().len(), 2);
+        let missing = track(17, 19, false, &[], Order::Little);
+        let primary = track(
+            17,
+            19,
+            false,
+            &[text(
+                2,
+                ":iTunes_Control:Music:F39:A.m4a",
+                Order::Little,
+                false,
+            )],
+            Order::Little,
+        );
+        assert!(
+            parse(&simple(&[primary], &[list(10, &[missing], Order::Little)]))
+                .unwrap()
+                .music_paths()
+                .is_err()
+        );
+    }
+    #[test]
+    fn unions_datasets_without_losing_instance_metadata() {
+        let first = track(
+            17,
+            19,
+            false,
+            &[text(1, "A", Order::Little, false)],
+            Order::Little,
+        );
+        let mut other = track(17, 19, false, &[], Order::Little);
+        u32_at(&mut other, 0x28, 1, Order::Little);
+        let extra = list(
+            6,
+            &[track(23, 29, false, &[], Order::Little)],
+            Order::Little,
+        );
+        let state = parse(&simple(
+            &[first],
+            &[extra, list(10, &[other], Order::Little)],
+        ))
+        .unwrap();
+        assert_eq!(state.track_pids().len(), 2);
+        assert_eq!(state.primary_tracks().len(), 1);
+        assert_eq!(state.track_datasets()[&10][0].metadata.total_time_ms, 1);
+        assert!(state.track_datasets()[&10][0].title().is_none());
+    }
+    #[test]
+    fn rejects_duplicate_track_and_collection_ids() {
+        let row = track(17, 19, false, &[], Order::Little);
+        rejected(&simple(&[row.clone(), row], &[]));
+        rejected(&simple(
+            &[
+                track(17, 19, false, &[], Order::Little),
+                track(17, 23, false, &[], Order::Little),
+            ],
+            &[],
+        ));
+        rejected(&simple(
+            &[
+                track(17, 19, false, &[], Order::Little),
+                track(23, 19, false, &[], Order::Little),
+            ],
+            &[],
+        ));
+        let col = collection(true, 31, 23, Order::Little);
+        rejected(&simple(&[], &[list(4, &[col.clone(), col], Order::Little)]));
+        rejected(&simple(
+            &[],
+            &[list(
+                4,
+                &[collection(true, 31, 0, Order::Little)],
+                Order::Little,
+            )],
+        ));
+        rejected(&simple(&[track(0, 19, false, &[], Order::Little)], &[]));
+    }
+    #[test]
+    fn rejects_dangling_joins_and_cross_dataset_conflicts() {
+        rejected(&simple(&[track(17, 19, true, &[], Order::Little)], &[]));
+        let first = track(17, 19, false, &[], Order::Little);
+        rejected(&simple(
+            std::slice::from_ref(&first),
+            &[list(
+                10,
+                &[track(17, 23, false, &[], Order::Little)],
+                Order::Little,
+            )],
+        ));
+        let a = track(
+            17,
+            19,
+            false,
+            &[text(1, "A", Order::Little, false)],
+            Order::Little,
+        );
+        let b = track(
+            17,
+            19,
+            false,
+            &[text(1, "B", Order::Little, false)],
+            Order::Little,
+        );
+        rejected(&simple(
+            &[first],
+            &[list(6, &[a], Order::Little), list(10, &[b], Order::Little)],
+        ));
+    }
+    #[test]
+    fn rejects_root_versions_lengths_and_input_limit() {
+        let data = fixture(Order::Little, false);
+        for len in 0..244 {
+            rejected(&data[..len]);
+        }
+        for (offset, value) in [
+            (0, 0),
+            (4, 243),
+            (8, 1),
+            (12, 3),
+            (16, 116),
+            (20, 0),
+            (20, 4097),
+        ] {
+            let mut bad = data.clone();
+            u32_at(&mut bad, offset, value, Order::Little);
+            rejected(&bad);
+        }
+        let mut bad = data.clone();
+        bad[0xa8] = 1;
+        rejected(&bad);
+        rejected(&vec![0; MAX_INPUT_BYTES + 1]);
+    }
+    #[test]
+    fn rejects_sections_lists_and_records_with_wrong_bounds() {
+        for (offset, value) in [
+            (244, 0),
+            (248, 95),
+            (252, 95),
+            (252, u32::MAX),
+            (340, 0),
+            (344, 91),
+            (348, 0),
+            (348, u32::MAX),
+            (432, 0),
+            (436, 623),
+            (440, 623),
+            (440, u32::MAX),
+            (444, 4097),
+        ] {
+            let mut bad = fixture(Order::Little, false);
+            u32_at(&mut bad, offset, value, Order::Little);
+            rejected(&bad);
+        }
+        let mut bad = fixture(Order::Little, false);
+        bad.push(0);
+        let len = bad.len() as u32;
+        u32_at(&mut bad, 8, len, Order::Little);
+        rejected(&bad);
+    }
+    #[test]
+    fn requires_one_primary_and_one_saved_anchor_dataset() {
+        rejected(&database(
+            &[list(1, &[], Order::Little)],
+            Order::Little,
+            false,
+        ));
+        rejected(&database(
+            &[section(11, &[0; 48], Order::Little)],
+            Order::Little,
+            false,
+        ));
+        rejected(&simple(&[], &[list(1, &[], Order::Little)]));
+        rejected(&simple(&[], &[section(11, &[0; 48], Order::Little)]));
+        rejected(&database(
+            &[
+                list(1, &[], Order::Little),
+                section(11, &[0; 47], Order::Little),
+            ],
+            Order::Little,
+            false,
+        ));
+    }
+
+    #[test]
+    fn validates_current_database_and_primary_container_identity() {
+        let state = parse(&simple(
+            &[],
+            &[playlists(5, &[(41, 1), (53, 0)], Order::Little)],
+        ))
+        .unwrap();
+        assert_eq!(state.playlist_pids().len(), 2);
+        assert!(state.all_mapped_pids().contains(&47));
+        assert!(state.all_mapped_pids().contains(&53));
+        rejected(&simple(&[], &[playlists(5, &[(59, 1)], Order::Little)]));
+        rejected(&simple(
+            &[],
+            &[playlists(5, &[(41, 1), (53, 1)], Order::Little)],
+        ));
+        rejected(&simple(
+            &[],
+            &[playlists(5, &[(41, 0), (41, 0)], Order::Little)],
+        ));
+        rejected(&simple(&[], &[playlists(5, &[(0, 0)], Order::Little)]));
+        rejected(&simple(&[], &[playlists(5, &[(53, 2)], Order::Little)]));
+        let mut zero = simple(&[], &[]);
+        u64_at(&mut zero, 0x48, 0, Order::Little);
+        rejected(&zero);
+        for rows in [vec![], vec![(41, 0)]] {
+            rejected(&database(
+                &[
+                    list(1, &[], Order::Little),
+                    section(11, &[0; 48], Order::Little),
+                    playlists(3, &rows, Order::Little),
+                ],
+                Order::Little,
+                false,
+            ));
+        }
+        let mut malformed = playlists(5, &[(53, 0)], Order::Little);
+        u32_at(&mut malformed, 96 + 92 + 8, u32::MAX, Order::Little);
+        rejected(&simple(&[], &[malformed]));
+    }
+    #[test]
+    fn rejects_text_headers_encodings_duplicates_and_unicode() {
+        for (offset, value) in [
+            (0, 0),
+            (4, 23),
+            (8, 23),
+            (8, u32::MAX),
+            (24, 3),
+            (28, 0),
+            (28, 1048577),
+        ] {
+            let mut child = text(1, "abc", Order::Little, false);
+            u32_at(&mut child, offset, value, Order::Little);
+            rejected(&simple(
+                &[track(17, 19, false, &[child], Order::Little)],
+                &[],
+            ));
+        }
+        let mut child = text(1, "a", Order::Little, false);
+        child[32] = 0;
+        rejected(&simple(
+            &[track(17, 19, false, &[child], Order::Little)],
+            &[],
+        ));
+        let child = text(1, "a", Order::Little, false);
+        rejected(&simple(
+            &[track(17, 19, false, &[child.clone(), child], Order::Little)],
+            &[],
+        ));
+        for (utf8, payload) in [(false, vec![0]), (false, vec![0, 0xd8]), (true, vec![0xff])] {
+            let mut child = text(1, "", Order::Little, utf8);
+            child.extend(&payload);
+            let len = child.len() as u32;
+            u32_at(&mut child, 8, len, Order::Little);
+            u32_at(&mut child, 28, payload.len() as u32, Order::Little);
+            rejected(&simple(
+                &[track(17, 19, false, &[child], Order::Little)],
+                &[],
+            ));
+        }
+    }
+    #[test]
+    fn bounds_unknown_payloads_without_searching_inside() {
+        let mut child = vec![0; 24];
+        child.extend(b"mhit is opaque");
+        let len = child.len() as u32;
+        magic(&mut child, b"mhod", Order::Little);
+        for (at, value) in [(4, 24), (8, len), (12, 999)] {
+            u32_at(&mut child, at, value, Order::Little);
+        }
+        let row = track(17, 19, false, &[child], Order::Little);
+        assert!(
+            parse(&simple(
+                &[row],
+                &[section(77, b"mhit is opaque", Order::Little)]
+            ))
+            .is_ok()
+        );
+    }
+    #[test]
+    fn enforces_aggregate_limits_and_compilation_boolean() {
+        let row = track(
+            17,
+            19,
+            false,
+            &[text(1, "A", Order::Little, false)],
+            Order::Little,
+        );
+        let mut reader = Reader {
+            order: Order::Little,
+            rows: MAX_ROWS,
+            children: 0,
+            text_bytes: 0,
+        };
+        let section = list(1, std::slice::from_ref(&row), Order::Little);
+        assert!(reader.tracks(&section[96..], 1).is_err());
+        reader.children = MAX_TOTAL_CHILDREN;
+        assert!(reader.text_children(&row, 624, &[1]).is_err());
+        reader.children = 0;
+        reader.text_bytes = MAX_TOTAL_TEXT_BYTES;
+        assert!(reader.text_children(&row, 624, &[1]).is_err());
+        let mut row = row;
+        row[0x1e] = 2;
+        rejected(&simple(&[row], &[]));
+    }
+    #[test]
+    fn rejects_truncated_bad_checksum_and_extra_zlib_streams() {
+        let good = fixture(Order::Little, true);
+        let mut truncated = good[..good.len() - 1].to_vec();
+        let mut trailing = good.clone();
+        trailing.push(0);
+        let mut multiple = good.clone();
+        multiple.extend(zlib(b""));
+        for mut bad in [truncated.clone(), trailing, multiple] {
+            let len = bad.len() as u32;
+            u32_at(&mut bad, 8, len, Order::Little);
+            rejected(&bad);
+        }
+        truncated = good;
+        *truncated.last_mut().unwrap() ^= 1;
+        rejected(&truncated);
+        let payload = vec![b'a'; 100_000];
+        let compressed = zlib(&payload);
+        assert_eq!(inflate(&compressed, payload.len()).unwrap(), payload);
+        assert!(inflate(&compressed, payload.len() - 1).is_err());
+    }
 }
