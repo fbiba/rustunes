@@ -3,3 +3,4 @@
 
 pub mod anchor;
 pub mod identity;
+pub mod inventory;
