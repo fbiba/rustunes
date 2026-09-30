@@ -35,6 +35,10 @@ const ENCODED_CAP: usize = 64 << 20;
 /// `Snapshot::layout_hash` of the 45 tables observed on iOS 27.0.1 and 27.2.
 pub const LAYOUT_SHA256: &str = "282f0a1114d01c831e691f47b5071743f530936c81efb3d98c891992dfecdab3";
 
+pub mod values;
+
+mod custody;
+
 #[derive(Clone, Copy)]
 pub struct Capture<'a> {
     pub database: &'a Path,
@@ -473,4 +477,187 @@ fn plain_rows_checked(
     }
     check_sql_phase(policy)?;
     Ok(out)
+}
+struct LoadedInput {
+    source: OwnedCapture,
+    db: Vec<u8>,
+    wal: Option<Vec<u8>>,
+    hashes: SqlHashes,
+}
+fn load_input(input: Capture<'_>, b: &mut Budget) -> Result<LoadedInput> {
+    let source = OwnedCapture {
+        database: input.database.to_owned(),
+        wal: input.wal.map(|(p, _)| p.to_owned()),
+    };
+    sidecars(&source)?;
+    ensure!(input.database_sha256 != [0; 32], "missing database hash");
+    let db = read(input.database, DB_CAP, b)?;
+    ensure!(
+        !db.is_empty() && <[u8; 32]>::from(Sha256::digest(&db)) == input.database_sha256,
+        "database hash differs"
+    );
+    let wal = input
+        .wal
+        .map(|(p, h)| -> Result<Vec<u8>> {
+            let v = read(p, WAL_CAP, b)?;
+            ensure!(
+                h != [0; 32] && <[u8; 32]>::from(Sha256::digest(&v)) == h,
+                "WAL hash differs"
+            );
+            Ok(v)
+        })
+        .transpose()?;
+    b.add_input(db.len() as u64 + wal.as_ref().map_or(0, |v| v.len() as u64))?;
+    let hashes = SqlHashes {
+        database_sha256: hex(&input.database_sha256),
+        database_bytes: db.len() as u64,
+        wal_sha256: input.wal.map(|(_, h)| hex(&h)),
+        wal_bytes: wal.as_ref().map(|v| v.len() as u64),
+    };
+    Ok(LoadedInput {
+        source,
+        db,
+        wal,
+        hashes,
+    })
+}
+fn configure_memory_temp(c: &Connection, b: &Budget) -> Result<()> {
+    b.check()?;
+    super::memory_temp_storage(c, || b.check())?;
+    b.check()
+}
+fn subtract(a: &Rows, b: &Rows, budget: &Budget) -> Result<Vec<Value>> {
+    let mut result = Vec::new();
+    for (position, (r, n)) in a.iter().enumerate() {
+        if position % 256 == 0 {
+            budget.check()?;
+        }
+        let count = n.saturating_sub(*b.get(r).unwrap_or(&0));
+        if count > 0 {
+            result.push(serde_json::json!({"cells":r,"multiplicity":count}));
+        }
+    }
+    budget.check()?;
+    Ok(result)
+}
+pub fn delta(before: &Snapshot, after: &Snapshot, b: &Budget) -> Result<Value> {
+    let mut tables = Vec::new();
+    let names: std::collections::BTreeSet<_> =
+        before.tables.keys().chain(after.tables.keys()).collect();
+    let empty = Rows::new();
+    for n in names {
+        b.check()?;
+        let a = before.tables.get(n);
+        let z = after.tables.get(n);
+        let removed = subtract(
+            a.map_or(&empty, |t| &t.rows),
+            z.map_or(&empty, |t| &t.rows),
+            b,
+        )?;
+        let added = subtract(
+            z.map_or(&empty, |t| &t.rows),
+            a.map_or(&empty, |t| &t.rows),
+            b,
+        )?;
+        if !removed.is_empty()
+            || !added.is_empty()
+            || a.map(|t| &t.definitions) != z.map(|t| &t.definitions)
+        {
+            tables.push(serde_json::json!({"table":n,"before_columns":a.map(|t|&t.columns),"after_columns":z.map(|t|&t.columns),"before_definitions":a.map(|t|&t.definitions),"after_definitions":z.map(|t|&t.definitions),"removed":removed,"added":added}));
+        }
+    }
+    Ok(
+        serde_json::json!({"schema_equal":before.schema==after.schema,"before_user_version":before.version,"after_user_version":after.version,"before_schema":before.schema,"after_schema":after.schema,"tables":tables,"truncated":false}),
+    )
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn controlled_plain_rows_checks_effective_phase_after_empty_query() {
+        for expired in [false, true] {
+            let c = Connection::open_in_memory().unwrap();
+            let flag = Arc::new(AtomicBool::new(false));
+            let budget = Budget::new_cancellable_until(
+                Instant::now() + Duration::from_secs(30),
+                flag.clone(),
+            );
+            let phase = Instant::now() + Duration::from_millis(100);
+            let reached = Arc::new(AtomicBool::new(false));
+            let marker = reached.clone();
+            // The original overall budget stays live during phase-only expiry.
+            c.progress_handler(
+                1,
+                Some(move || {
+                    marker.store(true, Ordering::Relaxed);
+                    if expired {
+                        while Instant::now() < phase {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    } else {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    false
+                }),
+            )
+            .unwrap();
+            assert!(plain_rows_checked(&c, "SELECT 1 WHERE 0", 2, Some((&budget, phase))).is_err());
+            assert!(
+                reached.load(Ordering::Relaxed),
+                "empty query never reached SQLite"
+            );
+            if expired {
+                budget.check().unwrap();
+            }
+        }
+    }
+    #[test]
+    fn optional_cancellation_and_expired_original_deadline_refuse() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let future = Instant::now() + Duration::from_secs(60);
+        let controlled = Budget::new_cancellable_until(future, Arc::clone(&cancelled));
+        controlled.check().unwrap();
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(
+            controlled
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(
+            Budget::new_until(Instant::now() - Duration::from_millis(1))
+                .check()
+                .is_err()
+        );
+        Budget::new().check().unwrap();
+    }
+    #[test]
+    fn installed_sqlite_progress_observes_later_cancellation() {
+        let c = Connection::open_in_memory().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        install_progress(
+            &c,
+            Instant::now() + Duration::from_secs(30),
+            Some(Arc::clone(&cancelled)),
+        )
+        .unwrap();
+        cancelled.store(true, Ordering::Relaxed);
+        let result: rusqlite::Result<i64> = c.query_row(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n", [], |r| r.get(0));
+        assert!(result.unwrap_err().to_string().contains("interrupted"));
+        install_progress(&c, Instant::now() + Duration::from_secs(30), None).unwrap();
+        assert_eq!(
+            c.query_row::<i64, _, _>("SELECT 7", [], |r| r.get(0))
+                .unwrap(),
+            7
+        );
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use rusqlite::Connection;
 }
