@@ -421,6 +421,134 @@ impl Reader {
     }
 }
 
+/// Only the exact current writer's 1.117 raw / 2.117 zlib formats are accepted.
+pub fn parse(input: &[u8]) -> Result<Inventory> {
+    ensure!(
+        input.len() <= MAX_INPUT_BYTES,
+        "database exceeds 64 MiB input limit"
+    );
+    ensure!(input.len() >= ROOT_HEADER, "truncated database root");
+    let order = match &input[..4] {
+        b"mhbd" => Order::Little,
+        b"dbhm" => Order::Big,
+        _ => bail!("unsupported database magic"),
+    };
+    ensure!(
+        order.u32(input, 4)? as usize == ROOT_HEADER,
+        "unsupported root header length"
+    );
+    ensure!(
+        order.u32(input, 8)? as usize == input.len(),
+        "declared database length differs from input"
+    );
+    ensure!(order.u32(input, 16)? == 117, "unsupported minor version");
+    let count = order.u32(input, 20)?;
+    ensure!(
+        (1..=MAX_SECTIONS).contains(&count),
+        "section count absent or exceeds limit"
+    );
+    let inflated;
+    let sections = match (order.u32(input, 12)?, input[0xa8]) {
+        (1, 0) => &input[ROOT_HEADER..],
+        (2, 1) => {
+            inflated = inflate(&input[ROOT_HEADER..], MAX_SECTION_BYTES)?;
+            &inflated
+        }
+        _ => bail!("unsupported version/compression combination"),
+    };
+    let mut reader = Reader {
+        order,
+        rows: 0,
+        children: 0,
+        text_bytes: 0,
+    };
+    let mut output = Inventory {
+        database_pid: order.u64(input, 0x48)?,
+        primary_container_pid: 0,
+        tracks: BTreeMap::new(),
+        albums: BTreeMap::new(),
+        artists: BTreeMap::new(),
+        track_pids: BTreeSet::new(),
+        all_mapped_pids: BTreeSet::new(),
+        playlist_pids: BTreeSet::new(),
+        saved_media_anchor: None,
+    };
+    ensure!(output.database_pid != 0, "zero database PID");
+    let mut primary_by_dataset = BTreeMap::new();
+    let (mut kinds, mut offset) = (BTreeSet::new(), 0);
+    for _ in 0..count {
+        let section = sections
+            .get(offset..)
+            .context("section offset exceeds input")?;
+        ensure!(section.len() >= SECTION_HEADER, "truncated section header");
+        order.magic(section, b"mhsd")?;
+        ensure!(
+            order.u32(section, 4)? as usize == SECTION_HEADER,
+            "unsupported section header length"
+        );
+        let length = order.u32(section, 8)? as usize;
+        ensure!(
+            (SECTION_HEADER..=section.len()).contains(&length),
+            "section length exceeds bounds"
+        );
+        let kind = order.u32(section, 12)?;
+        ensure!(kinds.insert(kind), "duplicate dataset type");
+        let body = &section[SECTION_HEADER..length];
+        match kind {
+            1 | 6 | 10 => {
+                output.tracks.insert(kind, reader.tracks(body, kind)?);
+            }
+            4 => output.albums = reader.collections(body, true)?,
+            8 => output.artists = reader.collections(body, false)?,
+            2 | 3 | 5 => {
+                let (pids, primary) = reader.playlists(body)?;
+                output.playlist_pids.extend(pids);
+                if let Some(primary) = primary {
+                    primary_by_dataset.insert(kind, primary);
+                }
+            }
+            11 => {
+                ensure!(body.len() == 48, "unsupported saved-anchor dataset length");
+                output.saved_media_anchor = Some(order.u32(body, 0)?);
+            }
+            _ => {}
+        }
+        offset += length;
+    }
+    ensure!(
+        offset == sections.len(),
+        "trailing database sections or bytes"
+    );
+    ensure!(
+        output.tracks.contains_key(&1),
+        "primary track dataset 1 absent"
+    );
+    ensure!(
+        output.saved_media_anchor.is_some(),
+        "saved-anchor dataset 11 absent"
+    );
+    output.primary_container_pid = *primary_by_dataset
+        .get(&3)
+        .context("dataset 3 primary container absent")?;
+    ensure!(
+        primary_by_dataset
+            .values()
+            .all(|pid| *pid == output.primary_container_pid),
+        "conflicting primary containers across datasets"
+    );
+    resolve_tracks(&mut output)?;
+    output.all_mapped_pids = output
+        .track_pids
+        .iter()
+        .copied()
+        .chain(output.albums.values().map(|row| row.pid))
+        .chain(output.artists.values().map(|row| row.pid))
+        .chain(output.playlist_pids.iter().copied())
+        .chain(std::iter::once(output.database_pid))
+        .collect();
+    Ok(output)
+}
+
 fn resolve_tracks(inventory: &mut Inventory) -> Result<()> {
     // Store observed common fields independently: filling a missing field here
     // must never invent a value in the returned primary or instance records.
@@ -525,4 +653,349 @@ fn music_path(native: &str) -> Result<String> {
         "unsafe or ambiguous Music file component"
     );
     Ok(format!("iTunes_Control/Music/{folder}/{name}"))
+}
+
+fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let mut decoder = Decompress::new(true);
+    let mut output = Vec::new();
+    let mut chunk = [0; 32 * 1024];
+    loop {
+        let (before_in, before_out) = (decoder.total_in(), decoder.total_out());
+        let available = (limit - output.len()).saturating_add(1).min(chunk.len());
+        let status = decoder
+            .decompress(
+                &input[before_in as usize..],
+                &mut chunk[..available],
+                FlushDecompress::None,
+            )
+            .context("invalid database zlib stream")?;
+        let produced = (decoder.total_out() - before_out) as usize;
+        ensure!(
+            produced <= limit - output.len(),
+            "inflated database exceeds limit"
+        );
+        output
+            .try_reserve_exact(produced)
+            .context("allocating bounded database sections")?;
+        output.extend_from_slice(&chunk[..produced]);
+        if status == Status::StreamEnd {
+            ensure!(
+                decoder.total_in() == input.len() as u64,
+                "trailing bytes or multiple zlib streams"
+            );
+            return Ok(output);
+        }
+        ensure!(
+            decoder.total_in() > before_in || produced > 0,
+            "truncated or stalled zlib stream"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write;
+
+    fn u32_at(data: &mut [u8], at: usize, value: u32, order: Order) {
+        data[at..at + 4].copy_from_slice(&match order {
+            Order::Little => value.to_le_bytes(),
+            Order::Big => value.to_be_bytes(),
+        });
+    }
+    fn u64_at(data: &mut [u8], at: usize, value: u64, order: Order) {
+        data[at..at + 8].copy_from_slice(&match order {
+            Order::Little => value.to_le_bytes(),
+            Order::Big => value.to_be_bytes(),
+        });
+    }
+    fn magic(data: &mut [u8], value: &[u8; 4], order: Order) {
+        u32_at(data, 0, u32::from_le_bytes(*value), order);
+    }
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+    fn text(kind: u32, value: &str, order: Order, utf8: bool) -> Vec<u8> {
+        let payload: Vec<u8> = if utf8 {
+            value.as_bytes().to_vec()
+        } else {
+            value
+                .encode_utf16()
+                .flat_map(|unit| match order {
+                    Order::Little => unit.to_le_bytes(),
+                    Order::Big => unit.to_be_bytes(),
+                })
+                .collect()
+        };
+        let mut data = vec![0; 40];
+        data.extend_from_slice(&payload);
+        let len = data.len() as u32;
+        magic(&mut data, b"mhod", order);
+        for (at, value) in [
+            (4, 24),
+            (8, len),
+            (12, kind),
+            (24, if utf8 { 2 } else { 1 }),
+            (28, payload.len() as u32),
+        ] {
+            u32_at(&mut data, at, value, order);
+        }
+        data[32] = 1;
+        data
+    }
+    fn track(pid: u64, id: u32, joins: bool, children: &[Vec<u8>], order: Order) -> Vec<u8> {
+        let mut data = vec![0; 624];
+        data.extend(children.concat());
+        let len = data.len() as u32;
+        magic(&mut data, b"mhit", order);
+        for (at, value) in [
+            (4, 624),
+            (8, len),
+            (12, children.len() as u32),
+            (16, id),
+            (0x120, if joins { 23 } else { 0 }),
+            (0x1e0, if joins { 29 } else { 0 }),
+            (0x28, 234567),
+            (0x2c, 2),
+            (0x30, 12),
+            (0x5c, 1),
+            (0x60, 2),
+            (0x34, 2020),
+        ] {
+            u32_at(&mut data, at, value, order);
+        }
+        data[0x1e] = 1;
+        u64_at(&mut data, 0x70, pid, order);
+        u64_at(&mut data, 0x12c, 0x100000001, order);
+        data
+    }
+    fn collection(album: bool, pid: u64, id: u32, order: Order) -> Vec<u8> {
+        let header = if album { 88 } else { 80 };
+        let mut data = vec![0; header];
+        data.extend(text(
+            if album { 200 } else { 300 },
+            if album { "Album" } else { "Artist" },
+            order,
+            false,
+        ));
+        let len = data.len() as u32;
+        magic(&mut data, if album { b"mhia" } else { b"mhii" }, order);
+        for (at, value) in [(4, header as u32), (8, len), (12, 1), (16, id)] {
+            u32_at(&mut data, at, value, order);
+        }
+        u64_at(&mut data, 20, pid, order);
+        data[28] = 2;
+        data
+    }
+    fn section(kind: u32, body: &[u8], order: Order) -> Vec<u8> {
+        let mut data = vec![0; 96];
+        data.extend_from_slice(body);
+        let len = data.len() as u32;
+        magic(&mut data, b"mhsd", order);
+        for (at, value) in [(4, 96), (8, len), (12, kind)] {
+            u32_at(&mut data, at, value, order);
+        }
+        data
+    }
+    fn list(kind: u32, rows: &[Vec<u8>], order: Order) -> Vec<u8> {
+        let mut body = vec![0; 92];
+        magic(
+            &mut body,
+            match kind {
+                4 => b"mhla",
+                8 => b"mhli",
+                _ => b"mhlt",
+            },
+            order,
+        );
+        u32_at(&mut body, 4, 92, order);
+        u32_at(&mut body, 8, rows.len() as u32, order);
+        body.extend(rows.concat());
+        section(kind, &body, order)
+    }
+    fn database(sections: &[Vec<u8>], order: Order, compressed: bool) -> Vec<u8> {
+        let mut data = vec![0; 244];
+        let body = sections.concat();
+        data.extend(if compressed { zlib(&body) } else { body });
+        let len = data.len() as u32;
+        magic(&mut data, b"mhbd", order);
+        for (at, value) in [
+            (4, 244),
+            (8, len),
+            (12, if compressed { 2 } else { 1 }),
+            (16, 117),
+            (20, sections.len() as u32),
+        ] {
+            u32_at(&mut data, at, value, order);
+        }
+        data[0xa8] = u8::from(compressed);
+        u64_at(&mut data, 0x48, 47, order);
+        data
+    }
+    fn playlists(kind: u32, rows: &[(u64, u8)], order: Order) -> Vec<u8> {
+        let mut body = vec![0; 92];
+        magic(&mut body, b"mhlp", order);
+        u32_at(&mut body, 4, 92, order);
+        u32_at(&mut body, 8, rows.len() as u32, order);
+        for (pid, flag) in rows {
+            let mut row = vec![0; 184];
+            magic(&mut row, b"mhyp", order);
+            u32_at(&mut row, 4, 184, order);
+            u32_at(&mut row, 8, 184, order);
+            row[20] = *flag;
+            u64_at(&mut row, 28, *pid, order);
+            body.extend(row);
+        }
+        section(kind, &body, order)
+    }
+    fn fixture(order: Order, compressed: bool) -> Vec<u8> {
+        let track = track(
+            0x1122334455667788,
+            19,
+            true,
+            &[
+                text(1, "Synthetic 🎵", order, false),
+                text(3, "Album", order, false),
+                text(4, "Artist", order, true),
+                text(22, "Album artist", order, true),
+            ],
+            order,
+        );
+        let mut anchor = [0; 48];
+        u32_at(&mut anchor, 0, 17, order);
+        database(
+            &[
+                list(1, &[track], order),
+                list(4, &[collection(true, 31, 23, order)], order),
+                list(8, &[collection(false, 37, 29, order)], order),
+                section(11, &anchor, order),
+                playlists(3, &[(41, 1)], order),
+            ],
+            order,
+            compressed,
+        )
+    }
+    fn simple(rows: &[Vec<u8>], extra: &[Vec<u8>]) -> Vec<u8> {
+        let mut sections = vec![
+            list(1, rows, Order::Little),
+            section(11, &[0; 48], Order::Little),
+            playlists(3, &[(41, 1)], Order::Little),
+        ];
+        sections.extend_from_slice(extra);
+        database(&sections, Order::Little, false)
+    }
+    fn rejected(data: &[u8]) {
+        assert!(parse(data).is_err());
+    }
+
+    #[test]
+    fn reads_current_containers_both_orders_with_unicode_and_joins() {
+        for order in [Order::Little, Order::Big] {
+            for compressed in [false, true] {
+                let state = parse(&fixture(order, compressed)).unwrap();
+                let row = &state.primary_tracks()[0];
+                assert_eq!(row.title(), Some("Synthetic 🎵"));
+                assert_eq!(row.artist(), Some("Artist"));
+                assert_eq!(row.album(), Some("Album"));
+                assert_eq!(row.album_artist(), Some("Album artist"));
+                assert_eq!((row.album_pid, row.artist_pid), (Some(31), Some(37)));
+                assert_eq!(row.metadata.file_size, 0x100000001);
+                assert_eq!(state.saved_media_anchor(), 17);
+                assert_eq!(state.all_mapped_pids().len(), 5);
+                assert_eq!(state.database_pid(), 47);
+                assert_eq!(state.primary_container_pid(), 41);
+            }
+        }
+    }
+    #[test]
+    fn preserves_absent_fields_zero_joins_and_empty_primary() {
+        let state = parse(&simple(&[], &[])).unwrap();
+        assert!(state.primary_tracks().is_empty());
+        assert_eq!(state.saved_media_anchor(), 0);
+        let state = parse(&simple(&[track(17, 19, false, &[], Order::Little)], &[])).unwrap();
+        let row = &state.primary_tracks()[0];
+        assert!(row.title().is_none() && row.album_pid.is_none());
+    }
+
+    #[test]
+    fn converts_only_conservative_native_music_components() {
+        assert_eq!(
+            music_path(":iTunes_Control:Music:F39:PXMR.m4a").unwrap(),
+            "iTunes_Control/Music/F39/PXMR.m4a"
+        );
+        assert_eq!(
+            music_path(":iTunes_Control:Music:F00:a_B-1.mp3").unwrap(),
+            "iTunes_Control/Music/F00/a_B-1.mp3"
+        );
+        for bad in [
+            "",
+            "iTunes_Control:Music:F39:PXMR.m4a",
+            "/iTunes_Control/Music/F39/PXMR.m4a",
+            "\\iTunes_Control\\Music\\F39\\PXMR.m4a",
+            "C::iTunes_Control:Music:F39:PXMR.m4a",
+            ":Other:Music:F39:PXMR.m4a",
+            ":iTunes_Control:Podcasts:F39:PXMR.m4a",
+            ":iTunes_Control:Music:F9:a.m4a",
+            ":iTunes_Control:Music:F999:a.m4a",
+            ":iTunes_Control:Music:..:a.m4a",
+            ":iTunes_Control:Music:F39:",
+            ":iTunes_Control:Music:F39:.",
+            ":iTunes_Control:Music:F39:..",
+            ":iTunes_Control:Music:F39:a:b.m4a",
+            ":iTunes_Control:Music:F39:a/b.m4a",
+            ":iTunes_Control:Music:F39:a\\b.m4a",
+            ":iTunes_Control:Music:F39:%2E%2E.m4a",
+            ":iTunes_Control:Music:F39:α.m4a",
+            ":iTunes_Control:Music:F39:a\0.m4a",
+            ":iTunes_Control:Music:F39:a\n.m4a",
+        ] {
+            assert!(music_path(bad).is_err());
+        }
+        assert!(music_path(&format!(":iTunes_Control:Music:F39:{}", "A".repeat(256))).is_err());
+    }
+
+    #[test]
+    fn music_path_set_requires_every_represented_track_location() {
+        let missing = parse(&simple(&[track(17, 19, false, &[], Order::Little)], &[])).unwrap();
+        assert!(missing.music_paths().is_err());
+        let child = text(
+            2,
+            ":iTunes_Control:Music:F39:PXMR.m4a",
+            Order::Little,
+            false,
+        );
+        let row = track(17, 19, false, std::slice::from_ref(&child), Order::Little);
+        let state = parse(&simple(&[row], &[])).unwrap();
+        assert!(
+            state
+                .music_paths()
+                .unwrap()
+                .contains("iTunes_Control/Music/F39/PXMR.m4a")
+        );
+        rejected(&simple(
+            &[track(17, 19, false, &[child.clone(), child], Order::Little)],
+            &[],
+        ));
+        let unsafe_row = track(
+            17,
+            19,
+            false,
+            &[text(
+                2,
+                ":iTunes_Control:Music:F39:..",
+                Order::Little,
+                false,
+            )],
+            Order::Little,
+        );
+        assert!(
+            parse(&simple(&[unsafe_row], &[]))
+                .unwrap()
+                .music_paths()
+                .is_err()
+        );
+    }
 }
