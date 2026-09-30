@@ -32,6 +32,7 @@ lofty.workspace = true
 image.workspace = true
 jpeg-encoder.workspace = true
 png.workspace = true
+rusqlite.workspace = true
 symphonia-bundle-mp3.workspace = true
 symphonia-core.workspace = true
 
