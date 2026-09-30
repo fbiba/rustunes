@@ -191,3 +191,11 @@ fn shm_cap(database: &[u8], wal: &[u8]) -> Result<u64> {
         .checked_mul(quantum)
         .context("SQL SHM rounding overflow")
 }
+
+pub(super) struct CreatedOutput {
+    root: Root,
+    database: Leaf,
+    wal: Option<Leaf>,
+    shm: Option<MutableShm>,
+    finished: bool,
+}
