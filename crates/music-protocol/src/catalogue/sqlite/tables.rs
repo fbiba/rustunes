@@ -38,6 +38,9 @@ pub const LAYOUT_SHA256: &str = "282f0a1114d01c831e691f47b5071743f530936c81efb3d
 pub mod values;
 
 mod custody;
+pub use custody::{
+    Materialized, OwnedMaterialized, materialize_owned_controlled, with_materialized_controlled,
+};
 
 #[derive(Clone, Copy)]
 pub struct Capture<'a> {
@@ -478,6 +481,88 @@ fn plain_rows_checked(
     check_sql_phase(policy)?;
     Ok(out)
 }
+pub fn materialize(input: Capture<'_>, out: &Path, b: &mut Budget) -> Result<Snapshot> {
+    materialize_checked(input, out, b, false)
+}
+pub fn materialize_with_control(
+    input: Capture<'_>,
+    out: &Path,
+    b: &mut Budget,
+) -> Result<Snapshot> {
+    ensure!(
+        b.cancelled.is_some(),
+        "controlled SQL requires shared cancellation"
+    );
+    b.check()?;
+    materialize_checked(input, out, b, true)
+}
+fn materialize_checked(
+    input: Capture<'_>,
+    out: &Path,
+    b: &mut Budget,
+    controlled: bool,
+) -> Result<Snapshot> {
+    let LoadedInput {
+        source,
+        db,
+        wal,
+        hashes,
+    } = load_input(input, b)?;
+    directory(out)?;
+    let path = out.join("database.sqlite");
+    let wp = out.join("database.sqlite-wal");
+    if controlled {
+        durable_checked(&path, &db, Some(b))?;
+    } else {
+        durable(&path, &db)?;
+    }
+    if let Some(v) = &wal {
+        if controlled {
+            durable_checked(&wp, v, Some(b))?;
+        } else {
+            durable(&wp, v)?;
+        }
+    }
+    drop(db);
+    drop(wal);
+    // Reuse the already qualified current-generation WAL validation; no Apple
+    // routines or SQLite writes to the original sources are involved.
+    if controlled {
+        super::validate_container_with_control(
+            &path,
+            input.wal.map(|_| wp.as_path()),
+            b.deadline,
+            b.cancelled
+                .as_ref()
+                .context("controlled SQL flag absent")?
+                .clone(),
+        )?;
+    } else {
+        super::validate_container(&path, input.wal.map(|_| wp.as_path()))?;
+    }
+    let (snap, deadline) = analyze_copies(&path, hashes, source, b, controlled, None, |_| Ok(()))?;
+    recheck(&snap, b)?;
+    ensure!(
+        hex(&Sha256::digest(read(&path, DB_CAP, b)?)) == snap.hashes.database_sha256,
+        "SQLite changed copied database"
+    );
+    if input.wal.is_some() {
+        ensure!(
+            Some(hex(&Sha256::digest(read(&wp, WAL_CAP, b)?))) == snap.hashes.wal_sha256,
+            "SQLite changed copied WAL"
+        );
+    }
+    // SQLite may build this disposable shared-memory index, never original SHM.
+    match fs::remove_file(out.join("database.sqlite-shm")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if controlled {
+        b.check_phase(deadline)?;
+    }
+    Ok(snap)
+}
 struct LoadedInput {
     source: OwnedCapture,
     db: Vec<u8>,
@@ -525,6 +610,164 @@ fn configure_memory_temp(c: &Connection, b: &Budget) -> Result<()> {
     b.check()?;
     super::memory_temp_storage(c, || b.check())?;
     b.check()
+}
+fn analyze_copies(
+    path: &Path,
+    hashes: SqlHashes,
+    source: OwnedCapture,
+    b: &Budget,
+    controlled: bool,
+    held: Option<&custody::CreatedOutput>,
+    checkpoint: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<(Snapshot, Instant)> {
+    b.check()?;
+    let c = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    c.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    c.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    c.execute_batch("PRAGMA query_only=ON; PRAGMA mmap_size=0; PRAGMA cache_size=-8192;")?;
+    if let Some(output) = held {
+        configure_memory_temp(&c, b)?;
+        output.check_live(b)?;
+    }
+    c.busy_timeout(Duration::from_millis(100))?;
+    for (k, n) in [
+        (Limit::SQLITE_LIMIT_LENGTH, 2 << 20),
+        (Limit::SQLITE_LIMIT_SQL_LENGTH, 1 << 20),
+        (Limit::SQLITE_LIMIT_COLUMN, 512),
+        (Limit::SQLITE_LIMIT_ATTACHED, 0),
+    ] {
+        c.set_limit(k, n)?;
+    }
+    let deadline = b.deadline.min(Instant::now() + Duration::from_secs(30));
+    install_progress(&c, deadline, b.cancelled.clone())?;
+    let policy = controlled.then_some((&*b, deadline));
+    let schema_rows = |sql: &str, cap| match policy {
+        None => plain_rows(&c, sql, cap),
+        Some(_) => plain_rows_checked(&c, sql, cap, policy),
+    };
+    c.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+        match ctx.action {
+            AuthAction::Read { .. } | AuthAction::Select => Authorization::Allow,
+            AuthAction::Pragma { pragma_name, .. }
+                if ["user_version", "integrity_check", "table_xinfo"].contains(&pragma_name) =>
+            {
+                Authorization::Allow
+            }
+            _ => Authorization::Deny,
+        }
+    }))?;
+    check_sql_phase(policy)?;
+    ensure!(
+        schema_rows("PRAGMA integrity_check", 2)? == vec![vec![Value::String("ok".into())]],
+        "SQLite integrity failure"
+    );
+    check_sql_phase(policy)?;
+    let version = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    check_sql_phase(policy)?;
+    let schema = schema_rows(
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name",
+        2048,
+    )?;
+    ensure!(
+        serde_json::to_vec(&schema)?.len() <= 4 << 20,
+        "schema byte bound exceeded"
+    );
+    let names: Vec<_> = schema
+        .iter()
+        .filter(|r| r[0] == "table")
+        .map(|r| r[1].as_str().context("invalid table name"))
+        .collect::<Result<_>>()?;
+    ensure!(
+        !names.is_empty() && names.len() <= 64,
+        "table count exceeds bound"
+    );
+    let mut tables = BTreeMap::new();
+    let (mut total, mut cells, mut encoded) = (0usize, 0usize, 0usize);
+    for name in names {
+        b.check()?;
+        check_sql_phase(policy)?;
+        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+        let definitions = schema_rows(&format!("PRAGMA table_xinfo({quoted})"), 512)?;
+        ensure!(!definitions.is_empty(), "empty table column list");
+        let columns: Vec<String> = definitions
+            .iter()
+            .map(|r| {
+                check_sql_phase(policy)?;
+                r[1].as_str()
+                    .map(str::to_owned)
+                    .context("invalid column name")
+            })
+            .collect::<Result<_>>()?;
+        let mut s = c.prepare(&format!("SELECT * FROM {quoted}"))?;
+        check_sql_phase(policy)?;
+        ensure!(
+            s.column_count() == columns.len(),
+            "hidden/generated columns unsupported"
+        );
+        let mut cursor = s.query([])?;
+        check_sql_phase(policy)?;
+        let mut rows = Rows::new();
+        let mut count = 0usize;
+        loop {
+            check_sql_phase(policy)?;
+            let row = cursor.next()?;
+            check_sql_phase(policy)?;
+            let Some(r) = row else {
+                break;
+            };
+            b.check()?;
+            ensure!(Instant::now() < deadline, "SQLite deadline exceeded");
+            count += 1;
+            total += 1;
+            cells += columns.len();
+            ensure!(
+                count <= 50_000 && total <= 200_000 && cells <= 2_000_000,
+                "SQL row/cell count exceeds bound"
+            );
+            let row: Row = (0..columns.len())
+                .map(|i| {
+                    check_sql_phase(policy)?;
+                    cell(r.get_ref(i)?)
+                })
+                .collect::<Result<_>>()?;
+            let size = serde_json::to_vec(&row)?.len();
+            encoded += size;
+            ensure!(
+                size <= 2 << 20 && encoded <= ENCODED_CAP,
+                "typed SQL byte bound exceeded"
+            );
+            *rows.entry(row).or_default() += 1;
+        }
+        check_sql_phase(policy)?;
+        tables.insert(
+            name.to_owned(),
+            Table {
+                columns,
+                definitions,
+                rows,
+            },
+        );
+    }
+    check_sql_phase(policy)?;
+    checkpoint(&c)?;
+    if let Some(output) = held {
+        output.check_live(b)?;
+        check_sql_phase(policy)?;
+    }
+    drop(c);
+    let snap = Snapshot {
+        schema,
+        tables,
+        version,
+        hashes,
+        source,
+    };
+    Ok((snap, deadline))
 }
 fn subtract(a: &Rows, b: &Rows, budget: &Budget) -> Result<Vec<Value>> {
     let mut result = Vec::new();
@@ -660,4 +903,13 @@ mod cancellation_tests {
 mod layout_tests {
     use super::*;
     use rusqlite::Connection;
+
+    fn snapshot(database: &Path) -> Snapshot {
+        let capture = Capture {
+            database,
+            database_sha256: Sha256::digest(fs::read(database).unwrap()).into(),
+            wal: None,
+        };
+        materialize(capture, &database.with_extension("sql"), &mut Budget::new()).unwrap()
+    }
 }
