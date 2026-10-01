@@ -40,6 +40,7 @@ pub const TESTED_USER_VERSIONS: &[i64] = &[2_400_060, 2_410_000];
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 mod scratch;
 pub mod tables;
+mod without;
 
 #[derive(Clone)]
 pub struct SourceHashes {
