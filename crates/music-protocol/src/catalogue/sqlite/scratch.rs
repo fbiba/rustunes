@@ -392,3 +392,6 @@ impl Drop for Scratch {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

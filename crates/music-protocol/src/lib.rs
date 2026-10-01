@@ -3,3 +3,6 @@
 pub mod catalogue;
 pub mod media;
 pub mod protocol;
+
+#[cfg(any(test, feature = "offline-test-support"))]
+pub mod test_support;
