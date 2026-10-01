@@ -4,5 +4,6 @@
 pub mod anchor;
 pub mod identity;
 pub mod inventory;
+pub mod mutation;
 pub mod presentation;
 pub mod sqlite;

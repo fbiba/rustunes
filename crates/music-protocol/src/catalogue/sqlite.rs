@@ -2198,6 +2198,9 @@ fn parse_artwork(
 }
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 mod current_storage_profile_tests {
     use super::*;
     #[test]
