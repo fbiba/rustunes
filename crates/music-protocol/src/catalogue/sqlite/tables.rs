@@ -902,6 +902,7 @@ mod cancellation_tests {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::test_support::catalogue::NativeFixture;
     use rusqlite::Connection;
 
     fn snapshot(database: &Path) -> Snapshot {
@@ -911,5 +912,47 @@ mod layout_tests {
             wal: None,
         };
         materialize(capture, &database.with_extension("sql"), &mut Budget::new()).unwrap()
+    }
+
+    #[test]
+    fn an_index_only_update_keeps_the_layout_and_a_column_change_does_not() {
+        let fixtures = [NativeFixture::new(), NativeFixture::index_only_update()];
+        let tested = snapshot(&fixtures[0].before);
+        assert_eq!(
+            tested.schema_hash().unwrap(),
+            "ffc9f173869d8f3bbc7fcfff56f93e6b7c1435608eabf9b5734c6e257e818c98"
+        );
+        assert_eq!(tested.layout_hash().unwrap(), LAYOUT_SHA256);
+        assert!(tested.layout_qualified().unwrap());
+
+        let newer = snapshot(&fixtures[1].before);
+        assert_eq!(newer.version, 2_410_000);
+        assert_ne!(newer.schema_hash().unwrap(), tested.schema_hash().unwrap());
+        assert_eq!(newer.layout_hash().unwrap(), LAYOUT_SHA256);
+        assert!(newer.layout_qualified().unwrap());
+
+        let mut older = tested.clone();
+        older.version = 2_400_059;
+        assert!(!older.layout_qualified().unwrap());
+
+        for sql in [
+            "ALTER TABLE album ADD COLUMN unmodelled TEXT",
+            "ALTER TABLE album RENAME COLUMN cloud_channel_name TO renamed",
+            "CREATE TABLE unmodelled(x)",
+            "DROP TABLE lyrics",
+        ] {
+            let fixture = NativeFixture::index_only_update();
+            Connection::open(&fixture.before)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+            let changed = snapshot(&fixture.before);
+            fs::remove_dir_all(&fixture.dir).unwrap();
+            assert_ne!(changed.layout_hash().unwrap(), LAYOUT_SHA256, "{sql}");
+            assert!(!changed.layout_qualified().unwrap(), "{sql}");
+        }
+        for fixture in fixtures {
+            fs::remove_dir_all(&fixture.dir).unwrap();
+        }
     }
 }

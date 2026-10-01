@@ -231,6 +231,29 @@ pub fn is_other_audio(path: &Path) -> bool {
             .any(|e| x.eq_ignore_ascii_case(e))
     })
 }
+pub fn read(path: &Path) -> Result<Source> {
+    let before = fs::symlink_metadata(path)?;
+    ensure!(
+        before.is_file()
+            && !before.file_type().is_symlink()
+            && (1..=MAX_BYTES).contains(&before.len()),
+        "MP3 source must be a bounded regular nonsymlink file"
+    );
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    ensure!(
+        same(&before, &file.metadata()?),
+        "MP3 source changed before open"
+    );
+    let result = read_file(&mut file, before.len())?;
+    ensure!(
+        same(&before, &file.metadata()?) && same(&before, &fs::symlink_metadata(path)?),
+        "MP3 source changed during inspection"
+    );
+    Ok(result)
+}
 use crate::media::held_source::same_file as same;
 fn read_file(file: &mut File, size: u64) -> Result<Source> {
     if size >= 12 {
@@ -787,3 +810,8 @@ pub fn read_front_cover(path: &Path, expected: &Source) -> Result<Option<Embedde
     );
     Ok(front)
 }
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+use crate::test_support::mpeg as test_fixture;

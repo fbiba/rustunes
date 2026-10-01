@@ -625,3 +625,6 @@ fn search(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

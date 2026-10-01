@@ -491,11 +491,117 @@ fn evidence(id: &str, bytes: &[u8]) -> FrameEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::mpeg::read;
     use std::path::PathBuf;
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(name)
+    }
+
+    #[test]
+    fn reads_tags_of_every_fixture_format() {
+        for (name, format) in [
+            ("tone-aac.m4a", Format::AacLc),
+            ("tone-flac.flac", Format::Flac),
+            ("tone-wav.wav", Format::Wav),
+            ("tone-aiff.aif", Format::Aiff),
+            ("tone-mpeg2.mp3", Format::Mpeg2Layer3),
+        ] {
+            let source = read(&fixture(name)).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(source.format(), format, "{name}");
+            let m = &source.metadata;
+            assert_eq!(m.title, ["Format title"], "{name}");
+            assert_eq!(m.artist, ["Format artist"], "{name}");
+            assert_eq!(m.album, ["Format album"], "{name}");
+            assert_eq!(m.track, Some(3), "{name}");
+            assert_eq!(m.genre, ["Test"], "{name}");
+            assert!(
+                m.release_date.iter().any(|d| d.starts_with("2024")),
+                "{name}"
+            );
+            source.transferred_identity().unwrap();
+        }
+        let aac = read(&fixture("tone-aac.m4a")).unwrap();
+        let stream = aac.stream.as_ref().unwrap();
+        assert_eq!(stream.valid_samples, 4410);
+        assert_eq!(stream.encoder_delay, 1024);
+        assert!(read(&fixture("tone-alac.m4a")).is_err());
+        // An MPEG-1 stream keeps its frame timing.
+        let vbr = read(&fixture("tone-mp3-vbr.mp3")).unwrap();
+        assert!(vbr.stream.is_none() && vbr.timing.is_some());
+    }
+
+    #[test]
+    fn an_empty_riff_track_number_is_none() {
+        // An INFO item: its id, length and NUL-terminated text, padded even.
+        let item = |id: &[u8], text: &str| {
+            let mut data = text.as_bytes().to_vec();
+            data.push(0);
+            let mut item = id.to_vec();
+            item.extend((data.len() as u32).to_le_bytes());
+            item.extend(&data);
+            if data.len() % 2 == 1 {
+                item.push(0);
+            }
+            item
+        };
+        let info = |items: &[Vec<u8>]| {
+            let mut tags = Tags::default();
+            riff_info(
+                &[b"INFO".as_slice(), &items.concat()].concat(),
+                &mut tags,
+                &mut Vec::new(),
+            )
+            .map(|()| tags)
+        };
+        let title = item(b"INAM", "Title");
+        let plain = info(std::slice::from_ref(&title)).unwrap();
+        for id in [b"ITRK", b"IPRT"] {
+            assert_eq!(info(&[title.clone(), item(id, "")]).unwrap(), plain);
+        }
+        assert_eq!(info(&[item(b"ITRK", "3")]).unwrap().track, Some(3));
+        assert!(info(&[item(b"ITRK", "x")]).is_err());
+    }
+
+    /// The `tone-flac.flac` fixture with one PICTURE block after STREAMINFO.
+    fn flac_with_picture(mime: &[u8], image: &[u8]) -> Vec<u8> {
+        let mut flac = std::fs::read(fixture("tone-flac.flac")).unwrap();
+        let mut payload = Vec::new();
+        payload.extend(3u32.to_be_bytes());
+        payload.extend((mime.len() as u32).to_be_bytes());
+        payload.extend(mime);
+        payload.extend(0u32.to_be_bytes());
+        payload.extend([0; 16]);
+        payload.extend((image.len() as u32).to_be_bytes());
+        payload.extend(image);
+        let mut block = vec![6];
+        block.extend(&(payload.len() as u32).to_be_bytes()[1..]);
+        block.extend(payload);
+        flac.splice(4 + 4 + 34..4 + 4 + 34, block);
+        flac
+    }
+
+    #[test]
+    fn a_flac_picture_declaring_no_type_is_read_by_its_bytes() {
+        let dir = std::env::temp_dir().join(format!("flac-picture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = crate::media::png::tests::png(5, 4);
+        let path = dir.join("cover.flac");
+        let outcome = (|| {
+            std::fs::write(&path, flac_with_picture(b"", &png))?;
+            let source = read(&path)?;
+            assert_eq!(source.artwork.len(), 1);
+            let cover = &source.artwork[0];
+            assert_eq!((cover.mime, cover.width, cover.height), ("image/png", 5, 4));
+            std::fs::write(&path, flac_with_picture(b"", b"not a picture"))?;
+            assert!(read(&path).is_err());
+            std::fs::write(&path, flac_with_picture(b"image/jpeg", &png))?;
+            assert!(read(&path).is_err());
+            Ok::<_, anyhow::Error>(())
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome.unwrap();
     }
 }
