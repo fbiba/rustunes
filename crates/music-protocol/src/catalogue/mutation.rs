@@ -13,6 +13,8 @@ use plist::{Dictionary, Value};
 
 use crate::catalogue::sqlite::{Catalog, Track};
 
+pub mod pending_delete;
+
 /// Change exactly catalog title and sort_name. The caller supplies both literal
 /// values: no article stripping, source-file rewrite, or statistics update.
 pub fn title(
@@ -402,5 +404,191 @@ mod tests {
         assert_eq!(keys(info), BTreeSet::from(["primary_container_pid"]));
         assert_eq!(info["primary_container_pid"].as_signed_integer(), Some(-3));
         operations.clone()
+    }
+
+    #[test]
+    fn many_deletes_share_one_envelope_in_order() {
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let (a, b) = (track(0x8000_0000_0000_0001), track(7));
+        let bytes = prepare_many(identity(40), &[&a, &b], time, validate_removable).unwrap();
+        let root = Value::from_reader(Cursor::new(&bytes)).unwrap();
+        let root = root.as_dictionary().unwrap();
+        assert_eq!(root["revision"].as_unsigned_integer(), Some(41));
+        let operations = root["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 3);
+        assert_eq!(
+            operations[0].as_dictionary().unwrap()["operation"].as_string(),
+            Some("update_db_info")
+        );
+        for (operation, id) in operations[1..].iter().zip([i64::MIN + 1, 7]) {
+            let operation = operation.as_dictionary().unwrap();
+            assert_eq!(keys(operation), BTreeSet::from(["operation", "pid"]));
+            assert_eq!(operation["operation"].as_string(), Some("delete_track"));
+            assert_eq!(operation["pid"].as_signed_integer(), Some(id));
+        }
+        assert!(prepare_many(identity(40), &[&a, &a], time, validate_removable).is_err());
+        assert!(prepare_many(identity(40), &[], time, validate_removable).is_err());
+        let mut gone = track(9);
+        gone.afc_path = None;
+        assert!(prepare_many(identity(40), &[&a, &gone], time, validate_removable).is_err());
+        let mut empty = track(9);
+        empty.metadata.total_time_ms = 0;
+        empty.metadata.file_size = 0;
+        prepare_many(identity(40), &[&a, &empty], time, validate_removable).unwrap();
+        // A row an interrupted insertion left has no location and no asset;
+        // only the unfilled batch removes it, and it refuses installed tracks.
+        gone.availability.has_non_purgeable_asset = false;
+        prepare_many(identity(40), &[&gone], time, validate_unfilled).unwrap();
+        assert!(prepare_many(identity(40), &[&gone], time, validate_removable).is_err());
+        assert!(prepare_many(identity(40), &[&a], time, validate_unfilled).is_err());
+    }
+
+    #[test]
+    fn one_removal_file_holds_at_most_499_tracks_or_playlists() {
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let tracks: Vec<Track> = (1..=500).map(track).collect();
+        let refs: Vec<&Track> = tracks.iter().collect();
+        prepare_many(identity(40), &refs[..499], time, validate_removable).unwrap();
+        let error = prepare_many(identity(40), &refs, time, validate_removable)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("501 operations"), "{error}");
+        let lists: Vec<u64> = (1..=500).collect();
+        prepare_playlists(identity(40), &lists[..499], time).unwrap();
+        assert!(prepare_playlists(identity(40), &lists, time).is_err());
+    }
+
+    #[test]
+    fn playlist_deletes_share_one_envelope_in_order() {
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let lists = [0x1234_5678_9abc_def0, 0x8000_0000_0000_0003, 5];
+        let bytes = prepare_playlists(identity(40), &lists, time).unwrap();
+        let root = Value::from_reader(Cursor::new(&bytes)).unwrap();
+        let root = root.as_dictionary().unwrap();
+        assert_eq!(
+            keys(root),
+            BTreeSet::from(["revision", "timestamp", "operations"])
+        );
+        assert_eq!(root["revision"].as_unsigned_integer(), Some(41));
+        assert_eq!(root["timestamp"].as_date(), Some(time.into()));
+        let operations = root["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 4);
+        let db = operations[0].as_dictionary().unwrap();
+        assert_eq!(db["operation"].as_string(), Some("update_db_info"));
+        assert_eq!(db["pid"].as_signed_integer(), Some(-2));
+        for (operation, id) in operations[1..]
+            .iter()
+            .zip([0x1234_5678_9abc_def0, i64::MIN + 3, 5])
+        {
+            let operation = operation.as_dictionary().unwrap();
+            assert_eq!(keys(operation), BTreeSet::from(["operation", "pid"]));
+            assert_eq!(operation["operation"].as_string(), Some("delete_playlist"));
+            assert_eq!(operation["pid"].as_signed_integer(), Some(id));
+        }
+        // Nothing, zero, the library container, a repeat, an unknown catalog
+        // and an exhausted anchor refuse.
+        for (catalog, lists) in [
+            (identity(40), &[][..]),
+            (identity(40), &[0][..]),
+            (identity(40), &[5, u64::MAX - 2][..]),
+            (identity(40), &[5, 5][..]),
+            (identity(u32::MAX), &[5][..]),
+        ] {
+            assert!(prepare_playlists(catalog, lists, time).is_err());
+        }
+        let mut unknown = identity(40);
+        unknown.database = 0;
+        assert!(prepare_playlists(unknown, &[5], time).is_err());
+    }
+
+    #[test]
+    fn title_changes_only_two_literal_fields_and_keeps_existing_signed_ids() {
+        let time = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let bytes = prepare(
+            identity(14),
+            &track(u64::MAX),
+            Mutation::Title {
+                title: "The Δοκιμή",
+                sort_name: "Δοκιμή",
+            },
+            time,
+        )
+        .unwrap();
+        let operations = envelope(&bytes, 15, time);
+        let own = operations[1].as_dictionary().unwrap();
+        assert_eq!(keys(own), BTreeSet::from(["operation", "pid", "item"]));
+        assert_eq!(own["operation"].as_string(), Some("update_track"));
+        assert_eq!(own["pid"].as_signed_integer(), Some(-1));
+        let item = own["item"].as_dictionary().unwrap();
+        assert_eq!(keys(item), BTreeSet::from(["title", "sort_name"]));
+        assert_eq!(item["title"].as_string(), Some("The Δοκιμή"));
+        assert_eq!(item["sort_name"].as_string(), Some("Δοκιμή"));
+        assert_eq!(
+            bytes,
+            prepare(
+                identity(14),
+                &track(u64::MAX),
+                Mutation::Title {
+                    title: "The Δοκιμή",
+                    sort_name: "Δοκιμή"
+                },
+                time
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn deletion_is_exactly_one_existing_pid_without_metadata_or_collection_ops() {
+        let bytes = prepare(identity(16), &track(u64::MAX), Mutation::Delete, UNIX_EPOCH).unwrap();
+        let operations = envelope(&bytes, 17, UNIX_EPOCH);
+        let own = operations[1].as_dictionary().unwrap();
+        assert_eq!(keys(own), BTreeSet::from(["operation", "pid"]));
+        assert_eq!(own["operation"].as_string(), Some("delete_track"));
+        assert_eq!(own["pid"].as_signed_integer(), Some(-1));
+    }
+
+    #[test]
+    fn absent_zero_ambiguous_and_unavailable_targets_are_refused() {
+        assert!(target(&[track(1)], 2).is_err());
+        assert!(target(&[track(0)], 0).is_err());
+        assert!(target(&[track(1), track(1)], 1).is_err());
+        for change in 0..9 {
+            let mut track = track(1);
+            match change {
+                0 => track.availability.is_placeholder = true,
+                1 => track.availability.is_library_added = false,
+                2 => track.availability.has_non_purgeable_asset = false,
+                3 => track.availability.is_supported_type = false,
+                4 => track.afc_path = None,
+                5 => track.afc_path = Some("https://example.invalid/audio.m4a".into()),
+                6 => track.metadata.file_size = 0,
+                7 => track.metadata.total_time_ms = 0,
+                _ => track.afc_path = Some("iTunes_Control/Music/F39/../TEST.m4a".into()),
+            }
+            assert!(prepare(identity(13), &track, Mutation::Delete, UNIX_EPOCH).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_text_catalog_identity_and_anchor_exhaustion_are_refused() {
+        for text in [String::new(), "bad\0title".into(), "a".repeat(4097)] {
+            for mutation in [
+                Mutation::Title {
+                    title: &text,
+                    sort_name: "Valid",
+                },
+                Mutation::Title {
+                    title: "Valid",
+                    sort_name: &text,
+                },
+            ] {
+                assert!(prepare(identity(13), &track(1), mutation, UNIX_EPOCH).is_err());
+            }
+        }
+        assert!(prepare(identity(u32::MAX), &track(1), Mutation::Delete, UNIX_EPOCH).is_err());
+        let mut missing = identity(13);
+        missing.database = 0;
+        assert!(prepare(missing, &track(1), Mutation::Delete, UNIX_EPOCH).is_err());
     }
 }
