@@ -1,8 +1,57 @@
 //! Validation of retained operation DATA, without catalogue or receiver authority.
+use super::{SourceMetadataPatch, normalize_source_metadata_item, operation_value};
 use crate::catalogue::sqlite::Track;
 use anyhow::{Context, Result, ensure};
 use plist::Value;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
+
+/// Check retained bytes against the serializer's accepted request and canonical
+/// envelope. `before` and its sort are descriptive data: this does not rebind a
+/// catalogue, admit shared lookup effects, restore a live binding, or authorize
+/// execution/completion. The caller must validate the enclosing DTO and custody.
+/// A genuine producer always emits this bounded binary representation; requiring
+/// it also rejects duplicate keys, alternate encodings and trailing bytes.
+pub fn validate_source_metadata_operation_data(
+    before: &Track,
+    before_sort: &str,
+    patch: &SourceMetadataPatch,
+    database_pid: u64,
+    primary_container_pid: u64,
+    base_anchor: u32,
+    operation: &[u8],
+) -> Result<()> {
+    ensure!(
+        (40..=65_536).contains(&operation.len()) && operation.starts_with(b"bplist00"),
+        "source metadata operation is not bounded binary data"
+    );
+    validate_binary_layout(operation)?;
+    let accepted = normalize_source_metadata_item(before, before_sort, patch)?;
+    let value = Value::from_reader(OperationReader::new(operation))?;
+    let timestamp = value
+        .as_dictionary()
+        .and_then(|root| root.get("timestamp"))
+        .and_then(Value::as_date)
+        .context("source metadata operation timestamp is not a date")?;
+    let expected = operation_value(
+        database_pid,
+        primary_container_pid,
+        base_anchor,
+        before.sync_id,
+        accepted.item,
+        timestamp,
+    )?;
+    ensure!(
+        value == expected,
+        "source metadata operation differs from the accepted request or envelope"
+    );
+    let mut canonical = Vec::new();
+    expected.to_writer_binary(&mut canonical)?;
+    ensure!(
+        canonical == operation,
+        "source metadata operation is not canonical serializer output"
+    );
+    Ok(())
+}
 
 // Reject implausible trailer allocation requests before invoking the plist
 // reader. This shape has fewer than 64 objects; 128 leaves bounded headroom.
@@ -79,3 +128,6 @@ impl Seek for OperationReader<'_> {
         self.cursor.seek(position)
     }
 }
+
+#[cfg(test)]
+mod tests;
