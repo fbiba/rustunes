@@ -482,3 +482,396 @@ fn matching_passes_for_profile(
     }
     Ok(())
 }
+
+#[derive(Debug, Serialize)]
+pub struct Guard {
+    pub path: String,
+    pub stage: String,
+    pub expected_bytes: u64,
+    pub expected_sha256: String,
+    pub raw_local_file: String,
+    pub status: String,
+    pub before: Option<Attributes>,
+    pub after: Option<Attributes>,
+    pub retained_bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub opened: bool,
+    pub close_attempted: bool,
+    pub close_acknowledged: bool,
+    pub error: Option<String>,
+}
+
+pub fn matching_guards(guards: &[Guard]) -> Result<()> {
+    ensure!(guards.len() == 4, "guard set incomplete");
+    for (index, guard) in guards.iter().enumerate() {
+        ensure!(
+            guard.path == if index % 2 == 0 { PREFS } else { ARTWORKDB }
+                && guard.stage == if index < 2 { "before" } else { "after" },
+            "guard order differs"
+        );
+        ensure!(
+            guard.status == "complete"
+                && guard.opened
+                && guard.close_acknowledged
+                && guard.close_attempted
+                && guard.retained_bytes == Some(guard.expected_bytes)
+                && guard.sha256.as_deref() == Some(guard.expected_sha256.as_str()),
+            "guard incomplete or bytes differ"
+        );
+        let before = guard
+            .before
+            .as_ref()
+            .context("guard before attributes absent")?;
+        let after = guard
+            .after
+            .as_ref()
+            .context("guard after attributes absent")?;
+        let observed = entry("guard", before.clone())?;
+        ensure!(
+            observed.kind == Kind::RegularFile
+                && observed.size == guard.expected_bytes
+                && stable(before) == stable(after),
+            "guard attributes changed"
+        );
+    }
+    for index in 0..2 {
+        let before = &guards[index];
+        let after = &guards[index + 2];
+        ensure!(
+            before.expected_bytes == after.expected_bytes
+                && before.expected_sha256 == after.expected_sha256
+                && stable(before.before.as_ref().unwrap()) == stable(after.after.as_ref().unwrap()),
+            "guard attributes changed across tree passes"
+        );
+    }
+    Ok(())
+}
+
+pub fn outcome(complete: bool) -> serde_json::Value {
+    serde_json::json!({
+        "status": if complete { "complete" } else { "incomplete" },
+        "inventory_complete": complete,
+        "atomic_snapshot_claimed": false,
+        "restoration_or_mutation_authorized": false,
+        "phone_writes": 0,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn attrs(kind: &str) -> Attributes {
+        BTreeMap::from([
+            ("st_ifmt".into(), kind.into()),
+            ("st_size".into(), "7".into()),
+            ("st_mtime".into(), "23".into()),
+            ("st_atime".into(), "10".into()),
+        ])
+    }
+    fn snapshot() -> Snapshot {
+        let mut result = Snapshot {
+            completed: true,
+            ..Snapshot::default()
+        };
+        for parent in ["iTunes_Control", "iTunes_Control/iTunes"] {
+            result.ancestors.insert(parent.into(), attrs("S_IFDIR"));
+        }
+        for (role, root) in ROOTS {
+            result.roots.insert(role.into(), "present".into());
+            result
+                .directory_names
+                .insert(root.into(), vec!["returned-chunk".into()]);
+            insert(
+                &mut result,
+                root.into(),
+                entry(role, attrs("S_IFDIR")).unwrap(),
+            )
+            .unwrap();
+            insert(
+                &mut result,
+                format!("{root}/returned-chunk"),
+                entry(role, attrs("S_IFREG")).unwrap(),
+            )
+            .unwrap();
+        }
+        result
+    }
+    fn guards() -> Vec<Guard> {
+        (0..4)
+            .map(|index| Guard {
+                path: if index % 2 == 0 {
+                    PREFS.into()
+                } else {
+                    ARTWORKDB.into()
+                },
+                stage: if index < 2 {
+                    "before".into()
+                } else {
+                    "after".into()
+                },
+                expected_bytes: 7,
+                expected_sha256: "a".repeat(64),
+                raw_local_file: "private-guard".into(),
+                status: "complete".into(),
+                before: Some(attrs("S_IFREG")),
+                after: Some(attrs("S_IFREG")),
+                retained_bytes: Some(7),
+                sha256: Some("a".repeat(64)),
+                opened: true,
+                close_attempted: true,
+                close_acknowledged: true,
+                error: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn returned_names_define_paths_and_reject_unsafe_or_duplicate_components() {
+        let (_, names) = super::names(b".\0..\0Purgable\0real-chunk\0").unwrap();
+        assert_eq!(names, ["Purgable", "real-chunk"]);
+        assert_eq!(
+            child(ROOTS[0].1, ROOTS[0].1, &names[0]).unwrap().0,
+            "iTunes_Control/Artwork/Purgable"
+        );
+        for raw in [
+            b"x\0x\0".as_slice(),
+            b"../x\0",
+            b"x\\y\0",
+            b"\xff\0",
+            b"x\0\0",
+            b"unterminated",
+        ] {
+            assert!(super::names(raw).is_err());
+        }
+        assert!(child(ROOTS[0].1, ROOTS[1].1, "x").is_err());
+        assert!(child("arbitrary", "arbitrary", "x").is_err());
+    }
+
+    #[test]
+    fn combined_budgets_and_depth_refuse_the_first_excess() {
+        for (mut budget, limit) in [
+            (Budget::companion_metadata(), MAX_DIRECTORIES),
+            (Budget::artwork_discovery(), MAX_DISCOVERY_DIRECTORIES),
+        ] {
+            budget.names(MAX_ENTRIES - 1).unwrap();
+            budget.names(1).unwrap();
+            assert!(budget.names(1).is_err());
+            for _ in 0..limit {
+                budget.directory().unwrap();
+            }
+            assert!(budget.directory().is_err());
+            for _ in 0..MAX_OPERATIONS {
+                budget.operation().unwrap();
+            }
+            assert!(budget.operation().is_err());
+            assert_eq!(budget.directories_listed, limit);
+            assert_eq!(budget.returned_non_dot_entries, MAX_ENTRIES);
+            assert_eq!(budget.operations_attempted, MAX_OPERATIONS);
+        }
+        let root = ROOTS[0].1;
+        let parent = format!("{root}/{}", ["x"; MAX_DEPTH - 1].join("/"));
+        let (deepest, depth) = child(root, &parent, "last").unwrap();
+        assert_eq!(depth, MAX_DEPTH);
+        assert!(child(root, &deepest, "excess").is_err());
+    }
+
+    #[test]
+    fn full_attributes_reject_duplicates_unknown_kinds_and_symlinks() {
+        assert!(attributes(b"st_size\0").is_err());
+        assert!(attributes(b"st_size\07\0st_size\08\0").is_err());
+        for kind in ["S_IFLNK", "S_IFIFO", "unknown"] {
+            assert!(entry("role", attrs(kind)).is_err());
+        }
+        assert!(entry("role", BTreeMap::new()).is_err());
+        let mut map = attrs("S_IFREG");
+        map.insert("st_size".into(), "-1".into());
+        assert!(entry("role", map).is_err());
+        let mut snapshot = snapshot();
+        assert!(
+            insert(
+                &mut snapshot,
+                ROOTS[0].1.into(),
+                entry("role", attrs("S_IFDIR")).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn two_passes_ignore_only_atime_and_reject_names_or_attribute_changes() {
+        let before = snapshot();
+        let mut after = snapshot();
+        after
+            .entries
+            .get_mut(ROOTS[0].1)
+            .unwrap()
+            .attributes
+            .insert("st_atime".into(), "999".into());
+        matching_passes(&before, &after).unwrap();
+        after
+            .entries
+            .get_mut(ROOTS[0].1)
+            .unwrap()
+            .attributes
+            .insert("st_mtime".into(), "999".into());
+        assert!(matching_passes(&before, &after).is_err());
+        after = snapshot();
+        after
+            .directory_names
+            .get_mut(ROOTS[1].1)
+            .unwrap()
+            .push("new".into());
+        assert!(matching_passes(&before, &after).is_err());
+        after = snapshot();
+        after
+            .entries
+            .get_mut(ROOTS[1].1)
+            .unwrap()
+            .attributes
+            .insert("new_attribute".into(), "yes".into());
+        assert!(matching_passes(&before, &after).is_err());
+    }
+
+    #[test]
+    fn changed_guards_and_lost_close_never_establish_inventory_completion() {
+        let mut records = guards();
+        matching_guards(&records).unwrap();
+        records[3].close_acknowledged = false;
+        assert!(matching_guards(&records).is_err());
+        records = guards();
+        records[2].sha256 = Some("b".repeat(64));
+        assert!(matching_guards(&records).is_err());
+        records = guards();
+        records[2]
+            .before
+            .as_mut()
+            .unwrap()
+            .insert("st_mtime".into(), "24".into());
+        records[2]
+            .after
+            .as_mut()
+            .unwrap()
+            .insert("st_mtime".into(), "24".into());
+        assert!(matching_guards(&records).is_err());
+        assert_eq!(outcome(false)["status"], "incomplete");
+        assert_eq!(outcome(false)["inventory_complete"], false);
+    }
+
+    #[test]
+    fn root_absence_is_separate_from_unknown_and_incomplete_passes() {
+        let mut before = snapshot();
+        let role = ROOTS[1].0;
+        let root = ROOTS[1].1;
+        before
+            .roots
+            .insert(role.into(), "canonically_absent".into());
+        before
+            .entries
+            .retain(|path, _| path != root && !path.starts_with(&format!("{root}/")));
+        before.directory_names.remove(root);
+        let mut after = before.clone();
+        matching_passes(&before, &after).unwrap();
+        after.roots.insert(role.into(), "unknown".into());
+        assert!(matching_passes(&before, &after).is_err());
+        after = before.clone();
+        after.completed = false;
+        assert!(matching_passes(&before, &after).is_err());
+    }
+
+    #[test]
+    fn receipt_coverage_rejects_missing_child_unlisted_entry_and_non_directory_list() {
+        let root = ROOTS[0].1;
+        let mut missing = snapshot();
+        missing.entries.remove(&format!("{root}/returned-chunk"));
+        assert!(matching_passes(&missing, &missing).is_err());
+        let mut orphan = snapshot();
+        insert(
+            &mut orphan,
+            format!("{root}/unlisted"),
+            entry(ROOTS[0].0, attrs("S_IFREG")).unwrap(),
+        )
+        .unwrap();
+        assert!(matching_passes(&orphan, &orphan).is_err());
+        let mut file_list = snapshot();
+        file_list
+            .directory_names
+            .insert(format!("{root}/returned-chunk"), vec![]);
+        assert!(matching_passes(&file_list, &file_list).is_err());
+        let mut unlisted_directory = snapshot();
+        *unlisted_directory
+            .entries
+            .get_mut(&format!("{root}/returned-chunk"))
+            .unwrap() = entry(ROOTS[0].0, attrs("S_IFDIR")).unwrap();
+        assert!(matching_passes(&unlisted_directory, &unlisted_directory).is_err());
+        let mut dangling = snapshot();
+        dangling
+            .directory_names
+            .insert(format!("{root}/unknown"), vec![]);
+        assert!(matching_passes(&dangling, &dangling).is_err());
+    }
+
+    #[test]
+    fn fixed_directory_profiles_preserve_serialized_counters() {
+        for mut budget in [Budget::companion_metadata(), Budget::artwork_discovery()] {
+            budget.directory().unwrap();
+            budget.names(7).unwrap();
+            budget.operation().unwrap();
+            assert_eq!(
+                serde_json::to_string(&budget).unwrap(),
+                "{\"returned_non_dot_entries\":7,\"directories_listed\":1,\"operations_attempted\":1}"
+            );
+        }
+        let mut discovery = ArtworkDiscoveryBudget::default();
+        for _ in 0..MAX_DISCOVERY_DIRECTORIES {
+            discovery.directory().unwrap();
+        }
+        assert!(discovery.directory().is_err());
+        assert_eq!(
+            serde_json::to_string(&discovery).unwrap(),
+            "{\"returned_non_dot_entries\":0,\"directories_listed\":512,\"operations_attempted\":0}"
+        );
+    }
+
+    fn snapshot_with_directories(count: usize) -> Snapshot {
+        let mut value = snapshot();
+        let (role, root) = ROOTS[0];
+        for index in 2..count {
+            let name = format!("directory-{index:04}");
+            let path = format!("{root}/{name}");
+            insert(
+                &mut value,
+                path.clone(),
+                entry(role, attrs("S_IFDIR")).unwrap(),
+            )
+            .unwrap();
+            value.directory_names.insert(path, Vec::new());
+            value.directory_names.get_mut(root).unwrap().push(name);
+        }
+        value.directory_names.get_mut(root).unwrap().sort();
+        assert_eq!(value.directory_names.len(), count);
+        value
+    }
+
+    #[test]
+    fn retained_directory_profiles_refuse_first_excess() {
+        let discovery_edge = snapshot_with_directories(MAX_DISCOVERY_DIRECTORIES / 2);
+        matching_artwork_discovery_passes(&discovery_edge, &discovery_edge).unwrap();
+        let discovery_excess = snapshot_with_directories(MAX_DISCOVERY_DIRECTORIES / 2 + 1);
+        assert_eq!(
+            matching_artwork_discovery_passes(&discovery_edge, &discovery_excess)
+                .unwrap_err()
+                .to_string(),
+            "retained coverage exceeds combined traversal bounds"
+        );
+        matching_passes(&discovery_excess, &discovery_excess).unwrap();
+        let companion_edge = snapshot_with_directories(MAX_DIRECTORIES / 2);
+        matching_passes(&companion_edge, &companion_edge).unwrap();
+        let companion_excess = snapshot_with_directories(MAX_DIRECTORIES / 2 + 1);
+        assert_eq!(
+            matching_passes(&companion_edge, &companion_excess)
+                .unwrap_err()
+                .to_string(),
+            "retained coverage exceeds combined traversal bounds"
+        );
+    }
+}
