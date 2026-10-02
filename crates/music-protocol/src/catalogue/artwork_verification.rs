@@ -766,4 +766,544 @@ mod tests {
         after.artists = &empty_artists;
         assert!(verify_views(&before, &after, u64::MAX, 100).is_err());
     }
+
+    #[test]
+    fn only_complete_recent_play_reset_is_accepted_and_disclosed() {
+        let fixture = Fixture::new();
+        let mut old = fixture.before.tracks().to_vec();
+        old[0].playback.play_count_recent = 3;
+        let mut second = old[0].clone();
+        second.sync_id = 1000;
+        second.playback.play_count_recent = 4;
+        old.push(second);
+        let fingerprints = BTreeMap::from([(u64::MAX, [1; 32]), (1000, [2; 32])]);
+        for (counts, accepted, expected_resets) in [
+            ([3, 4], true, 0),
+            ([0, 0], true, 2),
+            ([0, 4], false, 0),
+            ([3, 0], false, 0),
+            ([2, 0], false, 0),
+            ([4, 4], false, 0),
+        ] {
+            let mut new = old.clone();
+            for (track, count) in new.iter_mut().zip(counts) {
+                track.playback.play_count_recent = count;
+            }
+            let (mut before, mut after) = fixture.views();
+            before.tracks = &old;
+            after.tracks = &new;
+            before.stats_except_recent_play = &fingerprints;
+            after.stats_except_recent_play = &fingerprints;
+            let result = verify_views(&before, &after, u64::MAX, 100);
+            assert_eq!(result.is_ok(), accepted, "recent counts {counts:?}");
+            if accepted {
+                assert_eq!(result.unwrap().1.len(), expected_resets);
+            }
+        }
+    }
+
+    #[test]
+    fn recent_reset_never_waives_other_fields_or_raw_statistics() {
+        let fixture = Fixture::new();
+        let mut old = fixture.before.tracks().to_vec();
+        old[0].playback.play_count_recent = 3;
+        old[0].playback.skip_count_recent = 2;
+        for variant in 0..10 {
+            let mut new = old.clone();
+            new[0].playback.play_count_recent = 0;
+            new[0].playback.skip_count_recent = 0;
+            match variant {
+                0 => new[0].playback.skip_count_recent = 1,
+                1 => new[0].playback.play_count_user += 1,
+                2 => new[0].playback.has_been_played = !new[0].playback.has_been_played,
+                3 => new[0].playback.user_rating += 1,
+                4 => {
+                    new[0].playback.user_rating_is_derived = !new[0].playback.user_rating_is_derived
+                }
+                5 => new[0].playback.liked_state += 1,
+                6 => new[0].playback.skip_count_user += 1,
+                7 => new[0].metadata.title.push('!'),
+                8 => new[0].availability.is_placeholder = true,
+                _ => {} // An unprojected raw date/bookmark change below.
+            }
+            let (mut before, mut after) = fixture.views();
+            before.tracks = &old;
+            after.tracks = &new;
+            let altered = BTreeMap::from([(u64::MAX, [9; 32])]);
+            if variant == 9 {
+                after.stats_except_recent_play_and_skip = &altered;
+            }
+            assert!(
+                verify_views(&before, &after, u64::MAX, 100).is_err(),
+                "variant {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_missing_extra_or_unrelated_artwork_relationships() {
+        for variant in 0..6 {
+            let mut fixture = Fixture::new();
+            match variant {
+                0 => {
+                    fixture.track_art.clear();
+                }
+                1 => {
+                    fixture.album_art.clear();
+                }
+                2 => {
+                    fixture.track_art.insert(u64::MAX, 101);
+                }
+                3 => {
+                    fixture.track_art.insert(555, 100);
+                }
+                4 => {
+                    fixture.album_art.insert(555, 100);
+                }
+                _ => {
+                    fixture.occupied.insert(101);
+                }
+            }
+            let (before, after) = fixture.views();
+            assert!(verify_views(&before, &after, u64::MAX, 100).is_err());
+        }
+    }
+    #[test]
+    fn rejects_cached_object_changes_even_if_id_sets_are_unchanged() {
+        let fixture = Fixture::new();
+        let (mut before, mut after) = fixture.views();
+        let old = CachedArtwork {
+            cache_id: 101,
+            artwork_type: 6,
+            variant: 0,
+            relative_path: "bb/00000000000000000000000000000000000000".into(),
+        };
+        let prior = BTreeMap::from([((101, 0), old.clone())]);
+        let mut later = fixture.cached_objects.clone();
+        later.insert((101, 0), old);
+        let old_ids = BTreeSet::from([101]);
+        let new_ids = BTreeSet::from([100, 101]);
+        before.occupied = &old_ids;
+        before.cached = &old_ids;
+        before.cached_objects = &prior;
+        after.occupied = &new_ids;
+        after.cached = &new_ids;
+        after.cached_objects = &later;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_ok());
+        for change in 0..3 {
+            let mut altered = later.clone();
+            let row = altered.get_mut(&(101, 0)).unwrap();
+            match change {
+                0 => row.relative_path.replace_range(..2, "cc"),
+                1 => row.artwork_type = 1,
+                _ => row.variant = 1,
+            }
+            let (_, mut changed) = fixture.views();
+            changed.occupied = &new_ids;
+            changed.cached = &new_ids;
+            changed.cached_objects = &altered;
+            assert!(verify_views(&before, &changed, u64::MAX, 100).is_err());
+        }
+    }
+    #[test]
+    fn allows_only_new_or_exact_previous_album_cache_pending_permanent_byte_proof() {
+        let fixture = Fixture::new();
+        let (mut before, mut after) = fixture.views();
+        let old_ids = BTreeSet::from([101]);
+        let new_ids = BTreeSet::from([100, 101]);
+        let old = CachedArtwork {
+            cache_id: 101,
+            artwork_type: 6,
+            variant: 0,
+            relative_path: "aa/00000000000000000000000000000000000000".into(),
+        };
+        let prior_objects = BTreeMap::from([((101, 0), old.clone())]);
+        let mut objects = fixture.cached_objects.clone();
+        objects.insert((101, 0), old);
+        let old_album = BTreeMap::from([((-31i64 as u64), 101)]);
+        before.occupied = &old_ids;
+        before.cached = &old_ids;
+        before.cached_objects = &prior_objects;
+        before.album_art = &old_album;
+        after.occupied = &new_ids;
+        after.cached = &new_ids;
+        after.cached_objects = &objects;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_ok());
+        after.album_art = &old_album;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_ok());
+        let unrelated = BTreeMap::from([((-31i64 as u64), 102)]);
+        after.album_art = &unrelated;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_err());
+        let absent = BTreeMap::new();
+        before.album_art = &absent;
+        after.album_art = &old_album;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_err());
+    }
+    #[test]
+    fn a_dangling_prior_album_registration_leaves_only_when_the_album_takes_the_new_cover() {
+        let fixture = Fixture::new();
+        let (mut before, mut after) = fixture.views();
+        // As one album did after a compensated batch: the album registers
+        // 723 with no cached object; an older cached image (101) stays.
+        let old_occupied = BTreeSet::from([101, 723]);
+        let old_cached = BTreeSet::from([101]);
+        let old = CachedArtwork {
+            cache_id: 101,
+            artwork_type: 6,
+            variant: 0,
+            relative_path: "aa/00000000000000000000000000000000000000".into(),
+        };
+        let prior_objects = BTreeMap::from([((101, 0), old.clone())]);
+        let mut objects = fixture.cached_objects.clone();
+        objects.insert((101, 0), old);
+        let dangling = BTreeMap::from([((-31i64 as u64), 723)]);
+        let no_track_art = BTreeMap::new();
+        before.occupied = &old_occupied;
+        before.cached = &old_cached;
+        before.cached_objects = &prior_objects;
+        before.album_art = &dangling;
+        before.track_art = &no_track_art;
+        let new_occupied = BTreeSet::from([100, 101]);
+        let new_cached = BTreeSet::from([100, 101]);
+        after.occupied = &new_occupied;
+        after.cached = &new_cached;
+        after.cached_objects = &objects;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_ok());
+        // A prior ID that kept its registration must stay.
+        after.album_art = &dangling;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_err());
+        after.album_art = &fixture.album_art;
+        // A prior ID with a cached object, or another registration, stays too.
+        let cached_prior = BTreeSet::from([101, 723]);
+        before.cached = &cached_prior;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_err());
+        before.cached = &old_cached;
+        let shared = BTreeMap::from([(7, 723)]);
+        before.track_art = &shared;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_err());
+    }
+    #[test]
+    fn a_dangling_prior_track_registration_leaves_when_its_track_and_album_take_the_new_cover() {
+        let fixture = Fixture::new();
+        let (mut before, mut after) = fixture.views();
+        // As after a cover the phone took the metadata of and never received:
+        // the target and its album register 723 with no cached object.
+        let old_occupied = BTreeSet::from([723]);
+        let no_cached = BTreeSet::new();
+        let no_objects = BTreeMap::new();
+        let dangling_track = BTreeMap::from([(u64::MAX, 723)]);
+        let dangling_album = BTreeMap::from([((-31i64 as u64), 723)]);
+        before.occupied = &old_occupied;
+        before.cached = &no_cached;
+        before.cached_objects = &no_objects;
+        before.track_art = &dangling_track;
+        before.album_art = &dangling_album;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_ok());
+        let namespace = |before: &View<'_>, after: &View<'_>| {
+            verify_views(before, after, u64::MAX, 100)
+                .unwrap_err()
+                .to_string()
+                .contains("namespace")
+        };
+        // An album that kept the prior ID keeps it in the namespace.
+        after.album_art = &dangling_album;
+        assert!(namespace(&before, &after));
+        let kept = BTreeSet::from([100, 723]);
+        after.occupied = &kept;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_ok());
+        after.album_art = &fixture.album_art;
+        after.occupied = &fixture.occupied;
+        // So does another track registering it, or a cached object.
+        let shared = BTreeMap::from([(u64::MAX, 723), (7, 723)]);
+        let shared_after = BTreeMap::from([(u64::MAX, 100), (7, 723)]);
+        before.track_art = &shared;
+        after.track_art = &shared_after;
+        assert!(namespace(&before, &after));
+        after.occupied = &kept;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_ok());
+        before.track_art = &dangling_track;
+        after.track_art = &fixture.track_art;
+        after.occupied = &fixture.occupied;
+        let cached_prior = BTreeSet::from([723]);
+        before.cached = &cached_prior;
+        assert!(namespace(&before, &after));
+        // A track whose album keeps its own cached cover drops the ID alone.
+        let old = CachedArtwork {
+            cache_id: 101,
+            artwork_type: 6,
+            variant: 0,
+            relative_path: "aa/00000000000000000000000000000000000000".into(),
+        };
+        let prior_objects = BTreeMap::from([((101, 0), old.clone())]);
+        let mut objects = fixture.cached_objects.clone();
+        objects.insert((101, 0), old);
+        let (old_occupied, old_cached) = (BTreeSet::from([101, 723]), BTreeSet::from([101]));
+        let cached_album = BTreeMap::from([((-31i64 as u64), 101)]);
+        let (new_occupied, new_cached) = (BTreeSet::from([100, 101]), BTreeSet::from([100, 101]));
+        before.occupied = &old_occupied;
+        before.cached = &old_cached;
+        before.cached_objects = &prior_objects;
+        before.album_art = &cached_album;
+        after.album_art = &cached_album;
+        after.occupied = &new_occupied;
+        after.cached = &new_cached;
+        after.cached_objects = &objects;
+        assert!(verify_views(&before, &after, u64::MAX, 100).is_ok());
+    }
+    #[test]
+    fn recent_play_and_skip_form_one_complete_reset_branch() {
+        let fixture = Fixture::new();
+        let mut old = fixture.before.tracks().to_vec();
+        old[0].playback.play_count_recent = 3;
+        old[0].playback.skip_count_recent = 2;
+        let mut other = old[0].clone();
+        other.sync_id = 1000;
+        other.playback.play_count_recent = 4;
+        other.playback.skip_count_recent = 5;
+        old.push(other);
+        let fingerprint = BTreeMap::from([(u64::MAX, [1; 32]), (1000, [2; 32])]);
+        for (counts, accepted) in [
+            ([3, 2, 4, 5], true),
+            ([0, 0, 0, 0], true),
+            ([0, 2, 0, 5], false),
+            ([3, 0, 4, 0], false),
+            ([0, 0, 0, 5], false),
+            ([0, 0, 4, 0], false),
+            ([4, 2, 4, 5], false),
+            ([3, 3, 4, 5], false),
+            ([0, 1, 0, 0], false),
+        ] {
+            let mut new = old.clone();
+            for (t, c) in new.iter_mut().zip(counts.chunks_exact(2)) {
+                t.playback.play_count_recent = c[0];
+                t.playback.skip_count_recent = c[1];
+            }
+            let (mut before, mut after) = fixture.views();
+            before.tracks = &old;
+            after.tracks = &new;
+            before.stats_except_recent_play = &fingerprint;
+            after.stats_except_recent_play = &fingerprint;
+            before.stats_except_recent_play_and_skip = &fingerprint;
+            after.stats_except_recent_play_and_skip = &fingerprint;
+            let result = verify_views(&before, &after, u64::MAX, 100);
+            assert_eq!(result.is_ok(), accepted, "{counts:?}");
+            if counts == [0, 0, 0, 0] {
+                let proof = result.unwrap();
+                assert_eq!(proof.1.len(), 2);
+                assert_eq!(proof.2.len(), 2);
+            }
+        }
+    }
+    fn real_transition(before_stats: &str, after_stats: &str) -> (Catalog, Catalog) {
+        let schema = "ALTER TABLE item_stats ADD COLUMN date_skipped REAL; ALTER TABLE item_stats ADD COLUMN unknown_future_stat;";
+        let before = crate::test_support::catalogue::modified_collection_catalog(
+            13,
+            &format!("{schema}{before_stats}"),
+        );
+        let art = "INSERT INTO artwork VALUES('100',300,6,0,'aa/00000000000000000000000000000000000000'); INSERT INTO artwork_token VALUES(1,'100',300,1,0,0),(31,'100',300,6,4,0);";
+        let after = crate::test_support::catalogue::modified_collection_catalog(
+            14,
+            &format!("{schema}{after_stats}{art}"),
+        );
+        (before, after)
+    }
+    #[test]
+    fn actual_parser_reset_refuses_lifetime_dates_unknown_values_and_storage_types() {
+        let old = "UPDATE item_stats SET play_count_recent=3,skip_count_recent=2,date_skipped=123.25,unknown_future_stat=1;";
+        let reset = "UPDATE item_stats SET play_count_recent=0,skip_count_recent=0,date_skipped=123.25,unknown_future_stat=1;";
+        let (before, after) = real_transition(old, reset);
+        assert!(
+            !verify(&before, &after, u64::MAX, 100)
+                .unwrap()
+                .recent_skip_count_resets
+                .is_empty()
+        );
+        for change in [
+            "skip_count_user=1",
+            "play_count_user=1",
+            "date_skipped=123.5",
+            "unknown_future_stat=1.0",
+            "unknown_future_stat='1'",
+            "unknown_future_stat=x'31'",
+            "unknown_future_stat=NULL",
+            "user_rating=1",
+        ] {
+            let (before, after) =
+                real_transition(old, &format!("{reset}UPDATE item_stats SET {change};"));
+            assert!(verify(&before, &after, u64::MAX, 100).is_err(), "{change}");
+        }
+    }
+    #[test]
+    fn no_skip_reset_omits_the_skip_reset_fields() {
+        for (before_stats, after_stats, plays_reset) in [
+            ("", "", false),
+            ("UPDATE item_stats SET play_count_recent=3;", "", true),
+            (
+                "UPDATE item_stats SET skip_count_recent=2;",
+                "UPDATE item_stats SET skip_count_recent=2;",
+                false,
+            ),
+        ] {
+            let (before, after) = real_transition(before_stats, after_stats);
+            for independent in [false, true] {
+                let proof =
+                    verify_policy(&before, &after, u64::MAX, 100, !independent, None).unwrap();
+                assert_eq!(proof.recent_play_count_resets.is_empty(), !plays_reset);
+                assert_eq!(
+                    proof.permanent_album_original_equality_required,
+                    !independent
+                );
+                let value = serde_json::to_value(&proof).unwrap();
+                assert!(value.get("recent_skip_count_resets").is_none());
+                assert!(value.get("recent_count_import_rule").is_none());
+            }
+        }
+    }
+
+    /// The between-runs rule as the CLI passes it: lifetime counts grow,
+    /// recent counters are kept or restarted, `has_been_played` follows
+    /// plays, rating and like state stay.
+    fn listening(was: &PlaybackStatistics, now: &PlaybackStatistics) -> Result<()> {
+        let plays = now
+            .play_count_user
+            .checked_sub(was.play_count_user)
+            .context("plays")?;
+        let skips = now
+            .skip_count_user
+            .checked_sub(was.skip_count_user)
+            .context("skips")?;
+        for (prior, later, events) in [
+            (was.play_count_recent, now.play_count_recent, plays),
+            (was.skip_count_recent, now.skip_count_recent, skips),
+        ] {
+            ensure!(
+                prior + events == later || (prior > 0 && later == events),
+                "recent"
+            );
+        }
+        ensure!(
+            now.has_been_played == (was.has_been_played || plays > 0),
+            "played"
+        );
+        ensure!(
+            (was.user_rating, was.liked_state) == (now.user_rating, now.liked_state),
+            "rating"
+        );
+        Ok(())
+    }
+
+    fn listened_transition(before_stats: &str, after_stats: &str) -> (Catalog, Catalog) {
+        let schema = "ALTER TABLE item_stats ADD COLUMN date_played INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE item_stats ADD COLUMN date_skipped INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE item_stats ADD COLUMN date_accessed INTEGER NOT NULL DEFAULT 0;";
+        let art = "INSERT INTO artwork VALUES('100',300,6,0,'aa/00000000000000000000000000000000000000'); INSERT INTO artwork_token VALUES(1,'100',300,1,0,0),(31,'100',300,6,4,0);";
+        (
+            crate::test_support::catalogue::modified_collection_catalog(
+                13,
+                &format!("{schema}{before_stats}"),
+            ),
+            crate::test_support::catalogue::modified_collection_catalog(
+                14,
+                &format!("{schema}{after_stats}{art}"),
+            ),
+        )
+    }
+
+    #[test]
+    fn a_later_run_absorbs_plays_skips_and_the_import_reset() {
+        let old = "UPDATE item_stats SET play_count_user=2,play_count_recent=2,has_been_played=1,date_played=800000000;";
+        for (later, plays, skips) in [
+            // Nothing played: the plain transition, also under this profile.
+            (old.to_string(), 0, 0),
+            // The import cleared the recent counter; nothing played since.
+            (old.replace("play_count_recent=2", "play_count_recent=0"), 0, 0),
+            // Three plays, counted on from the kept or the cleared counter.
+            (
+                "UPDATE item_stats SET play_count_user=5,play_count_recent=5,has_been_played=1,date_played=800000100.5;".into(),
+                3,
+                0,
+            ),
+            (
+                "UPDATE item_stats SET play_count_user=5,play_count_recent=3,has_been_played=1,date_played=800000100;".into(),
+                3,
+                0,
+            ),
+            (
+                "UPDATE item_stats SET play_count_user=2,play_count_recent=2,has_been_played=1,date_played=800000000,skip_count_user=1,skip_count_recent=1,date_skipped=800000200;".into(),
+                0,
+                1,
+            ),
+        ] {
+            let (before, after) = listened_transition(old, &later);
+            // The strict check takes the import's own reset, never listening.
+            assert_eq!(
+                verify_independent_representative(&before, &after, u64::MAX, 100).is_ok(),
+                plays + skips == 0
+            );
+            let proof = verify_independent_representative_after_listening(
+                &before, &after, u64::MAX, 100, &listening,
+            )
+            .unwrap_or_else(|e| panic!("{later}: {e:#}"));
+            let listened = &proof.tracks_listened_between_runs;
+            if plays + skips == 0 {
+                assert!(listened.iter().all(|t| t.plays == 0 && t.skips == 0));
+            } else {
+                assert_eq!((listened[0].plays, listened[0].skips), (plays, skips));
+            }
+        }
+    }
+
+    #[test]
+    fn a_later_run_refuses_what_listening_does_not_explain() {
+        let old = "UPDATE item_stats SET play_count_user=2,play_count_recent=2,has_been_played=1,date_played=800000000,date_skipped=700000000;";
+        for later in [
+            // A date without its event, or one that went back.
+            "UPDATE item_stats SET play_count_user=2,play_count_recent=2,has_been_played=1,date_played=800000001,date_skipped=700000000;",
+            "UPDATE item_stats SET play_count_user=3,play_count_recent=3,has_been_played=1,date_played=799999999,date_skipped=700000000;",
+            "UPDATE item_stats SET play_count_user=2,play_count_recent=2,has_been_played=1,date_played=800000000,date_skipped=700000001;",
+            // Fewer plays, a recent counter neither kept nor restarted.
+            "UPDATE item_stats SET play_count_user=1,play_count_recent=1,has_been_played=1,date_played=800000000,date_skipped=700000000;",
+            "UPDATE item_stats SET play_count_user=3,play_count_recent=2,has_been_played=1,date_played=800000100,date_skipped=700000000;",
+            // Rating, and a column listening never writes.
+            "UPDATE item_stats SET play_count_user=2,play_count_recent=2,has_been_played=1,date_played=800000000,date_skipped=700000000,user_rating=60;",
+            "UPDATE item_stats SET play_count_user=2,play_count_recent=2,has_been_played=1,date_played=800000000,date_skipped=700000000,date_accessed=5;",
+        ] {
+            let (before, after) = listened_transition(old, later);
+            assert!(
+                verify_independent_representative_after_listening(
+                    &before,
+                    &after,
+                    u64::MAX,
+                    100,
+                    &listening,
+                )
+                .is_err(),
+                "{later}"
+            );
+        }
+        // A typed field, and the cover itself, are still exact.
+        let (before, after) =
+            listened_transition(old, &format!("{old} UPDATE item_extra SET title='Other';"));
+        assert!(
+            verify_independent_representative_after_listening(
+                &before,
+                &after,
+                u64::MAX,
+                100,
+                &listening
+            )
+            .is_err()
+        );
+        let (before, after) = listened_transition(old, old);
+        assert!(
+            verify_independent_representative_after_listening(
+                &before,
+                &after,
+                u64::MAX,
+                101,
+                &listening
+            )
+            .is_err()
+        );
+    }
 }
