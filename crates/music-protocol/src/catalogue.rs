@@ -6,6 +6,8 @@ pub mod identity;
 pub mod inventory;
 pub mod metadata_edit;
 pub mod metadata_update;
+pub mod metadata_verification;
 pub mod mutation;
 pub mod presentation;
 pub mod sqlite;
+pub mod title_verification;
