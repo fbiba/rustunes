@@ -2,6 +2,8 @@
 //! Completion, ownership and durable workflow policy belong to the caller.
 
 pub mod anchor;
+pub mod artwork_update;
+pub mod artwork_verification;
 pub mod identity;
 pub mod inventory;
 pub mod metadata_edit;
