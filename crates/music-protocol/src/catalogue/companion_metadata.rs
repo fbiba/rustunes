@@ -874,4 +874,90 @@ mod tests {
             "retained coverage exceeds combined traversal bounds"
         );
     }
+
+    #[test]
+    fn companion_candidate_topology_fits_both_pass_directory_budget() {
+        // 2,040 artwork cache paths, not observed receiver files: 340 covers,
+        // each with an original and five cache sizes, in two-hex directories.
+        // Names, attributes and the complete tree below are deliberately
+        // synthetic.
+        let candidates: Vec<String> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/companion-candidate-paths.json"
+        )))
+        .unwrap();
+        assert_eq!(candidates.len(), 2040);
+        let mut tree = Snapshot {
+            completed: true,
+            ..Snapshot::default()
+        };
+        for ancestor in ["iTunes_Control", "iTunes_Control/iTunes"] {
+            tree.ancestors.insert(ancestor.into(), attrs("S_IFDIR"));
+        }
+        for (role, root) in ROOTS {
+            tree.roots.insert(role.into(), "present".into());
+            insert(
+                &mut tree,
+                root.into(),
+                entry(role, attrs("S_IFDIR")).unwrap(),
+            )
+            .unwrap();
+        }
+        insert(
+            &mut tree,
+            ARTWORKDB.into(),
+            entry(ROOTS[0].0, attrs("S_IFREG")).unwrap(),
+        )
+        .unwrap();
+        let (role, root) = ROOTS[1];
+        for candidate in candidates {
+            assert!(candidate.starts_with(&format!("{root}/")));
+            let mut parent = candidate.rsplit_once('/').unwrap().0;
+            while parent != root {
+                if !tree.entries.contains_key(parent) {
+                    insert(
+                        &mut tree,
+                        parent.into(),
+                        entry(role, attrs("S_IFDIR")).unwrap(),
+                    )
+                    .unwrap();
+                }
+                parent = parent.rsplit_once('/').unwrap().0;
+            }
+            insert(&mut tree, candidate, entry(role, attrs("S_IFREG")).unwrap()).unwrap();
+        }
+        for (path, value) in &tree.entries {
+            if value.kind == Kind::Directory {
+                tree.directory_names.insert(path.clone(), Vec::new());
+            }
+        }
+        for path in tree.entries.keys() {
+            if ROOTS.iter().any(|(_, root)| path == root) {
+                continue;
+            }
+            let (parent, name) = path.rsplit_once('/').unwrap();
+            tree.directory_names
+                .get_mut(parent)
+                .unwrap()
+                .push(name.into());
+        }
+        for names in tree.directory_names.values_mut() {
+            names.sort();
+        }
+        assert_eq!(tree.directory_names.len(), 1155);
+        assert_eq!(
+            tree.directory_names.values().map(Vec::len).sum::<usize>(),
+            3194
+        );
+        let mut budget = Budget::default();
+        for _ in 0..2 {
+            for names in tree.directory_names.values() {
+                budget.directory().unwrap();
+                budget.names(names.len()).unwrap();
+            }
+        }
+        assert_eq!(budget.directories_listed, 2310);
+        assert_eq!(budget.returned_non_dot_entries, 6388);
+        matching_passes(&tree, &tree).unwrap();
+    }
 }
