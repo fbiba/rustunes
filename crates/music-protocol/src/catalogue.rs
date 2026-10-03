@@ -7,6 +7,7 @@ pub mod artwork_verification;
 pub mod companion_metadata;
 pub mod companion_tree;
 pub mod identity;
+pub mod insert_verification;
 pub mod inventory;
 pub mod metadata_edit;
 pub mod metadata_update;
