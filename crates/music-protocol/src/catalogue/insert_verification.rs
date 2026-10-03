@@ -210,6 +210,234 @@ pub struct ComposerOrderChange {
     pub after: i64,
 }
 
+pub fn verify_insert(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &ExpectedInsert<'_>,
+) -> Result<VerifiedInsert> {
+    verify_insert_with_policy(before, after, expected, false, None)
+}
+
+/// For a later run's capture, after the phone may have been used. `listening`
+/// decides whether a prior track's playback statistics changed only by plays,
+/// skips and recent-counter resets; every other Track field stays exact. The
+/// typed raw statistics of such tracks (dates included) are not compared here,
+/// so the caller MUST have proved them with a full SQL comparison.
+pub fn verify_insert_after_listening(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &ExpectedInsert<'_>,
+    listening: &dyn Fn(&PlaybackStatistics, &PlaybackStatistics) -> Result<()>,
+) -> Result<VerifiedInsert> {
+    verify_insert_with_policy(before, after, expected, false, Some(listening))
+}
+
+/// For an insert serialized with no existing composer, whose composer became
+/// its own sort label. This accepts the observed shared composer-sort
+/// transition and emits every prior order delta. A caller MUST additionally
+/// pin an independent full-SQL audit; this receipt does not claim those known
+/// changed values were preserved and cannot authorize replay.
+pub fn verify_insert_legacy_composer_sort(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &ExpectedInsert<'_>,
+) -> Result<VerifiedInsert> {
+    verify_insert_with_policy(before, after, expected, true, None)
+}
+
+fn verify_insert_with_policy(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &ExpectedInsert<'_>,
+    legacy_composer_sort: bool,
+    listening: Option<&dyn Fn(&PlaybackStatistics, &PlaybackStatistics) -> Result<()>>,
+) -> Result<VerifiedInsert> {
+    ensure!(
+        before.database_pid() == after.database_pid()
+            && before.primary_container_pid() == after.primary_container_pid(),
+        "catalogue identity changed across insertion"
+    );
+    ensure!(
+        after.persisted_media_anchor()
+            == before
+                .persisted_media_anchor()
+                .checked_add(1)
+                .context("media anchor exhausted")?,
+        "post-transfer media anchor differs from the single prepared operation"
+    );
+    ensure!(
+        !before.represented_sync_ids().contains(&expected.track_id),
+        "expected inserted track already existed"
+    );
+    ensure!(
+        after.tracks().len() == before.tracks().len() + 1,
+        "post-transfer track count differs from one insertion"
+    );
+    let after_tracks: BTreeMap<_, _> = after.tracks().iter().map(|t| (t.sync_id, t)).collect();
+    ensure!(
+        after_tracks.len() == after.tracks().len(),
+        "post-transfer track IDs alias"
+    );
+    let declared = Declared::of([expected])?;
+    let (prior_recent_counter_resets, prior_tracks_listened_between_runs, mut case_renamed) =
+        if legacy_composer_sort {
+            preserve_tracks(before.tracks(), &after_tracks)?;
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            preserve_insert_tracks(
+                before,
+                after,
+                &after_tracks,
+                &BTreeSet::from([expected.track_id]),
+                listening,
+                &declared,
+            )?
+        };
+    let inserted = after_tracks
+        .get(&expected.track_id)
+        .context("inserted identity absent from fresh catalogue")?;
+    let normalized_fields = check_inserted(inserted, expected, before)?;
+    let targets = std::slice::from_ref(expected);
+    let presented = presentations(before, targets)?;
+    let composer_sort_delta = verify_composers(
+        before,
+        after,
+        expected.track_id,
+        expected.metadata.projected()?.composer,
+        presented[0].map(|p| p.sort_composer),
+        legacy_composer_sort,
+    )?;
+    verify_presentation(
+        before,
+        after,
+        targets,
+        &presented,
+        &BTreeSet::from([expected.track_id]),
+    )?;
+    let old_albums: BTreeSet<_> = before.albums().values().map(|a| a.sync_id).collect();
+    let old_artists: BTreeSet<_> = before.artists().values().map(|a| a.sync_id).collect();
+    let expected_albums = old_albums
+        .union(&BTreeSet::from([expected.album_id]))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let expected_artists = old_artists
+        .union(&BTreeSet::from([expected.artist_id]))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        after
+            .albums()
+            .values()
+            .map(|a| a.sync_id)
+            .collect::<BTreeSet<_>>()
+            == expected_albums,
+        "post-transfer album identities differ from the planned grouping"
+    );
+    ensure!(
+        after
+            .artists()
+            .values()
+            .map(|a| a.sync_id)
+            .collect::<BTreeSet<_>>()
+            == expected_artists,
+        "post-transfer artist identities differ from the planned grouping"
+    );
+    for (id, old) in before.albums() {
+        let new = after.albums().get(id).context("prior album disappeared")?;
+        ensure!(
+            old.sync_id == new.sync_id
+                && group_name(
+                    &mut case_renamed,
+                    "album",
+                    old.sync_id,
+                    &old.name,
+                    &new.name,
+                    &declared.albums
+                )
+                && old.artist_internal_id == new.artist_internal_id
+                && old.artist_sync_id == new.artist_sync_id
+                && old.all_compilations == new.all_compilations
+                && compilation_members_kept(old, new)
+                && new.live_track_count
+                    == old.live_track_count + usize::from(old.sync_id == expected.album_id),
+            "prior album changed outside the expected track membership increment"
+        );
+    }
+    for (id, old) in before.artists() {
+        let new = after
+            .artists()
+            .get(id)
+            .context("prior artist disappeared")?;
+        ensure!(
+            old.sync_id == new.sync_id
+                && group_name(
+                    &mut case_renamed,
+                    "album_artist",
+                    old.sync_id,
+                    &old.name,
+                    &new.name,
+                    &declared.album_artists
+                )
+                && new.live_track_count
+                    == old.live_track_count + usize::from(old.sync_id == expected.artist_id),
+            "prior artist changed outside the expected track membership increment"
+        );
+    }
+    for (id, cache) in before.artwork().track_cache_ids() {
+        ensure!(
+            after.artwork().track_cache_ids().get(id) == Some(cache),
+            "prior track artwork registration changed"
+        );
+    }
+    for (id, cache) in before.artwork().album_cache_ids() {
+        ensure!(
+            after.artwork().album_cache_ids().get(id) == Some(cache),
+            "prior album artwork registration changed"
+        );
+    }
+    ensure!(
+        before
+            .artwork()
+            .occupied_cache_ids()
+            .is_subset(after.artwork().occupied_cache_ids()),
+        "prior artwork namespace lost an ID"
+    );
+    Ok(VerifiedInsert {
+        schema: "music-protocol.insert-catalog-verification",
+        track_id: format!("{:016x}", expected.track_id),
+        media_anchor: after.persisted_media_anchor(),
+        before_database_sha256: hex(&before.source_hashes().database),
+        before_wal_sha256: before.source_hashes().wal.map(|v| hex(&v)),
+        after_database_sha256: hex(&after.source_hashes().database),
+        after_wal_sha256: after.source_hashes().wal.map(|v| hex(&v)),
+        supported_metadata_matches: true,
+        prior_tracks_preserved: before.tracks().len(),
+        prior_track_field_scope: if legacy_composer_sort {
+            "Track DTO fields are exact; composer lookup/sort/order preservation or explicit legacy deltas are reported separately"
+        } else if listening.is_some() {
+            "Prior Track DTO fields are exact except reported recent-counter resets and the playback statistics of reported listened tracks, which the caller's listening rule accepted; listened tracks' other item_stats columns are exact and their play and skip dates move forward only with new plays and skips, all others are exact; composer lookup/sort/order preservation is reported separately"
+        } else {
+            "Prior Track DTO fields are exact except explicitly reported positive-to-zero recent play/skip counter resets; all other typed raw item_stats columns are exact; composer lookup/sort/order preservation is reported separately"
+        },
+        prior_recent_counter_resets,
+        prior_tracks_listened_between_runs,
+        case_renamed,
+        prior_artwork_registrations_preserved: true,
+        audio_and_artwork_bytes_verified_by_this_check: false,
+        normalized_fields,
+        composer_sort_policy: if legacy_composer_sort {
+            "legacy_source_sort"
+        } else {
+            "preserve"
+        },
+        composer_sort_delta,
+        unverified_fields: [
+            "Other unprojected SQL columns and lookup grouping keys require independent full-row audit",
+            "Permanent audio/artwork bytes and protocol terminal are separate evidence",
+        ],
+    })
+}
+
 fn preserve_insert_tracks(
     before: &Catalog,
     after: &Catalog,
@@ -668,4 +896,868 @@ fn verify_presentation(
         )?;
     }
     Ok(())
+}
+
+/// `sent_sort` is the sort name a presented insert sent with the composer;
+/// `None` when the insert was not presented, which sent the name as its sort.
+fn verify_composers(
+    before: &Catalog,
+    after: &Catalog,
+    target: u64,
+    desired: Option<&str>,
+    sent_sort: Option<Option<&str>>,
+    legacy: bool,
+) -> Result<Option<ComposerSortDelta>> {
+    let target_ref = after
+        .track_composers()
+        .get(&target)
+        .context("inserted composer reference absent")?;
+    ensure!(
+        after.track_composers().len() == before.track_composers().len() + 1,
+        "composer reference count differs"
+    );
+    let prior = desired
+        .map(|name| before.composer_for_label(name))
+        .transpose()?
+        .flatten();
+    let current = target_ref
+        .lookup_id
+        .map(|id| {
+            after
+                .composers()
+                .get(&id)
+                .context("inserted composer lookup absent")
+        })
+        .transpose()?;
+    match (desired, prior, current) {
+        (None, None, None) => {}
+        (Some(name), None, Some(row)) => ensure!(
+            row.name == name
+                && row.sort_name.as_deref() == sent_sort.unwrap_or(Some(name))
+                && !before.composers().contains_key(&row.internal_id),
+            "new composer lookup differs from source"
+        ),
+        (Some(_), Some(old), Some(new)) => ensure!(
+            old.internal_id == new.internal_id
+                && old.sync_id == new.sync_id
+                && old.name == new.name,
+            "reused composer identity or label changed"
+        ),
+        _ => anyhow::bail!("inserted composer join differs from source and prior lookup"),
+    }
+    let expected_ids: BTreeSet<_> = before
+        .composers()
+        .keys()
+        .copied()
+        .chain(target_ref.lookup_id)
+        .collect();
+    ensure!(
+        after.composers().keys().copied().collect::<BTreeSet<_>>() == expected_ids,
+        "unexpected composer lookup creation or removal"
+    );
+    let mut delta = None;
+    for (id, old) in before.composers() {
+        let new = &after.composers()[id];
+        if old == new {
+            continue;
+        }
+        ensure!(
+            legacy && prior.is_some_and(|row| row.internal_id == *id),
+            "prior composer lookup changed"
+        );
+        let requested = desired.context("legacy composer request absent")?;
+        ensure!(
+            old.name.is_ascii()
+                && requested.is_ascii()
+                && old.name != requested
+                && old.name.eq_ignore_ascii_case(requested)
+                && old.internal_id == new.internal_id
+                && old.sync_id == new.sync_id
+                && old.name == new.name
+                && old.sort_name.as_deref() == Some(old.name.as_str())
+                && new.sort_name.as_deref() == Some(requested),
+            "legacy composer sort delta is not the qualified ASCII label transition"
+        );
+        let count = before
+            .track_composers()
+            .values()
+            .filter(|r| r.lookup_id == Some(*id))
+            .count();
+        ensure!(count > 0, "legacy composer has no prior live references");
+        delta = Some(ComposerSortDelta {
+            lookup_id: *id,
+            stored_name: old.name.clone(),
+            before_sort: old.sort_name.clone().unwrap(),
+            after_sort: requested.to_owned(),
+            prior_reference_count: count,
+            after_reference_count: count + 1,
+            order_changes: Vec::new(),
+        });
+    }
+    for (id, old) in before.track_composers() {
+        let new = after
+            .track_composers()
+            .get(id)
+            .context("prior composer reference disappeared")?;
+        ensure!(
+            old.lookup_id == new.lookup_id,
+            "prior composer reference changed"
+        );
+        // Outside a legacy transition, orders may only be spaced out (below).
+        if old.order != new.order && legacy {
+            let change = delta
+                .as_mut()
+                .context("prior composer order changed outside explicit legacy qualification")?;
+            ensure!(
+                old.lookup_id == Some(change.lookup_id)
+                    && old.order > 0
+                    && new.order > 0
+                    && new.order == target_ref.order,
+                "legacy composer order changed outside qualified shared group"
+            );
+            change.order_changes.push(ComposerOrderChange {
+                track_id: format!("{id:016x}"),
+                before: old.order,
+                after: new.order,
+            });
+        }
+    }
+    if legacy {
+        let change = delta
+            .as_ref()
+            .context("explicit legacy composer transition absent")?;
+        ensure!(
+            change.order_changes.len() == change.prior_reference_count
+                && change
+                    .order_changes
+                    .iter()
+                    .map(|r| r.before)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == 1,
+            "legacy composer order changes do not cover exactly the prior shared group"
+        );
+    } else {
+        // The phone may space every sort key out again, keeping their order,
+        // as after a large batch (seen after a long run of single inserts).
+        ensure!(
+            keeps_order(before.track_composers(), after.track_composers()),
+            "prior composer order changed"
+        );
+    }
+    Ok(delta)
+}
+/// Catalogue checks after one session inserted several ALAC tracks.
+#[derive(Serialize)]
+pub struct VerifiedInsertBatch {
+    pub schema: &'static str,
+    pub track_ids: Vec<String>,
+    pub media_anchor: u32,
+    pub before_database_sha256: String,
+    pub before_wal_sha256: Option<String>,
+    pub after_database_sha256: String,
+    pub after_wal_sha256: Option<String>,
+    pub supported_metadata_matches: bool,
+    pub prior_tracks_preserved: usize,
+    pub prior_recent_counter_resets: Vec<RecentCounterReset>,
+    /// Prior tracks played or skipped between the session and a later run's
+    /// check; see [`verify_insert_batch_after_listening`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prior_tracks_listened_between_runs: Vec<String>,
+    /// Prior rows and groups the phone renamed to a target's spelling.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub case_renamed: Vec<CaseRename>,
+    pub prior_artwork_registrations_preserved: bool,
+    pub new_albums: Vec<String>,
+    pub new_artists: Vec<String>,
+    pub new_composers: Vec<String>,
+    pub normalized_fields: Vec<InsertedFields>,
+    /// Targets the phone created without their audio (no file location).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locationless_track_ids: Vec<String>,
+    /// Targets the phone created and deleted again in the same session.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_track_ids: Vec<String>,
+    /// Album registrations whose album was already gone and that the session
+    /// deleted.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub dropped_orphan_album_registrations: usize,
+    /// Cache IDs that left the namespace with the album registration they had
+    /// no cached object for, when the album took a new member's cover.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub released_album_cache_ids: Vec<u32>,
+    /// Targets inserted with their cover, and their albums' registrations.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub covers: Vec<InsertedCover>,
+    pub audio_and_artwork_bytes_verified_by_this_check: bool,
+}
+
+#[derive(Serialize)]
+pub struct InsertedCover {
+    pub track_id: String,
+    pub cache_id: u32,
+    pub album_id: String,
+    pub album_cache_id: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct InsertedFields {
+    pub track_id: String,
+    pub normalized_fields: Vec<NormalizedField>,
+}
+
+/// The single-insert checks for every target of one session: the anchor moves
+/// once, prior tracks, groups and artwork registrations are exact apart from
+/// the added memberships, and each new track matches its source. Tracks of the
+/// same new album, artist or composer share one new row.
+pub fn verify_insert_batch(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+) -> Result<VerifiedInsertBatch> {
+    verify_insert_batch_with(before, after, expected, &BTreeSet::new())
+}
+
+/// The same checks for a session that ended before some of its audio arrived:
+/// each `locationless` target has its planned row and groups but no file
+/// location, and its other fields are not checked (it awaits removal).
+pub fn verify_insert_batch_with(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+    locationless: &BTreeSet<u64>,
+) -> Result<VerifiedInsertBatch> {
+    verify_insert_batch_covered(
+        before,
+        after,
+        expected,
+        locationless,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+    )
+}
+
+/// The same checks for a session whose inserts may name covers: `covers` maps
+/// a target track to its new cache ID. A covered target registers exactly that
+/// ID (a locationless one may lack it), an uncovered one none. An album keeps
+/// its registration or takes the cover of one of its new members, as the phone
+/// does for a single cover (independent representative); a new album takes
+/// one of its members' covers or none. An album without a covered member, and
+/// every other registration, stays exact; only planned cache IDs appear. The
+/// caller sends covers only for albums whose own image may change.
+///
+/// Each `removed` target is one the phone created and deleted again within the
+/// session (observed when the host abandoned a session mid-transfer: the
+/// in-flight rows were deleted, the others kept without a location). Its row,
+/// references and track registration are gone; an album, artist or composer
+/// planned for it may stay without members, and its album may hold its cover.
+/// The session may also delete album registrations whose album was already
+/// gone, never create one.
+pub fn verify_insert_batch_covered(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+    locationless: &BTreeSet<u64>,
+    removed: &BTreeSet<u64>,
+    covers: &BTreeMap<u64, u32>,
+) -> Result<VerifiedInsertBatch> {
+    verify_batch(before, after, expected, locationless, removed, covers, None)
+}
+
+/// The same checks for a later run's capture, after the phone may have been
+/// played: a prior track's playback may differ as `listening` accepts, its
+/// play or skip date only forwards and only with new plays or skips, and
+/// every other statistic and field stays exact. The session's own
+/// recent-counter resets are accepted as before.
+pub fn verify_insert_batch_after_listening(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+    locationless: &BTreeSet<u64>,
+    removed: &BTreeSet<u64>,
+    covers: &BTreeMap<u64, u32>,
+    listening: &dyn Fn(&PlaybackStatistics, &PlaybackStatistics) -> Result<()>,
+) -> Result<VerifiedInsertBatch> {
+    verify_batch(
+        before,
+        after,
+        expected,
+        locationless,
+        removed,
+        covers,
+        Some(listening),
+    )
+}
+
+fn verify_batch(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+    locationless: &BTreeSet<u64>,
+    removed: &BTreeSet<u64>,
+    covers: &BTreeMap<u64, u32>,
+    listening: Option<&dyn Fn(&PlaybackStatistics, &PlaybackStatistics) -> Result<()>>,
+) -> Result<VerifiedInsertBatch> {
+    ensure!(!expected.is_empty(), "insert batch has no targets");
+    ensure!(
+        before.database_pid() == after.database_pid()
+            && before.primary_container_pid() == after.primary_container_pid(),
+        "catalogue identity changed across insertion"
+    );
+    ensure!(
+        after.persisted_media_anchor()
+            == before
+                .persisted_media_anchor()
+                .checked_add(1)
+                .context("media anchor exhausted")?,
+        "post-transfer media anchor differs from the one prepared operation"
+    );
+    let inserted: BTreeSet<u64> = expected.iter().map(|e| e.track_id).collect();
+    ensure!(
+        inserted.len() == expected.len(),
+        "insert batch names a track twice"
+    );
+    ensure!(
+        locationless.is_subset(&inserted),
+        "a locationless track is not a batch target"
+    );
+    ensure!(
+        removed.is_subset(&inserted) && removed.is_disjoint(locationless),
+        "a removed track is not a present batch target"
+    );
+    let present: BTreeSet<u64> = inserted.difference(removed).copied().collect();
+    ensure!(
+        inserted
+            .iter()
+            .all(|id| !before.represented_sync_ids().contains(id)),
+        "expected inserted track already existed"
+    );
+    ensure!(
+        after.tracks().len() == before.tracks().len() + present.len(),
+        "post-transfer track count differs from the batch"
+    );
+    let after_tracks: BTreeMap<_, _> = after.tracks().iter().map(|t| (t.sync_id, t)).collect();
+    ensure!(
+        after_tracks.len() == after.tracks().len(),
+        "post-transfer track IDs alias"
+    );
+    let declared = Declared::of(expected.iter().filter(|e| present.contains(&e.track_id)))?;
+    let (prior_recent_counter_resets, prior_tracks_listened_between_runs, mut case_renamed) =
+        preserve_insert_tracks(before, after, &after_tracks, &present, listening, &declared)?;
+    let mut normalized_fields = Vec::new();
+    for target in expected {
+        if removed.contains(&target.track_id) {
+            ensure!(
+                !after_tracks.contains_key(&target.track_id),
+                "removed track {:016x} still exists",
+                target.track_id
+            );
+            continue;
+        }
+        let track = after_tracks
+            .get(&target.track_id)
+            .context("inserted identity absent from fresh catalogue")?;
+        if locationless.contains(&target.track_id) {
+            ensure!(
+                track.album_sync_id == target.album_id
+                    && track.artist_sync_id == target.artist_id
+                    && track.afc_path.is_none(),
+                "locationless track {:016x} differs from its planned row",
+                target.track_id
+            );
+            continue;
+        }
+        let normalized = check_inserted(track, target, before)?;
+        if !normalized.is_empty() {
+            normalized_fields.push(InsertedFields {
+                track_id: format!("{:016x}", target.track_id),
+                normalized_fields: normalized,
+            });
+        }
+    }
+    let presented = presentations(before, expected)?;
+    let (new_composers, composer_renames) =
+        verify_batch_composers(before, after, expected, &presented, removed)?;
+    case_renamed.extend(composer_renames);
+    let located: BTreeSet<u64> = present.difference(locationless).copied().collect();
+    verify_presentation(before, after, expected, &presented, &located)?;
+    let count = |pick: fn(&ExpectedInsert<'_>) -> u64, id: u64| {
+        expected
+            .iter()
+            .filter(|e| !removed.contains(&e.track_id) && pick(e) == id)
+            .count()
+    };
+    let old_albums: BTreeSet<_> = before.albums().values().map(|a| a.sync_id).collect();
+    let old_artists: BTreeSet<_> = before.artists().values().map(|a| a.sync_id).collect();
+    let after_albums: BTreeSet<_> = after.albums().values().map(|a| a.sync_id).collect();
+    let after_artists: BTreeSet<_> = after.artists().values().map(|a| a.sync_id).collect();
+    // Groups of present targets must exist; those planned only for removed
+    // targets may.
+    let grouped = |pick: fn(&ExpectedInsert<'_>) -> u64, kept: bool| -> BTreeSet<u64> {
+        expected
+            .iter()
+            .filter(|e| !kept || !removed.contains(&e.track_id))
+            .map(pick)
+            .collect()
+    };
+    let within =
+        |after: &BTreeSet<u64>, old: &BTreeSet<u64>, pick: fn(&ExpectedInsert<'_>) -> u64| {
+            let kept: BTreeSet<u64> = old.union(&grouped(pick, true)).copied().collect();
+            let planned: BTreeSet<u64> = old.union(&grouped(pick, false)).copied().collect();
+            kept.is_subset(after) && after.is_subset(&planned)
+        };
+    ensure!(
+        within(&after_albums, &old_albums, |e| e.album_id),
+        "post-transfer album identities differ from the planned grouping"
+    );
+    ensure!(
+        within(&after_artists, &old_artists, |e| e.artist_id),
+        "post-transfer artist identities differ from the planned grouping"
+    );
+    for (id, old) in before.albums() {
+        let new = after.albums().get(id).context("prior album disappeared")?;
+        ensure!(
+            old.sync_id == new.sync_id
+                && group_name(
+                    &mut case_renamed,
+                    "album",
+                    old.sync_id,
+                    &old.name,
+                    &new.name,
+                    &declared.albums
+                )
+                && old.artist_internal_id == new.artist_internal_id
+                && old.artist_sync_id == new.artist_sync_id
+                && old.all_compilations == new.all_compilations
+                && compilation_members_kept(old, new)
+                && new.live_track_count
+                    == old.live_track_count + count(|e| e.album_id, old.sync_id),
+            "prior album changed outside the expected track membership increment"
+        );
+    }
+    for new in after.albums().values() {
+        if !old_albums.contains(&new.sync_id) {
+            ensure!(
+                new.live_track_count == count(|e| e.album_id, new.sync_id),
+                "new album membership differs from the batch"
+            );
+        }
+    }
+    for (id, old) in before.artists() {
+        let new = after
+            .artists()
+            .get(id)
+            .context("prior artist disappeared")?;
+        ensure!(
+            old.sync_id == new.sync_id
+                && group_name(
+                    &mut case_renamed,
+                    "album_artist",
+                    old.sync_id,
+                    &old.name,
+                    &new.name,
+                    &declared.album_artists
+                )
+                && new.live_track_count
+                    == old.live_track_count + count(|e| e.artist_id, old.sync_id),
+            "prior artist changed outside the expected track membership increment"
+        );
+    }
+    for new in after.artists().values() {
+        if !old_artists.contains(&new.sync_id) {
+            ensure!(
+                new.live_track_count == count(|e| e.artist_id, new.sync_id),
+                "new artist membership differs from the batch"
+            );
+        }
+    }
+    for (id, cache) in before.artwork().track_cache_ids() {
+        ensure!(
+            after.artwork().track_cache_ids().get(id) == Some(cache),
+            "prior track artwork registration changed"
+        );
+    }
+    let released = released_album_cache_ids(before, after, expected, covers);
+    let covers = verify_batch_covers(before, after, expected, locationless, removed, covers)?;
+    ensure!(
+        before
+            .artwork()
+            .occupied_cache_ids()
+            .difference(&released)
+            .all(|id| after.artwork().occupied_cache_ids().contains(id)),
+        "prior artwork namespace lost an ID"
+    );
+    let orphans = before.artwork().orphan_album_cache_ids();
+    ensure!(
+        after
+            .artwork()
+            .orphan_album_cache_ids()
+            .iter()
+            .all(|(album, cache)| orphans.get(album) == Some(cache)),
+        "an album registration lost its album during insertion"
+    );
+    let ids = |set: BTreeSet<u64>, old: &BTreeSet<u64>| {
+        set.difference(old).map(|id| format!("{id:016x}")).collect()
+    };
+    Ok(VerifiedInsertBatch {
+        schema: "music-protocol.insert-batch-catalog-verification",
+        track_ids: expected
+            .iter()
+            .map(|e| format!("{:016x}", e.track_id))
+            .collect(),
+        media_anchor: after.persisted_media_anchor(),
+        before_database_sha256: hex(&before.source_hashes().database),
+        before_wal_sha256: before.source_hashes().wal.map(|v| hex(&v)),
+        after_database_sha256: hex(&after.source_hashes().database),
+        after_wal_sha256: after.source_hashes().wal.map(|v| hex(&v)),
+        supported_metadata_matches: true,
+        prior_tracks_preserved: before.tracks().len(),
+        prior_recent_counter_resets,
+        prior_tracks_listened_between_runs,
+        case_renamed,
+        prior_artwork_registrations_preserved: true,
+        new_albums: ids(after_albums, &old_albums),
+        new_artists: ids(after_artists, &old_artists),
+        new_composers,
+        normalized_fields,
+        locationless_track_ids: locationless.iter().map(|id| format!("{id:016x}")).collect(),
+        removed_track_ids: removed.iter().map(|id| format!("{id:016x}")).collect(),
+        released_album_cache_ids: released
+            .into_iter()
+            .filter(|id| !after.artwork().occupied_cache_ids().contains(id))
+            .collect(),
+        dropped_orphan_album_registrations: orphans.len()
+            - after.artwork().orphan_album_cache_ids().len(),
+        covers,
+        audio_and_artwork_bytes_verified_by_this_check: false,
+    })
+}
+
+/// Prior album cache IDs that may leave the namespace. An album that an
+/// interrupted batch pointed at a cover that never arrived registers an ID with
+/// no cached object; when the album takes a new member's cover, that ID leaves
+/// with its last registration, as for a single cover update.
+fn released_album_cache_ids(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+    covers: &BTreeMap<u64, u32>,
+) -> BTreeSet<u32> {
+    let (old, new) = (before.artwork(), after.artwork());
+    old.album_cache_ids()
+        .iter()
+        .filter(|(album, prior)| {
+            new.album_cache_ids().get(*album).is_some_and(|now| {
+                now != *prior
+                    && expected
+                        .iter()
+                        .any(|e| e.album_id == **album && covers.get(&e.track_id) == Some(now))
+            }) && !old.cached_ids().contains(*prior)
+                && !old.track_cache_ids().values().any(|id| id == *prior)
+                && !old.orphan_album_cache_ids().values().any(|id| id == *prior)
+                && old
+                    .album_cache_ids()
+                    .values()
+                    .filter(|id| id == prior)
+                    .count()
+                    == 1
+        })
+        .map(|(_, prior)| *prior)
+        .collect()
+}
+
+/// The cover rules of `verify_insert_batch_covered`; prior track registrations
+/// were checked by the caller.
+fn verify_batch_covers(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+    locationless: &BTreeSet<u64>,
+    removed: &BTreeSet<u64>,
+    covers: &BTreeMap<u64, u32>,
+) -> Result<Vec<InsertedCover>> {
+    let (old, new) = (before.artwork(), after.artwork());
+    ensure!(
+        covers
+            .keys()
+            .all(|track| expected.iter().any(|e| e.track_id == *track)),
+        "a cover names a track outside the batch"
+    );
+    let planned: BTreeSet<u32> = covers.values().copied().collect();
+    ensure!(
+        planned.len() == covers.len() && planned.iter().all(|c| *c >= 100),
+        "batch covers need distinct unreserved cache IDs"
+    );
+    ensure!(
+        planned.is_disjoint(old.occupied_cache_ids()),
+        "a planned cover cache ID was already occupied"
+    );
+    ensure!(
+        new.occupied_cache_ids()
+            .difference(old.occupied_cache_ids())
+            .all(|c| planned.contains(c)),
+        "an unplanned artwork cache ID appeared"
+    );
+    let mut album_covers: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
+    for target in expected {
+        let registered = new.track_cache_ids().get(&target.track_id);
+        match covers.get(&target.track_id) {
+            _ if removed.contains(&target.track_id) => ensure!(
+                registered.is_none(),
+                "removed track {:016x} kept a cover registration",
+                target.track_id
+            ),
+            Some(cache) if locationless.contains(&target.track_id) => ensure!(
+                registered.is_none_or(|r| r == cache),
+                "locationless track {:016x} registered another cover",
+                target.track_id
+            ),
+            Some(cache) => ensure!(
+                registered == Some(cache),
+                "inserted track {:016x} does not hold its cover",
+                target.track_id
+            ),
+            None => ensure!(
+                registered.is_none()
+                    && !new
+                        .tracks_with_artwork_registration()
+                        .contains(&target.track_id),
+                "inserted track {:016x} gained an unplanned cover",
+                target.track_id
+            ),
+        }
+        if let Some(cache) = covers.get(&target.track_id) {
+            album_covers
+                .entry(target.album_id)
+                .or_default()
+                .insert(*cache);
+        }
+    }
+    let takes_member_cover = |album: &u64, cache: &u32| {
+        album_covers
+            .get(album)
+            .is_some_and(|caches| caches.contains(cache))
+    };
+    for (album, cache) in old.album_cache_ids() {
+        let now = new.album_cache_ids().get(album);
+        ensure!(
+            now == Some(cache) || now.is_some_and(|c| takes_member_cover(album, c)),
+            "prior album artwork registration changed"
+        );
+    }
+    for (album, cache) in new.album_cache_ids() {
+        ensure!(
+            old.album_cache_ids().contains_key(album) || takes_member_cover(album, cache),
+            "album {album:016x} gained an unplanned cover registration"
+        );
+    }
+    Ok(expected
+        .iter()
+        .filter_map(|e| {
+            covers.get(&e.track_id).map(|cache| InsertedCover {
+                track_id: format!("{:016x}", e.track_id),
+                cache_id: *cache,
+                album_id: format!("{:016x}", e.album_id),
+                album_cache_id: new.album_cache_ids().get(&e.album_id).copied(),
+            })
+        })
+        .collect())
+}
+
+/// Each present target references the existing composer of its name, or the
+/// one new composer its name created in this batch; prior composers and
+/// references are exact. A removed target has no reference, and a new
+/// composer of its name may stay without members.
+fn verify_batch_composers(
+    before: &Catalog,
+    after: &Catalog,
+    expected: &[ExpectedInsert<'_>],
+    presented: &[Option<Presentation<'_>>],
+    removed: &BTreeSet<u64>,
+) -> Result<(Vec<String>, Vec<CaseRename>)> {
+    ensure!(
+        after.track_composers().len() + removed.len()
+            == before.track_composers().len() + expected.len(),
+        "composer reference count differs"
+    );
+    // New lookups by folded name, and the spellings of the present targets
+    // that joined each lookup.
+    let mut created: BTreeMap<String, i64> = BTreeMap::new();
+    let mut joined: BTreeMap<i64, BTreeSet<&str>> = BTreeMap::new();
+    // The sort names sent to each new lookup: a presented target's, or the
+    // name.
+    let mut sorted: BTreeMap<i64, BTreeSet<&str>> = BTreeMap::new();
+    let mut leftover = BTreeSet::new();
+    for (target, presentation) in expected.iter().zip(presented.iter().copied()) {
+        if removed.contains(&target.track_id) {
+            ensure!(
+                !after.track_composers().contains_key(&target.track_id),
+                "removed track {:016x} kept a composer reference",
+                target.track_id
+            );
+            if let Some(name) = target.metadata.projected()?.composer {
+                leftover.insert(name.to_owned());
+            }
+            continue;
+        }
+        let reference = after
+            .track_composers()
+            .get(&target.track_id)
+            .context("inserted composer reference absent")?;
+        let desired = target.metadata.projected()?.composer;
+        let prior = desired
+            .map(|name| before.composer_for_label(name))
+            .transpose()?
+            .flatten();
+        let current = reference
+            .lookup_id
+            .map(|id| {
+                after
+                    .composers()
+                    .get(&id)
+                    .context("inserted composer lookup absent")
+            })
+            .transpose()?;
+        match (desired, prior, current) {
+            (None, None, None) => {}
+            (Some(name), None, Some(row)) => {
+                ensure!(
+                    !before.composers().contains_key(&row.internal_id),
+                    "new composer lookup differs from source"
+                );
+                let shared = *created.entry(folded(name)).or_insert(row.internal_id);
+                ensure!(
+                    shared == row.internal_id,
+                    "one new composer name created several lookups"
+                );
+                joined.entry(row.internal_id).or_default().insert(name);
+                sorted
+                    .entry(row.internal_id)
+                    .or_default()
+                    .insert(presentation.and_then(|p| p.sort_composer).unwrap_or(name));
+            }
+            (Some(name), Some(old), Some(new)) => {
+                ensure!(
+                    old.internal_id == new.internal_id
+                        && old.sync_id == new.sync_id
+                        && old.name == new.name,
+                    "reused composer identity or label changed"
+                );
+                joined.entry(new.internal_id).or_default().insert(name);
+            }
+            _ => anyhow::bail!("inserted composer join differs from source and prior lookup"),
+        }
+    }
+    // Members naming one composer in different ASCII case share its lookup:
+    // its name and sort name are each one of their spellings (seen: the name
+    // of the first member, the sort name of a later one).
+    let spelled = |id: &i64, text: Option<&str>| {
+        text.is_some_and(|text| joined.get(id).is_some_and(|names| names.contains(text)))
+    };
+    for id in created.values() {
+        let row = &after.composers()[id];
+        ensure!(
+            spelled(id, Some(&row.name))
+                && row
+                    .sort_name
+                    .as_deref()
+                    .is_some_and(|sort| sorted.get(id).is_some_and(|sent| sent.contains(sort))),
+            "new composer lookup differs from source"
+        );
+    }
+    let expected_ids: BTreeSet<_> = before
+        .composers()
+        .keys()
+        .copied()
+        .chain(created.values().copied())
+        .collect();
+    let after_ids: BTreeSet<_> = after.composers().keys().copied().collect();
+    let mut stray = BTreeSet::new();
+    for id in after_ids.difference(&expected_ids) {
+        let row = &after.composers()[id];
+        ensure!(
+            leftover.contains(&row.name)
+                && !created.contains_key(&folded(&row.name))
+                && before.composer_for_label(&row.name)?.is_none()
+                && stray.insert(row.name.clone()),
+            "unexpected composer lookup creation or removal"
+        );
+    }
+    ensure!(
+        expected_ids.is_subset(&after_ids),
+        "unexpected composer lookup creation or removal"
+    );
+    // A prior lookup keeps its name; a target naming it in another ASCII case
+    // may give it that spelling as its sort name.
+    let mut renamed = Vec::new();
+    for (id, old) in before.composers() {
+        let new = &after.composers()[id];
+        let sorted = new.internal_id == old.internal_id
+            && new.sync_id == old.sync_id
+            && new.name == old.name
+            && new.sort_name != old.sort_name
+            && new
+                .sort_name
+                .as_deref()
+                .is_some_and(|sort| same_name(sort, &old.name))
+            && spelled(id, new.sort_name.as_deref());
+        ensure!(*new == *old || sorted, "prior composer lookup changed");
+        if sorted {
+            renamed.push(CaseRename {
+                kind: "composer_sort",
+                id: format!("{:016x}", old.sync_id),
+                before: old.sort_name.clone().unwrap_or_default(),
+                after: new.sort_name.clone().unwrap_or_default(),
+            });
+        }
+    }
+    for (id, old) in before.track_composers() {
+        let new = after
+            .track_composers()
+            .get(id)
+            .context("prior composer reference disappeared")?;
+        ensure!(
+            old.lookup_id == new.lookup_id,
+            "prior composer reference changed"
+        );
+    }
+    // A large session may space every sort key out again, keeping their order
+    // (seen in a 200-track insert, for each prior track's orders).
+    ensure!(
+        keeps_order(before.track_composers(), after.track_composers()),
+        "prior composer order changed"
+    );
+    let names = created
+        .values()
+        .map(|id| after.composers()[id].name.clone())
+        .collect();
+    Ok((names, renamed))
+}
+
+/// Whether the references `before` holds keep their order in `after`: equal
+/// orders stay equal and lower ones stay lower.
+fn keeps_order(
+    before: &BTreeMap<u64, ComposerReference>,
+    after: &BTreeMap<u64, ComposerReference>,
+) -> bool {
+    let mut orders: Vec<_> = before
+        .iter()
+        .filter_map(|(id, old)| Some((old.order, after.get(id)?.order)))
+        .collect();
+    orders.sort_unstable();
+    orders.windows(2).all(|pair| {
+        if pair[0].0 == pair[1].0 {
+            pair[0].1 == pair[1].1
+        } else {
+            pair[0].1 < pair[1].1
+        }
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
