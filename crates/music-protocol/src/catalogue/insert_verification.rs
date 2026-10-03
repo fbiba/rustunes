@@ -1761,3 +1761,1231 @@ fn hex(bytes: &[u8]) -> String {
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compilation_source(letter: &str, compilation: bool) -> Metadata {
+        let mut source = crate::media::metadata::read(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/silence-alac.m4a"),
+        )
+        .unwrap();
+        source.title = vec![format!("Fixture {letter}")];
+        source.artist = vec![format!("Guest {letter}")];
+        source.album = vec!["Compilation fixture album".into()];
+        source.album_artist = vec!["CLI Compilation Σύνολο".into()];
+        source.genre.clear();
+        source.composer.clear();
+        source.copyright.clear();
+        source.year = None;
+        source.track = None;
+        source.track_total = None;
+        source.disc = None;
+        source.disc_total = None;
+        source.content_rating = None;
+        source.compilation = Some(compilation);
+        source
+    }
+
+    fn compilation_state(stage: u32, change: &str) -> Catalog {
+        compilation_state_at(stage, 12 + stage, change)
+    }
+
+    fn compilation_state_at(stage: u32, anchor: u32, change: &str) -> Catalog {
+        let mut sql = String::new();
+        if stage >= 1 {
+            sql.push_str(
+                "INSERT INTO album_artist VALUES(121,8000,'CLI Compilation Σύνολο',NULL);
+                INSERT INTO album VALUES(131,9000,'Compilation fixture album',121,1,NULL);
+                INSERT INTO item_artist VALUES(141,0,'Guest A',NULL);
+                INSERT INTO item VALUES(2,8,131,121,141,0,0,51,0,0,1,1,0);
+                INSERT INTO item_extra VALUES(2,'Fixture A','NEWA.m4a',50.0,1000,0,0,0,NULL,0,0,NULL,NULL);
+                INSERT INTO item_store VALUES(2,10000);
+                INSERT INTO item_state VALUES(2,0,1,1,1);
+                INSERT INTO item_stats VALUES(2,0,0,0,0,0,0,0,0);",
+            );
+        }
+        if stage >= 2 {
+            sql.push_str(
+                "INSERT INTO item_artist VALUES(142,0,'Guest B',NULL);
+                INSERT INTO item VALUES(3,8,131,121,142,0,0,51,0,0,1,0,0);
+                INSERT INTO item_extra VALUES(3,'Fixture B','NEWB.m4a',50.0,1000,0,0,0,NULL,0,0,NULL,NULL);
+                INSERT INTO item_store VALUES(3,10001);
+                INSERT INTO item_state VALUES(3,0,1,1,1);
+                INSERT INTO item_stats VALUES(3,0,0,0,0,0,0,0,0);",
+            );
+        }
+        sql.push_str(change);
+        crate::test_support::catalogue::modified_collection_catalog(anchor, &sql)
+    }
+
+    fn compilation_expected(source: &Metadata, first: bool) -> ExpectedInsert<'_> {
+        ExpectedInsert {
+            track_id: if first { 10000 } else { 10001 },
+            album_id: 9000,
+            artist_id: 8000,
+            path: if first {
+                "iTunes_Control/Music/F39/NEWA.m4a"
+            } else {
+                "iTunes_Control/Music/F39/NEWB.m4a"
+            },
+            file_bytes: 1000,
+            metadata: source.into(),
+            presented: false,
+        }
+    }
+
+    #[test]
+    fn explicit_compilation_then_ordinary_member_preserves_catalogue_and_aggregates() {
+        let before = compilation_state(0, "");
+        let first = compilation_state(1, "");
+        let second = compilation_state(2, "");
+        let a = compilation_source("A", true);
+        let b = compilation_source("B", false);
+        assert_eq!(
+            verify_insert(&before, &first, &compilation_expected(&a, true))
+                .unwrap()
+                .prior_tracks_preserved,
+            1
+        );
+        assert_eq!(
+            verify_insert(&first, &second, &compilation_expected(&b, false))
+                .unwrap()
+                .prior_tracks_preserved,
+            2
+        );
+        let album = &second.albums()[&131];
+        assert_eq!(album.live_track_count, 2);
+        assert!(album.all_compilations && album.has_compilation_tracks);
+        assert_eq!(
+            second
+                .tracks()
+                .iter()
+                .filter(|t| t.album_sync_id == 9000)
+                .map(|t| t.metadata.is_compilation)
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn an_emptied_source_tag_is_expected_absent_from_the_inserted_row() {
+        let first = compilation_state(1, "");
+        let removed = compilation_source("B", false);
+        let mut emptied = compilation_source("B", false);
+        for field in [
+            &mut emptied.genre,
+            &mut emptied.composer,
+            &mut emptied.copyright,
+            &mut emptied.sort_composer,
+        ] {
+            *field = vec![String::new()];
+        }
+        let verified = |source: &Metadata, after: &Catalog| {
+            verify_insert(&first, after, &compilation_expected(source, false))
+                .map(|receipt| serde_json::to_value(receipt).unwrap())
+        };
+        // The row the insert left, with no copyright, composer or genre,
+        // verifies as it does for a source without those tags.
+        let second = compilation_state(2, "");
+        assert_eq!(
+            verified(&emptied, &second).unwrap(),
+            verified(&removed, &second).unwrap()
+        );
+        // A row holding a copyright the emptied tag does not name is refused.
+        let named = compilation_state(
+            2,
+            "UPDATE item_extra SET copyright='Artist X' WHERE item_pid=3;",
+        );
+        let error = verified(&emptied, &named).unwrap_err();
+        assert!(
+            error.to_string().contains("inserted text metadata differs"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_single_insert_may_space_prior_composer_orders_out() {
+        // A single insert after a long run of others gave every prior track
+        // new sort keys in the same order, as a large batch does.
+        let first = compilation_state(1, "");
+        let source = compilation_source("B", false);
+        let b = compilation_expected(&source, false);
+        let spaced = "UPDATE item SET composer_order=composer_order*3+5 WHERE item_pid IN (1,2)";
+        verify_insert(&first, &compilation_state(2, spaced), &b).unwrap();
+        // Track 2 (order 0) after track 1 (order 100) refuses.
+        let crossed = "UPDATE item SET composer_order=item_pid WHERE item_pid IN (1,2)";
+        let error = verify_insert(&first, &compilation_state(2, crossed), &b)
+            .err()
+            .expect("crossed composer orders verified");
+        assert!(
+            error.to_string().contains("prior composer order changed"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn one_session_inserts_two_members_of_one_new_album() {
+        let before = compilation_state(0, "");
+        let after = compilation_state_at(2, 13, "");
+        let a = compilation_source("A", true);
+        let b = compilation_source("B", false);
+        let expected = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        let checked = verify_insert_batch(&before, &after, &expected).unwrap();
+        assert_eq!(checked.prior_tracks_preserved, 1);
+        assert_eq!(checked.track_ids, ["0000000000002710", "0000000000002711"]);
+        assert_eq!(checked.new_albums, ["0000000000002328"]);
+        assert_eq!(checked.new_artists, ["0000000000001f40"]);
+        // A missing member, a second anchor step or a changed prior track refuse.
+        assert!(verify_insert_batch(&before, &compilation_state_at(1, 13, ""), &expected).is_err());
+        assert!(verify_insert_batch(&before, &compilation_state(2, ""), &expected).is_err());
+        assert!(
+            verify_insert_batch(
+                &before,
+                &compilation_state_at(
+                    2,
+                    13,
+                    "UPDATE item_stats SET play_count_user=1 WHERE item_pid=1"
+                ),
+                &expected
+            )
+            .is_err()
+        );
+        assert!(verify_insert_batch(&before, &after, &expected[..1]).is_err());
+        assert!(verify_insert_batch(&before, &after, &[]).is_err());
+        // The phone may space the prior track's sort keys out again.
+        let spaced = "UPDATE item SET composer_order=composer_order*3+5 WHERE item_pid=1";
+        verify_insert_batch(&before, &compilation_state_at(2, 13, spaced), &expected).unwrap();
+    }
+
+    #[test]
+    fn a_session_that_also_removes_tracks_is_checked_against_them_gone() {
+        // Both members of the album go and a new one refills it, in place.
+        let before = compilation_state(2, "");
+        let after = compilation_state_at(
+            0,
+            15,
+            "INSERT INTO album_artist VALUES(121,8000,'CLI Compilation Σύνολο',NULL);
+            INSERT INTO album VALUES(131,9000,'Compilation fixture album',121,1,NULL);
+            INSERT INTO item_artist VALUES(143,0,'Guest C',NULL);
+            INSERT INTO item VALUES(4,8,131,121,143,0,0,51,0,0,1,0,0);
+            INSERT INTO item_extra VALUES(4,'Fixture C','NEWC.m4a',50.0,1000,0,0,0,NULL,0,0,NULL,NULL);
+            INSERT INTO item_store VALUES(4,10002);
+            INSERT INTO item_state VALUES(4,0,1,1,1);
+            INSERT INTO item_stats VALUES(4,0,0,0,0,0,0,0,0);",
+        );
+        let c = compilation_source("C", false);
+        let expected = [ExpectedInsert {
+            track_id: 10002,
+            path: "iTunes_Control/Music/F39/NEWC.m4a",
+            ..compilation_expected(&c, true)
+        }];
+        let removed = BTreeSet::from([10000, 10001]);
+        let projected = before.without_tracks(&removed, &after).unwrap();
+        let checked = verify_insert_batch(&projected, &after, &expected).unwrap();
+        assert_eq!(checked.prior_tracks_preserved, 1);
+        assert!(checked.new_albums.is_empty());
+        assert!(verify_insert_batch(&before, &after, &expected).is_err());
+        // A removal that kept one of them is not the session that ran.
+        let kept = before
+            .without_tracks(&BTreeSet::from([10000]), &after)
+            .unwrap();
+        assert!(verify_insert_batch(&kept, &after, &expected).is_err());
+    }
+
+    #[test]
+    fn prior_composer_orders_may_move_but_keep_their_order() {
+        let references = |orders: &[i64]| -> BTreeMap<u64, ComposerReference> {
+            (1..)
+                .zip(orders)
+                .map(|(id, &order)| {
+                    let lookup_id = Some(72);
+                    (id, ComposerReference { lookup_id, order })
+                })
+                .collect()
+        };
+        let before = references(&[10, 20, 20, 30]);
+        assert!(keeps_order(&before, &before));
+        assert!(keeps_order(&before, &references(&[40, 90, 90, 200])));
+        // Two orders crossing, an equal pair split or two meeting refuse.
+        assert!(!keeps_order(&before, &references(&[40, 90, 90, 80])));
+        assert!(!keeps_order(&before, &references(&[40, 90, 91, 200])));
+        assert!(!keeps_order(&before, &references(&[90, 90, 90, 200])));
+    }
+
+    /// The sort names and comment two presented members of a new album sent,
+    /// as `after` holds them.
+    const PRESENTED: &str = "UPDATE item_extra SET sort_title=title WHERE item_pid=3;
+        UPDATE item_extra SET sort_title='Fixture A, sorted',comment='Line one
+Line two' WHERE item_pid=2;
+        UPDATE album SET sort_album='Compilation fixture album' WHERE album_pid=131;
+        UPDATE album_artist SET sort_album_artist='CLI Compilation Σύνολο' WHERE album_artist_pid=121;
+        UPDATE item_artist SET sort_item_artist=item_artist WHERE item_artist_pid IN (141,142);";
+
+    #[test]
+    fn presented_members_store_their_comment_and_sort_names() {
+        let before = compilation_state(0, "");
+        let after = compilation_state_at(2, 13, PRESENTED);
+        let member_a = || {
+            let mut a = compilation_source("A", true);
+            a.comment = vec!["Line one\nLine two".into()];
+            a.sort_title = vec!["Fixture A, sorted".into()];
+            a
+        };
+        let (a, b) = (member_a(), compilation_source("B", false));
+        let presented = |a, b| {
+            let mut expected = [
+                compilation_expected(a, true),
+                compilation_expected(b, false),
+            ];
+            for target in &mut expected {
+                target.presented = true;
+            }
+            expected
+        };
+        verify_insert_batch(&before, &after, &presented(&a, &b)).unwrap();
+        // An insert that sent nothing new is not checked for them.
+        verify_insert_batch(
+            &before,
+            &after,
+            &[
+                compilation_expected(&a, true),
+                compilation_expected(&b, false),
+            ],
+        )
+        .unwrap();
+        // A comment or sort name other than the one sent refuses.
+        let mut other = member_a();
+        other.comment.clear();
+        assert!(verify_insert_batch(&before, &after, &presented(&other, &b)).is_err());
+        let mut other = member_a();
+        other.sort_title.clear();
+        assert!(verify_insert_batch(&before, &after, &presented(&other, &b)).is_err());
+        // A new album holds a sort name one of its members sent.
+        let (mut other_a, mut other_b) = (member_a(), compilation_source("B", false));
+        other_b.sort_album = vec!["Elsewhere".into()];
+        verify_insert_batch(&before, &after, &presented(&a, &other_b)).unwrap();
+        other_a.sort_album = vec!["Elsewhere".into()];
+        assert!(verify_insert_batch(&before, &after, &presented(&other_a, &other_b)).is_err());
+        let mut other = compilation_source("B", false);
+        other.sort_artist = vec!["B, Guest".into()];
+        assert!(verify_insert_batch(&before, &after, &presented(&a, &other)).is_err());
+        // A prior group or track that changed its sort name or comment refuses.
+        for change in [
+            "UPDATE album SET sort_album='Moved' WHERE album_pid=31;",
+            "UPDATE item_artist SET sort_item_artist='Moved' WHERE item_artist_pid=41;",
+            "UPDATE item_extra SET comment='Moved' WHERE item_pid=1;",
+            "UPDATE item_extra SET sort_title='Moved' WHERE item_pid=1;",
+        ] {
+            let after = compilation_state_at(2, 13, &format!("{PRESENTED}{change}"));
+            assert!(
+                verify_insert_batch(&before, &after, &presented(&a, &b)).is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_presented_member_joining_a_group_leaves_its_sort_name() {
+        // The insert sends a joined group's stored sort name back.
+        let stored = "UPDATE album SET sort_album='Album, sorted' WHERE album_pid=131;
+            UPDATE album_artist SET sort_album_artist='Artist, sorted' WHERE album_artist_pid=121;
+            UPDATE item_artist SET sort_item_artist='Guest A' WHERE item_artist_pid=141;";
+        let before = compilation_state(1, stored);
+        let after = compilation_state(
+            2,
+            &format!(
+                "{stored}UPDATE item_extra SET sort_title=title WHERE item_pid=3;
+                UPDATE item_artist SET sort_item_artist='Guest B' WHERE item_artist_pid=142;"
+            ),
+        );
+        let b = compilation_source("B", false);
+        let mut expected = compilation_expected(&b, false);
+        expected.presented = true;
+        verify_insert(&before, &after, &expected).unwrap();
+        let moved = compilation_state(
+            2,
+            &format!(
+                "{stored}UPDATE item_extra SET sort_title=title WHERE item_pid=3;
+                UPDATE item_artist SET sort_item_artist='Guest B' WHERE item_artist_pid=142;
+                UPDATE album SET sort_album='Compilation fixture album' WHERE album_pid=131;"
+            ),
+        );
+        assert!(verify_insert(&before, &moved, &expected).is_err());
+    }
+
+    #[test]
+    fn an_artist_matched_by_name_ignoring_case_is_the_same_group() {
+        // On the phone, a track tagged `Ca$h` was filed under the artist
+        // `CA$H`, the spelling of a later member of the same batch.
+        let before = compilation_state(0, "");
+        let after = compilation_state_at(2, 13, "");
+        let a = compilation_source("A", true);
+        let mut b = compilation_source("B", false);
+        b.artist = vec!["GUEST b".into()];
+        let expected = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        assert!(verify_insert_batch(&before, &after, &expected).is_ok());
+        b.artist = vec!["Guest C".into()];
+        let expected = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        assert!(verify_insert_batch(&before, &after, &expected).is_err());
+    }
+
+    #[test]
+    fn a_group_the_phone_renamed_to_a_targets_spelling_is_recorded() {
+        // On the phone, a member tagged `Ca$h` renamed the artist `CA$H` an
+        // earlier batch had left, and its prior member shows it.
+        let before = compilation_state(1, "");
+        let renamed = "UPDATE item_artist SET item_artist='GUEST A' WHERE item_artist_pid=141;
+            UPDATE item SET item_artist_pid=141 WHERE item_pid=3;
+            DELETE FROM item_artist WHERE item_artist_pid=142;";
+        let after = compilation_state_at(2, 14, renamed);
+        let mut b = compilation_source("B", false);
+        b.artist = vec!["GUEST A".into()];
+        let checked =
+            verify_insert_batch(&before, &after, &[compilation_expected(&b, false)]).unwrap();
+        assert_eq!(checked.case_renamed.len(), 1);
+        let rename = &checked.case_renamed[0];
+        assert_eq!(
+            (
+                rename.kind,
+                rename.id.as_str(),
+                rename.before.as_str(),
+                rename.after.as_str()
+            ),
+            ("track_artist", "0000000000002710", "Guest A", "GUEST A")
+        );
+        // A spelling no target declared is a changed prior track.
+        b.artist = vec!["guest a".into()];
+        assert!(verify_insert_batch(&before, &after, &[compilation_expected(&b, false)]).is_err());
+    }
+
+    #[test]
+    fn members_naming_one_new_composer_in_different_case_share_its_lookup() {
+        // On the phone, `Alpha;Beta` then `ALPHA;BETA` in one batch made one
+        // lookup named by the first and sorted by the second.
+        let shared = |name: &str, sort: &str| {
+            format!(
+                "INSERT INTO composer VALUES(72,0,'{name}','{sort}');
+                UPDATE item SET composer_pid=72 WHERE item_pid IN (2,3);"
+            )
+        };
+        let before = compilation_state(0, "");
+        let mut a = compilation_source("A", true);
+        a.composer = vec!["Writer X".into()];
+        let mut b = compilation_source("B", false);
+        b.composer = vec!["WRITER X".into()];
+        let expected = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        let after = compilation_state_at(2, 13, &shared("Writer X", "WRITER X"));
+        let checked = verify_insert_batch(&before, &after, &expected).unwrap();
+        assert_eq!(checked.new_composers, ["Writer X"]);
+        // A spelling no member declared refuses.
+        let after = compilation_state_at(2, 13, &shared("Writer X", "writer x"));
+        assert!(verify_insert_batch(&before, &after, &expected).is_err());
+    }
+
+    /// Artwork rows: one cached object per ID, then (entity, ID, artwork type,
+    /// entity type) registrations, tracks by item and albums by album row.
+    fn art(objects: &[u32], tokens: &[(i64, u32, i64, i64)]) -> String {
+        let mut sql = String::new();
+        for id in objects {
+            sql.push_str(&format!(
+                "INSERT INTO artwork VALUES('{id}',300,6,0,'aa/00000000000000000000000000000000000000');"
+            ));
+        }
+        for (entity, id, kind, entity_type) in tokens {
+            sql.push_str(&format!(
+                "INSERT INTO artwork_token VALUES({entity},'{id}',300,{kind},{entity_type},0);"
+            ));
+        }
+        sql
+    }
+
+    #[test]
+    fn covered_members_register_their_covers_and_may_cover_their_album() {
+        let a = compilation_source("A", true);
+        let b = compilation_source("B", false);
+        let expected = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        let covers = BTreeMap::from([(10000, 140), (10001, 141)]);
+        let none = BTreeSet::new();
+        let tracks = [(2, 140, 1, 0), (3, 141, 1, 0)];
+        let after = |album: Option<u32>, tracks: &[(i64, u32, i64, i64)], objects: &[u32]| {
+            let mut tokens = tracks.to_vec();
+            tokens.extend(album.map(|id| (131, id, 6, 4)));
+            compilation_state_at(2, 13, &art(objects, &tokens))
+        };
+        let check = |before: &Catalog, after: &Catalog| {
+            verify_insert_batch_covered(before, after, &expected, &none, &none, &covers)
+        };
+        // A new album takes one of its members' covers, or none.
+        let new = compilation_state(0, "");
+        for album in [Some(140), Some(141), None] {
+            let checked = check(&new, &after(album, &tracks, &[140, 141])).unwrap();
+            assert_eq!(checked.covers.len(), 2);
+            assert_eq!(checked.covers[0].album_cache_id, album);
+        }
+        for (album, tracks, objects, message) in [
+            (
+                Some(150),
+                &tracks[..],
+                &[140, 141, 150][..],
+                "unplanned artwork cache ID",
+            ),
+            (
+                None,
+                &[(2, 141, 1, 0), (3, 140, 1, 0)][..],
+                &[140, 141][..],
+                "does not hold its cover",
+            ),
+            (
+                None,
+                &tracks[..1],
+                &[140, 141][..],
+                "does not hold its cover",
+            ),
+        ] {
+            let error = check(&new, &after(album, tracks, objects))
+                .err()
+                .expect(message);
+            assert!(
+                format!("{error:#}").contains(message),
+                "{message}: {error:#}"
+            );
+        }
+        // Without covers nothing may register.
+        let error =
+            verify_insert_batch_with(&new, &after(None, &tracks, &[140, 141]), &expected, &none)
+                .err()
+                .expect("an uncovered batch registered covers");
+        assert!(
+            format!("{error:#}").contains("unplanned artwork cache ID"),
+            "{error:#}"
+        );
+        // A prior album (here emptied earlier) keeps its registration or takes
+        // a new member's cover. Its members are ordinary tracks here: an empty
+        // album has no compilation member, and that aggregate must not change.
+        let ordinary = compilation_source("A", false);
+        let refill = [
+            compilation_expected(&ordinary, true),
+            compilation_expected(&b, false),
+        ];
+        let emptied = "INSERT INTO album_artist VALUES(121,8000,'CLI Compilation Σύνολο',NULL);
+            INSERT INTO album VALUES(131,9000,'Compilation fixture album',121,1,NULL);";
+        let before =
+            compilation_state(0, &format!("{emptied}{}", art(&[120], &[(131, 120, 6, 4)])));
+        let refilled = |album: Option<u32>| {
+            let mut tokens = tracks.to_vec();
+            tokens.extend(album.map(|id| (131, id, 6, 4)));
+            let sql = format!(
+                "UPDATE item SET is_compilation=0 WHERE item_pid=2;{}",
+                art(&[120, 140, 141], &tokens)
+            );
+            verify_insert_batch_covered(
+                &before,
+                &compilation_state_at(2, 13, &sql),
+                &refill,
+                &none,
+                &none,
+                &covers,
+            )
+        };
+        for album in [120, 140, 141] {
+            refilled(Some(album)).unwrap();
+        }
+        assert!(refilled(None).is_err());
+        // An album without a covered member keeps its own registration.
+        let live = compilation_state(0, &art(&[120], &[(31, 120, 6, 4)]));
+        let moved = compilation_state_at(
+            2,
+            13,
+            &art(
+                &[120, 140, 141],
+                &[(2, 140, 1, 0), (3, 141, 1, 0), (31, 140, 6, 4)],
+            ),
+        );
+        let error = check(&live, &moved)
+            .err()
+            .expect("a live album's cover moved");
+        assert!(format!("{error:#}").contains("prior album artwork registration changed"));
+    }
+
+    #[test]
+    fn an_album_taking_a_member_cover_may_release_its_dangling_cache_id() {
+        let a = compilation_source("A", false);
+        let b = compilation_source("B", false);
+        let expected = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        let covers = BTreeMap::from([(10000, 140), (10001, 141)]);
+        let none = BTreeSet::new();
+        let emptied = "INSERT INTO album_artist VALUES(121,8000,'CLI Compilation Σύνολο',NULL);
+            INSERT INTO album VALUES(131,9000,'Compilation fixture album',121,1,NULL);";
+        // The emptied album points at 120, which has no cached object.
+        let dangling = compilation_state(0, &format!("{emptied}{}", art(&[], &[(131, 120, 6, 4)])));
+        let cached =
+            compilation_state(0, &format!("{emptied}{}", art(&[120], &[(131, 120, 6, 4)])));
+        let after = |album: u32, objects: &[u32]| {
+            let tokens = [(2, 140, 1, 0), (3, 141, 1, 0), (131, album, 6, 4)];
+            compilation_state_at(
+                2,
+                13,
+                &format!(
+                    "UPDATE item SET is_compilation=0 WHERE item_pid=2;{}",
+                    art(objects, &tokens)
+                ),
+            )
+        };
+        let check = |before: &Catalog, after: &Catalog| {
+            verify_insert_batch_covered(before, after, &expected, &none, &none, &covers)
+        };
+        let checked = check(&dangling, &after(141, &[140, 141])).unwrap();
+        assert_eq!(checked.released_album_cache_ids, [120]);
+        // An album that keeps its registration releases nothing; a cached ID
+        // never leaves.
+        let kept = check(&dangling, &after(120, &[140, 141])).unwrap();
+        assert!(kept.released_album_cache_ids.is_empty());
+        let error = check(&cached, &after(141, &[140, 141]))
+            .err()
+            .expect("a cached ID left");
+        assert!(
+            format!("{error:#}").contains("namespace lost an ID"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn removed_targets_leave_no_row_and_may_leave_their_groups() {
+        let a = compilation_source("A", false);
+        let b = compilation_source("B", false);
+        let expected = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        let before = compilation_state(0, "");
+        let none = BTreeSet::new();
+        let first = BTreeSet::from([10000]);
+        let both = BTreeSet::from([10000, 10001]);
+        let without_a = |extra: &str| {
+            compilation_state_at(
+                2,
+                13,
+                &format!(
+                    "DELETE FROM item_extra WHERE item_pid=2; DELETE FROM item_store WHERE item_pid=2;
+                    DELETE FROM item_state WHERE item_pid=2; DELETE FROM item_stats WHERE item_pid=2;
+                    DELETE FROM item WHERE item_pid=2;{extra}"
+                ),
+            )
+        };
+        let check = |after: &Catalog, removed: &BTreeSet<u64>, covers: &BTreeMap<u64, u32>| {
+            verify_insert_batch_covered(&before, after, &expected, &none, removed, covers)
+        };
+        // A was dropped; B is complete in the album both planned.
+        let checked = check(&without_a(""), &first, &BTreeMap::new()).unwrap();
+        assert_eq!(checked.removed_track_ids, ["0000000000002710"]);
+        assert_eq!(checked.new_albums, ["0000000000002328"]);
+        // Both were dropped: their new groups may stay without members, or not.
+        let emptied = "INSERT INTO album_artist VALUES(121,8000,'CLI Compilation Σύνολο',NULL);
+            INSERT INTO album VALUES(131,9000,'Compilation fixture album',121,1,NULL);";
+        for after in [
+            compilation_state_at(0, 13, emptied),
+            compilation_state_at(0, 13, ""),
+        ] {
+            let checked = check(&after, &both, &BTreeMap::new()).unwrap();
+            assert_eq!(checked.removed_track_ids.len(), 2);
+        }
+        // The dropped member's cover may stay as its album's; it holds none.
+        let covers = BTreeMap::from([(10000, 140), (10001, 141)]);
+        for album in [Some(140), Some(141), None] {
+            let mut tokens = vec![(3, 141, 1, 0)];
+            tokens.extend(album.map(|id| (131, id, 6, 4)));
+            check(&without_a(&art(&[140, 141], &tokens)), &first, &covers).unwrap();
+        }
+        // A row that still exists, or one both removed and locationless, refuses.
+        let error = check(&compilation_state_at(2, 13, ""), &first, &BTreeMap::new())
+            .err()
+            .expect("a removed track's row exists");
+        assert!(
+            format!("{error:#}").contains("track count differs"),
+            "{error:#}"
+        );
+        let error = verify_insert_batch_covered(
+            &before,
+            &without_a(""),
+            &expected,
+            &first,
+            &first,
+            &BTreeMap::new(),
+        )
+        .err()
+        .expect("a track was both removed and locationless");
+        assert!(
+            format!("{error:#}").contains("not a present batch target"),
+            "{error:#}"
+        );
+        // A present member's groups must exist.
+        let error = check(&compilation_state_at(0, 13, ""), &first, &BTreeMap::new())
+            .err()
+            .expect("the kept member lost its row");
+        assert!(
+            format!("{error:#}").contains("track count differs"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_batch_may_drop_album_registrations_whose_album_was_gone() {
+        let a = compilation_source("A", false);
+        let b = compilation_source("B", false);
+        let expected = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        let orphan = art(&[120], &[(999, 120, 6, 4)]);
+        let kept = art(&[120], &[]);
+        let ordinary = "UPDATE item SET is_compilation=0 WHERE item_pid=2;";
+        let none = BTreeSet::new();
+        let check = |before: &str, after: &str| {
+            verify_insert_batch_covered(
+                &compilation_state(0, before),
+                &compilation_state_at(2, 13, &format!("{ordinary}{after}")),
+                &expected,
+                &none,
+                &none,
+                &BTreeMap::new(),
+            )
+        };
+        assert_eq!(
+            check(&orphan, &kept)
+                .unwrap()
+                .dropped_orphan_album_registrations,
+            1
+        );
+        assert_eq!(
+            check(&orphan, &orphan)
+                .unwrap()
+                .dropped_orphan_album_registrations,
+            0
+        );
+        let error = check(&kept, &orphan)
+            .err()
+            .expect("a new orphan registration");
+        assert!(format!("{error:#}").contains("lost its album"), "{error:#}");
+    }
+
+    #[test]
+    fn compilation_verification_refuses_old_member_or_aggregate_drift() {
+        let before = compilation_state(1, "");
+        let b = compilation_source("B", false);
+        for change in [
+            "UPDATE item SET is_compilation=0 WHERE item_pid=2",
+            "UPDATE item_extra SET title='Changed' WHERE item_pid=2",
+            "UPDATE item_stats SET play_count_user=1 WHERE item_pid=1",
+            "UPDATE album SET all_compilations=0 WHERE album_pid=131",
+            "UPDATE album SET all_compilations=1 WHERE album_pid=31",
+            "UPDATE album_artist SET album_artist='Changed' WHERE album_artist_pid=121",
+            "UPDATE item SET is_compilation=1 WHERE item_pid=3",
+        ] {
+            assert!(
+                verify_insert(
+                    &before,
+                    &compilation_state(2, change),
+                    &compilation_expected(&b, false)
+                )
+                .is_err(),
+                "{change}"
+            );
+        }
+        let a = compilation_source("A", true);
+        assert!(
+            verify_insert(
+                &compilation_state(0, ""),
+                &compilation_state(1, "UPDATE item SET is_compilation=0 WHERE item_pid=2"),
+                &compilation_expected(&a, true)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn first_compilation_aggregate_transition_is_not_inferred_by_verifier() {
+        let ordinary = "UPDATE item SET is_compilation=0 WHERE item_pid=2; UPDATE album SET all_compilations=0 WHERE album_pid=131;";
+        let before = compilation_state(1, ordinary);
+        let after = compilation_state(
+            2,
+            &format!("{ordinary} UPDATE item SET is_compilation=1 WHERE item_pid=3;"),
+        );
+        let source = compilation_source("B", true);
+        let error = verify_insert(&before, &after, &compilation_expected(&source, false))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("prior album changed"));
+    }
+
+    #[test]
+    fn an_emptied_compilation_album_is_refilled_by_a_compilation_track() {
+        // `clear` can leave an album so: no members, summary still set.
+        let emptied = |summary: u8| {
+            compilation_state(
+                0,
+                &format!(
+                    "INSERT INTO album_artist VALUES(121,8000,'CLI Compilation Σύνολο',NULL);
+                    INSERT INTO album VALUES(131,9000,'Compilation fixture album',121,{summary},NULL);"
+                ),
+            )
+        };
+        let before = emptied(1);
+        let a = compilation_source("A", true);
+        let b = compilation_source("B", false);
+        let first = compilation_state(1, "");
+        verify_insert(&before, &first, &compilation_expected(&a, true)).unwrap();
+        let both = [
+            compilation_expected(&a, true),
+            compilation_expected(&b, false),
+        ];
+        verify_insert_batch(&before, &compilation_state_at(2, 13, ""), &both).unwrap();
+        // The summary itself stays, and an emptied ordinary album takes no
+        // first compilation.
+        let cleared = "UPDATE album SET all_compilations=0 WHERE album_pid=131";
+        for (before, after) in [
+            (&before, compilation_state(1, cleared)),
+            (&emptied(0), compilation_state(1, cleared)),
+        ] {
+            let error = verify_insert(before, &after, &compilation_expected(&a, true))
+                .err()
+                .expect("an unmodelled album aggregate verified");
+            assert!(
+                error.to_string().contains("prior album changed"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_composer_sort_delta_requires_explicit_legacy_policy() {
+        let before = crate::test_support::catalogue::composer_transition_catalog(
+            "ACME",
+            Some("ACME"),
+            100,
+            false,
+        );
+        let after = crate::test_support::catalogue::composer_transition_catalog(
+            "ACME",
+            Some("Acme"),
+            200,
+            true,
+        );
+        assert!(verify_composers(&before, &after, 1000, Some("Acme"), None, false).is_err());
+        let proof = verify_composers(&before, &after, 1000, Some("Acme"), None, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.lookup_id, 71);
+        assert_eq!(proof.before_sort, "ACME");
+        assert_eq!(proof.after_sort, "Acme");
+        assert_eq!(proof.prior_reference_count, 1);
+        assert_eq!(proof.after_reference_count, 2);
+        assert_eq!(proof.order_changes.len(), 1);
+        assert_eq!(proof.order_changes[0].before, 100);
+        assert_eq!(proof.order_changes[0].after, 200);
+        for (name, sort, order, request) in [
+            ("ACME", "ACME", 100, "Acme"), // no legacy effect
+            ("ACME", "Acme", 100, "Acme"), // unknown sort-only effect
+            ("ACME", "Other", 200, "Acme"),
+            ("ACME", "Acme", 200, "Other"),
+            ("ACME", "Acme", 200, "Acme "),
+            ("Acme", "Acme", 200, "Acme"), // display label changed
+        ] {
+            let wrong = crate::test_support::catalogue::composer_transition_catalog(
+                name,
+                Some(sort),
+                order,
+                true,
+            );
+            assert!(verify_composers(&before, &wrong, 1000, Some(request), None, true).is_err());
+        }
+    }
+    #[test]
+    fn strict_composer_reuse_preserves_independent_sort_and_reference_order() {
+        let before = crate::test_support::catalogue::composer_transition_catalog(
+            "ACME",
+            Some("An independent sort"),
+            100,
+            false,
+        );
+        let after = crate::test_support::catalogue::composer_transition_catalog(
+            "ACME",
+            Some("An independent sort"),
+            100,
+            true,
+        );
+        assert!(
+            verify_composers(&before, &after, 1000, Some("Acme"), None, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(verify_composers(&before, &after, 1000, Some("ACME"), None, false).is_ok());
+        assert!(verify_composers(&before, &after, 1000, Some("acme "), None, false).is_err());
+        assert!(verify_composers(&before, &after, 1000, None, None, false).is_err());
+    }
+    #[test]
+    fn preservation_rejects_missing_path_metadata_and_availability_changes() {
+        let catalog = crate::test_support::catalogue::collection_catalog(13);
+        let original = &catalog.tracks()[0];
+        assert!(preserve_tracks(catalog.tracks(), &BTreeMap::new()).is_err());
+        assert!(
+            preserve_tracks(
+                catalog.tracks(),
+                &BTreeMap::from([(original.sync_id, original)])
+            )
+            .is_ok()
+        );
+        for variant in 0..6 {
+            let mut changed = original.clone();
+            match variant {
+                0 => changed.afc_path = None,
+                1 => changed.metadata.title = "changed".into(),
+                2 => changed.availability.is_placeholder = true,
+                3 => changed.playback.play_count_user += 1,
+                4 => changed.metadata.content_rating += 1,
+                _ => changed.metadata.is_compilation = true,
+            };
+            assert!(
+                preserve_tracks(
+                    catalog.tracks(),
+                    &BTreeMap::from([(changed.sync_id, &changed)])
+                )
+                .is_err()
+            );
+        }
+    }
+    // Regression reduced from a retained insert capture: this prior track's
+    // recent play count drained 10 -> 0 while lifetime counts, dates and every
+    // other inspected/raw stats value remained exact. This is only a catalogue
+    // verifier test; transport, complete readback and journal acceptance are
+    // separately required evidence.
+    #[test]
+    fn insert_capture_recent_counters_reset_preserves_prior_track() {
+        let prior_stats = "ALTER TABLE item_stats ADD COLUMN date_played REAL; \
+            ALTER TABLE item_stats ADD COLUMN date_accessed REAL; \
+            ALTER TABLE item_stats ADD COLUMN bookmark_time_ms REAL; \
+            UPDATE item_store SET sync_id=-1234567890123456789 WHERE item_pid=1; \
+            UPDATE item_stats SET play_count_user=10,play_count_recent=10, \
+            date_played=750208100.121234,date_accessed=750153587.007244, \
+            bookmark_time_ms=0.0 WHERE item_pid=1;";
+        let before = compilation_state(0, prior_stats);
+        let after = compilation_state(
+            1,
+            &format!(
+                "{prior_stats} \
+                 UPDATE item_stats SET play_count_recent=0 WHERE item_pid=1; \
+                 UPDATE item SET is_compilation=0 WHERE item_pid=2; \
+                 UPDATE album SET all_compilations=0 WHERE album_pid=131;"
+            ),
+        );
+        let source = compilation_source("A", false);
+        let proof = verify_insert(&before, &after, &compilation_expected(&source, true))
+            .expect("the qualified recent-counter reset preserves the prior track");
+        assert_eq!(proof.prior_tracks_preserved, 1);
+        assert_eq!(before.tracks()[0].sync_id, 0xeeddef0b82167eeb);
+        assert_eq!(before.tracks()[0].playback.play_count_recent, 10);
+        assert_eq!(after.tracks()[0].playback.play_count_recent, 0);
+    }
+
+    #[test]
+    fn insert_capture_recent_counter_reset_rejects_every_other_prior_change() {
+        let prior_stats = "ALTER TABLE item_stats ADD COLUMN date_played REAL; \
+            ALTER TABLE item_stats ADD COLUMN date_accessed REAL; \
+            ALTER TABLE item_stats ADD COLUMN bookmark_time_ms REAL; \
+            UPDATE item_store SET sync_id=-1234567890123456789 WHERE item_pid=1; \
+            UPDATE item_stats SET play_count_user=10,play_count_recent=10, \
+            date_played=750208100.121234,date_accessed=750153587.007244, \
+            bookmark_time_ms=0.0 WHERE item_pid=1;";
+        let before = compilation_state(0, prior_stats);
+        let source = compilation_source("A", false);
+        for change in [
+            "UPDATE item_stats SET play_count_user=9 WHERE item_pid=1;",
+            "UPDATE item_stats SET play_count_user=11 WHERE item_pid=1;",
+            "UPDATE item_stats SET skip_count_user=1 WHERE item_pid=1;",
+            "UPDATE item_stats SET user_rating=1 WHERE item_pid=1;",
+            "UPDATE item_stats SET has_been_played=1 WHERE item_pid=1;",
+            "UPDATE item_stats SET user_rating_is_derived=1 WHERE item_pid=1;",
+            "UPDATE item_stats SET liked_state=1 WHERE item_pid=1;",
+            "UPDATE item_stats SET date_played=750208101.121234 WHERE item_pid=1;",
+            "UPDATE item_stats SET date_accessed=750153588.007244 WHERE item_pid=1;",
+            "UPDATE item_stats SET bookmark_time_ms=1.0 WHERE item_pid=1;",
+            "ALTER TABLE item_stats ADD COLUMN opaque_value;",
+            "UPDATE item_stats SET play_count_recent=9 WHERE item_pid=1;",
+            "UPDATE item_stats SET play_count_recent=11 WHERE item_pid=1;",
+            "UPDATE item_stats SET skip_count_recent=1 WHERE item_pid=1;",
+            "UPDATE item_extra SET title='Changed' WHERE item_pid=1;",
+            "UPDATE item_extra SET location='LOST.m4a' WHERE item_pid=1;",
+            "UPDATE item_state SET is_placeholder=1 WHERE item_pid=1;",
+            "UPDATE item_store SET sync_id=123 WHERE item_pid=1;",
+            "DELETE FROM item_stats WHERE item_pid=1; DELETE FROM item_state WHERE item_pid=1; DELETE FROM item_store WHERE item_pid=1; DELETE FROM item_extra WHERE item_pid=1; DELETE FROM item WHERE item_pid=1;",
+        ] {
+            let after = compilation_state(
+                1,
+                &format!(
+                    "{prior_stats} \
+                    UPDATE item_stats SET play_count_recent=0 WHERE item_pid=1; \
+                    UPDATE item SET is_compilation=0 WHERE item_pid=2; \
+                    UPDATE album SET all_compilations=0 WHERE album_pid=131; {change}"
+                ),
+            );
+            assert!(
+                verify_insert(&before, &after, &compilation_expected(&source, true)).is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_capture_recent_play_and_skip_resets_are_explicit_and_other_stats_stay_exact() {
+        let stats = "ALTER TABLE item_stats ADD COLUMN date_played REAL; \
+            ALTER TABLE item_stats ADD COLUMN bookmark_time_ms; \
+            UPDATE item_stats SET play_count_user=10,play_count_recent=10, \
+            date_played=750208100.121234,bookmark_time_ms=1 WHERE item_pid=1; \
+            UPDATE item_stats SET skip_count_user=5,skip_count_recent=3, \
+            date_played=750208101.121234,bookmark_time_ms=2 WHERE item_pid=2;";
+        let before = compilation_state(1, stats);
+        let source = compilation_source("B", false);
+        let reset = "UPDATE item_stats SET play_count_recent=0 WHERE item_pid=1; \
+            UPDATE item_stats SET skip_count_recent=0 WHERE item_pid=2;";
+        let after = compilation_state(2, &format!("{stats}{reset}"));
+        let proof = verify_insert(&before, &after, &compilation_expected(&source, false)).unwrap();
+        assert_eq!(proof.prior_tracks_preserved, 2);
+        assert_eq!(proof.prior_recent_counter_resets.len(), 2);
+        let play = proof
+            .prior_recent_counter_resets
+            .iter()
+            .find(|r| r.play_count_recent_before == 10)
+            .unwrap();
+        assert_eq!(play.play_count_recent_after, 0);
+        assert_eq!(play.skip_count_recent_before, play.skip_count_recent_after);
+        let skip = proof
+            .prior_recent_counter_resets
+            .iter()
+            .find(|r| r.skip_count_recent_before == 3)
+            .unwrap();
+        assert_eq!(skip.skip_count_recent_after, 0);
+        assert_eq!(skip.play_count_recent_before, skip.play_count_recent_after);
+        for change in [
+            "UPDATE item_stats SET skip_count_user=4 WHERE item_pid=2;",
+            "UPDATE item_stats SET skip_count_user=6 WHERE item_pid=2;",
+            "UPDATE item_stats SET skip_count_recent=2 WHERE item_pid=2;",
+            "UPDATE item_stats SET skip_count_recent=4 WHERE item_pid=2;",
+            "UPDATE item_stats SET bookmark_time_ms=1.0 WHERE item_pid=1;",
+            "UPDATE item_stats SET bookmark_time_ms=NULL WHERE item_pid=1;",
+            "UPDATE item_stats SET date_played=750208101.121234 WHERE item_pid=1;",
+        ] {
+            let wrong = compilation_state(2, &format!("{stats}{reset}{change}"));
+            assert!(
+                verify_insert(&before, &wrong, &compilation_expected(&source, false)).is_err(),
+                "{change}"
+            );
+        }
+        let unchanged = compilation_state(2, stats);
+        assert!(
+            verify_insert(&before, &unchanged, &compilation_expected(&source, false))
+                .unwrap()
+                .prior_recent_counter_resets
+                .is_empty()
+        );
+        assert!(
+            verify_insert_legacy_composer_sort(
+                &before,
+                &after,
+                &compilation_expected(&source, false)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn listening_rule_decides_prior_playback_and_every_other_field_stays_exact() {
+        let stats = "ALTER TABLE item_stats ADD COLUMN date_played REAL; \
+            ALTER TABLE item_stats ADD COLUMN date_accessed REAL; \
+            UPDATE item_stats SET play_count_user=10,play_count_recent=1, \
+            date_played=750208100.121234 WHERE item_pid=1;";
+        let before = compilation_state(0, stats);
+        let source = compilation_source("A", false);
+        let expected = compilation_expected(&source, true);
+        let insert = "UPDATE item SET is_compilation=0 WHERE item_pid=2; \
+            UPDATE album SET all_compilations=0 WHERE album_pid=131;";
+        // Two later plays, counted from zero after the write cleared the
+        // recent counter.
+        let played = "UPDATE item_stats SET play_count_user=12,play_count_recent=2, \
+            date_played=750282000.5 WHERE item_pid=1;";
+        let after = compilation_state(1, &format!("{stats}{insert}{played}"));
+        assert!(verify_insert(&before, &after, &expected).is_err());
+        let grows = |a: &PlaybackStatistics, b: &PlaybackStatistics| -> Result<()> {
+            ensure!(
+                b.play_count_user >= a.play_count_user && b.user_rating == a.user_rating,
+                "not listening"
+            );
+            Ok(())
+        };
+        let proof = verify_insert_after_listening(&before, &after, &expected, &grows).unwrap();
+        assert_eq!(
+            proof.prior_tracks_listened_between_runs,
+            vec![format!("{:016x}", before.tracks()[0].sync_id)]
+        );
+        assert!(proof.prior_recent_counter_resets.is_empty());
+        let unchanged = compilation_state(1, &format!("{stats}{insert}"));
+        let proof = verify_insert_after_listening(&before, &unchanged, &expected, &grows).unwrap();
+        assert!(proof.prior_tracks_listened_between_runs.is_empty());
+        for change in [
+            "UPDATE item_stats SET user_rating=1 WHERE item_pid=1;",
+            "UPDATE item_stats SET play_count_user=9 WHERE item_pid=1;",
+            "UPDATE item_extra SET title='Changed' WHERE item_pid=1;",
+            "UPDATE item_extra SET location='LOST.m4a' WHERE item_pid=1;",
+            // A statistic listening never writes, and a play dated earlier.
+            "UPDATE item_stats SET date_accessed=750282000.5 WHERE item_pid=1;",
+            "UPDATE item_stats SET date_played=750208000.0 WHERE item_pid=1;",
+        ] {
+            let wrong = compilation_state(1, &format!("{stats}{insert}{played}{change}"));
+            assert!(
+                verify_insert_after_listening(&before, &wrong, &expected, &grows).is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_run_accepts_a_batch_whose_prior_tracks_were_played_since() {
+        let stats = "ALTER TABLE item_stats ADD COLUMN date_played REAL; \
+            ALTER TABLE item_stats ADD COLUMN date_accessed REAL; \
+            UPDATE item_stats SET play_count_user=10,play_count_recent=1, \
+            date_played=750208100.121234 WHERE item_pid=1;";
+        let before = compilation_state(0, stats);
+        let source = compilation_source("A", false);
+        let expected = [compilation_expected(&source, true)];
+        let insert = "UPDATE item SET is_compilation=0 WHERE item_pid=2; \
+            UPDATE album SET all_compilations=0 WHERE album_pid=131;";
+        let played = "UPDATE item_stats SET play_count_user=12,play_count_recent=2, \
+            date_played=750282000.5 WHERE item_pid=1;";
+        let none = BTreeSet::new();
+        let covers = BTreeMap::new();
+        let grows = |a: &PlaybackStatistics, b: &PlaybackStatistics| -> Result<()> {
+            ensure!(b.play_count_user >= a.play_count_user, "not listening");
+            Ok(())
+        };
+        let later = |after: &Catalog| {
+            verify_insert_batch_after_listening(
+                &before, after, &expected, &none, &none, &covers, &grows,
+            )
+        };
+        let after = compilation_state(1, &format!("{stats}{insert}{played}"));
+        // The session's own check stays exact.
+        assert!(
+            verify_insert_batch_covered(&before, &after, &expected, &none, &none, &covers).is_err()
+        );
+        let proof = later(&after).unwrap();
+        assert_eq!(
+            proof.prior_tracks_listened_between_runs,
+            vec![format!("{:016x}", before.tracks()[0].sync_id)]
+        );
+        let unchanged = compilation_state(1, &format!("{stats}{insert}"));
+        let proof = later(&unchanged).unwrap();
+        assert!(proof.prior_tracks_listened_between_runs.is_empty());
+        // The session's own reset is reported as one, not as listening.
+        let reset = "UPDATE item_stats SET play_count_recent=0 WHERE item_pid=1;";
+        let proof = later(&compilation_state(1, &format!("{stats}{insert}{reset}"))).unwrap();
+        assert!(proof.prior_tracks_listened_between_runs.is_empty());
+        assert_eq!(proof.prior_recent_counter_resets.len(), 1);
+        for change in [
+            "UPDATE item_stats SET play_count_user=9 WHERE item_pid=1;",
+            "UPDATE item_extra SET title='Changed' WHERE item_pid=1;",
+            "UPDATE item_stats SET date_accessed=750282000.5 WHERE item_pid=1;",
+            "UPDATE item_stats SET date_played=750208000.0 WHERE item_pid=1;",
+        ] {
+            let wrong = compilation_state(1, &format!("{stats}{insert}{played}{change}"));
+            assert!(later(&wrong).is_err(), "{change}");
+        }
+        // A date that moved without a play is not listening either.
+        let moved = "UPDATE item_stats SET date_played=750282000.5 WHERE item_pid=1;";
+        let wrong = compilation_state(1, &format!("{stats}{insert}{moved}"));
+        assert!(later(&wrong).is_err());
+    }
+
+    #[test]
+    fn unchanged_catalog_cannot_complete_an_insertion() {
+        let catalog = crate::test_support::catalogue::collection_catalog(13);
+        let metadata = crate::media::metadata::read(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/silence-alac.m4a"),
+        )
+        .unwrap();
+        let expected = ExpectedInsert {
+            track_id: 42,
+            album_id: 43,
+            artist_id: 44,
+            path: "iTunes_Control/Music/F00/TEST.m4a",
+            file_bytes: 100,
+            metadata: (&metadata).into(),
+            presented: false,
+        };
+        assert!(verify_insert(&catalog, &catalog, &expected).is_err());
+    }
+
+    /// The phone may finish an earlier session's evaluation of an album in a
+    /// later one: keep_local_status 0 to 2, its revision moved, its stats
+    /// revision row gone (seen in a metadata edit). The catalogue the
+    /// insert and cover verifiers compare holds none of those cells, so an
+    /// insert batch, a single insert or a cover accepts such a session.
+    #[test]
+    fn an_album_evaluation_leaves_the_compared_catalogue_unchanged() {
+        use rusqlite::Connection;
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = crate::test_support::catalogue::NativeFixture::new();
+        std::fs::set_permissions(&fixture.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Connection::open(&fixture.before)
+            .unwrap()
+            .execute_batch(
+                "UPDATE album SET keep_local_status=0 WHERE album_pid=10;
+                INSERT INTO entity_revision(revision,entity_pid,deleted,class,revision_type)VALUES(5,10,0,4,0),(6,10,0,4,1);",
+            )
+            .unwrap();
+        let evaluated = fixture.dir.join("evaluated.sqlite");
+        std::fs::copy(&fixture.before, &evaluated).unwrap();
+        Connection::open(&evaluated)
+            .unwrap()
+            .execute_batch(
+                "UPDATE album SET keep_local_status=2 WHERE album_pid=10;
+                UPDATE entity_revision SET revision=11 WHERE entity_pid=10 AND class=4 AND revision_type=0;
+                DELETE FROM entity_revision WHERE entity_pid=10 AND class=4 AND revision_type=1;",
+            )
+            .unwrap();
+        let read = |path: &std::path::Path| {
+            crate::catalogue::sqlite::read_snapshot(path, None, &fixture.dir).unwrap()
+        };
+        let (before, after) = (read(&fixture.before), read(&evaluated));
+        assert_eq!(before.tracks(), after.tracks());
+        assert!(before.albums() == after.albums());
+        assert!(before.artists() == after.artists());
+        assert_eq!(
+            before.persisted_media_anchor(),
+            after.persisted_media_anchor()
+        );
+        assert_eq!(
+            before.artwork().album_cache_ids(),
+            after.artwork().album_cache_ids()
+        );
+    }
+}
