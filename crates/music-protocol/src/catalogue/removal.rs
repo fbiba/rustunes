@@ -156,6 +156,590 @@ impl RemovalReceipt {
     }
 }
 
+/// Before-only qualification, run before sending and again at verification:
+/// every target is one distinct live item whose relationships are all
+/// modelled here. Container memberships are allowed in the library container
+/// and Playback History, which the receiver leaves in place, and once per
+/// ordinary playlist of the modelled shape, which loses them.
+pub fn qualify(before: &Tables, targets: &[i64]) -> Result<()> {
+    ensure!(!targets.is_empty(), "removal has no targets");
+    let distinct: BTreeSet<_> = targets.iter().collect();
+    ensure!(
+        distinct.len() == targets.len() && targets.iter().all(|t| *t > 0),
+        "removal targets must be distinct nonzero items"
+    );
+    let retained = retained_containers(before)?;
+    let playlists = playlists::ordinary(before)?;
+    let mut memberships = BTreeSet::new();
+    for (name, table) in before {
+        let Ok(key) = table.column("item_pid") else {
+            continue;
+        };
+        if ITEM_TABLES.contains(&name.as_str()) {
+            continue;
+        }
+        let container = table.column("container_pid").ok();
+        for row in table.rows.keys() {
+            let Cell::Integer(id) = row[key] else {
+                continue;
+            };
+            if !distinct.contains(&id) {
+                continue;
+            }
+            let owner = match container.map(|c| &row[c]) {
+                Some(Cell::Integer(pid)) if name == "container_item" => Some(*pid),
+                _ => None,
+            };
+            let allowed = owner.is_some_and(|pid| {
+                retained.contains(&pid) || playlists.contains(&pid) && memberships.insert((pid, id))
+            });
+            ensure!(
+                allowed,
+                "removal target {id} has an unmodelled {name} relationship"
+            );
+        }
+    }
+    let items = table(before, "item")?;
+    for item in targets {
+        let row = items.one("item_pid", *item)?;
+        for (name, key, _) in GROUPS {
+            let id = typed::int(items, row, key)?;
+            if id != 0 {
+                table(before, name)?.one(key, id)?;
+            }
+        }
+        let (revision, number) = target_revision(before, *item)?;
+        let revisions = table(before, "entity_revision")?;
+        ensure!(
+            number > 0 && typed::int(revisions, revision, "deleted")? == 0,
+            "removal target {item} revision is not live"
+        );
+        target_stats_revision(before, *item)?;
+    }
+    playlists::qualify(before, &targets.iter().copied().collect())?;
+    for key in [ANCHOR, LAST_SYNCED, GENERATION, HERO] {
+        property(before, key)?;
+    }
+    Ok(())
+}
+
+/// `qualify` for the removals of a session that also inserts tracks. That
+/// session is verified against the catalogue, which holds no playlist, so no
+/// target may belong to an ordinary playlist; such removals go in a session
+/// of their own.
+pub fn qualify_session(before: &Tables, targets: &[i64]) -> Result<()> {
+    qualify(before, targets)?;
+    let holding = playlists::holding(before, &targets.iter().copied().collect())?;
+    ensure!(
+        holding.is_empty(),
+        "{} ordinary playlist(s) hold a removal target; a session that also inserts removes no playlist member",
+        holding.len()
+    );
+    Ok(())
+}
+
+pub fn verify(
+    before: &Tables,
+    after: &Tables,
+    targets: &[i64],
+    base_anchor: u32,
+) -> Result<RemovalReceipt> {
+    verify_with(before, after, targets, base_anchor, None)
+}
+
+/// `verify` for a later run's capture, after the phone may have been used:
+/// everything the session wrote is modelled as before, except that the
+/// survivors' renumbering is left to `between_runs`, since the phone may
+/// renumber them again later. The session's tombstones, moved album and
+/// playlist revisions and keep-local evaluations stay exact.
+pub fn verify_later(
+    before: &Tables,
+    after: &Tables,
+    targets: &[i64],
+    base_anchor: u32,
+    between_runs: BetweenRuns<'_>,
+) -> Result<RemovalReceipt> {
+    verify_with(before, after, targets, base_anchor, Some(between_runs))
+}
+
+fn verify_with(
+    before: &Tables,
+    after: &Tables,
+    targets: &[i64],
+    base_anchor: u32,
+    between_runs: Option<BetweenRuns<'_>>,
+) -> Result<RemovalReceipt> {
+    qualify(before, targets)?;
+    ensure!(
+        before.keys().eq(after.keys())
+            && before.iter().all(|(n, t)| {
+                t.columns == after[n].columns && t.definitions == after[n].definitions
+            }),
+        "removal table set or column definitions differ"
+    );
+    ensure!(
+        decimal(property(before, ANCHOR)?, false)? == i64::from(base_anchor),
+        "removal before state is not at the prepared anchor"
+    );
+    let removed: BTreeSet<i64> = targets.iter().copied().collect();
+    let retained = retained_containers(before)?;
+    let mut expected = before.clone();
+    let mut playlist_removals =
+        playlists::remove_memberships(before, after, &mut expected, &removed)?;
+    let mut evaluations =
+        playlists::evaluate_untouched(before, after, &mut expected, &playlist_removals)?;
+    let mut receipts = Vec::new();
+    for item in targets {
+        let target = Cell::Integer(*item);
+        let mut removed_rows = BTreeMap::new();
+        for name in ITEM_TABLES {
+            let t = expected.get_mut(name).context("item table absent")?;
+            let key = t.column("item_pid")?;
+            let mut count = 0;
+            t.rows.retain(|r, n| {
+                let own = r[key] == target;
+                if own {
+                    count += *n;
+                }
+                !own
+            });
+            if count > 0 {
+                removed_rows.insert(name, count);
+            }
+        }
+        let mut removed_artwork_rows = 0;
+        for name in ["artwork_token", "best_artwork_token"] {
+            let t = expected.get_mut(name).context("artwork table absent")?;
+            let id = t.column("entity_pid")?;
+            let kind = t.column("entity_type")?;
+            t.rows.retain(|r, n| {
+                let own = r[id] == target && r[kind] == Cell::Integer(0);
+                if own {
+                    removed_artwork_rows += *n;
+                }
+                !own
+            });
+        }
+        let mut retained_memberships = 0;
+        if let Some(memberships) = before.get("container_item") {
+            let key = memberships.column("item_pid")?;
+            let owner = memberships.column("container_pid")?;
+            retained_memberships = memberships
+                .rows
+                .iter()
+                .filter(|(r, _)| {
+                    r[key] == target
+                        && matches!(r[owner], Cell::Integer(pid) if retained.contains(&pid))
+                })
+                .map(|(_, n)| *n)
+                .sum();
+        }
+        receipts.push(TargetRemoval {
+            item_pid: *item,
+            removed_rows,
+            tombstone_revision_before: 0,
+            tombstone_revision_after: 0,
+            removed_stats_revision: None,
+            removed_artwork_rows,
+            retained_memberships,
+        });
+    }
+    // Token rows whose entity was already gone before the session may go.
+    let mut removed_orphan_artwork_rows = 0;
+    for name in ["artwork_token", "best_artwork_token"] {
+        for (row, n) in orphan_tokens(before, name)? {
+            if !table(after, name)?.rows.contains_key(&row) {
+                expected
+                    .get_mut(name)
+                    .context("artwork table absent")?
+                    .rows
+                    .remove(&row);
+                removed_orphan_artwork_rows += n;
+            }
+        }
+    }
+    let survivors = item_ids(table(&expected, "item")?)?;
+    let mut collected = collected_groups(before, after, &survivors)?;
+    for group in &collected {
+        let t = expected
+            .get_mut(group.table)
+            .context("group table absent")?;
+        let key = t.column(group.key)?;
+        t.rows
+            .retain(|r, _| r[key] != Cell::Integer(group.group_pid));
+    }
+
+    let recent_counter_resets = recent_counter_resets(before, after, &mut expected, &removed)?;
+    let filled_phone_entries = fill_phone_entries(before, after, &mut expected)?;
+
+    // Each target's live revision becomes its tombstone above the last synced
+    // one; every tombstone number is distinct.
+    let last_synced = decimal(property(before, LAST_SYNCED)?, false)?;
+    let revisions = table(before, "entity_revision")?;
+    let mut numbers = BTreeSet::new();
+    for receipt in &mut receipts {
+        let item = receipt.item_pid;
+        let (old_revision, old_number) = target_revision(before, item)?;
+        let (new_revision, new_number) = target_revision(after, item)?;
+        ensure!(
+            new_number > old_number
+                && new_number > last_synced
+                && numbers.insert(new_number)
+                && typed::int(revisions, new_revision, "deleted")? == 2,
+            "removal target {item} tombstone is invalid"
+        );
+        let mut tombstone = old_revision.clone();
+        typed::set(
+            revisions,
+            &mut tombstone,
+            "revision",
+            Cell::Integer(new_number),
+        )?;
+        typed::set(revisions, &mut tombstone, "deleted", Cell::Integer(2))?;
+        ensure!(
+            tombstone == *new_revision,
+            "removal target {item} tombstone changed other fields"
+        );
+        typed::replace(&mut expected, "entity_revision", old_revision, tombstone)?;
+        receipt.tombstone_revision_before = old_number;
+        receipt.tombstone_revision_after = new_number;
+        if let Some((stats_row, number)) = target_stats_revision(before, item)? {
+            if !table(after, "entity_revision")?
+                .rows
+                .contains_key(stats_row)
+            {
+                ensure!(
+                    new_number > number
+                        && expected
+                            .get_mut("entity_revision")
+                            .context("revisions absent")?
+                            .rows
+                            .remove(stats_row)
+                            == Some(1),
+                    "removal target {item} stats revision is not dominated"
+                );
+                receipt.removed_stats_revision = Some(number);
+            }
+        }
+    }
+    // A collected group's revisions follow the same rule as a target's.
+    for group in &mut collected {
+        let class = group.class;
+        let own = |t: &Table| -> Result<Vec<(Row, i64)>> {
+            let mut rows = Vec::new();
+            for (row, n) in &t.rows {
+                if typed::int(t, row, "entity_pid")? == group.group_pid
+                    && typed::int(t, row, "class")? == class
+                {
+                    ensure!(*n == 1, "duplicate group revision");
+                    rows.push((row.clone(), typed::int(t, row, "revision_type")?));
+                }
+            }
+            Ok(rows)
+        };
+        let after_revisions = table(after, "entity_revision")?;
+        let now = own(after_revisions)?;
+        for (old, kind) in own(revisions)? {
+            let number = typed::int(revisions, &old, "revision")?;
+            match kind {
+                0 => {
+                    let (tombstone, _) = now.iter().find(|(_, k)| *k == 0).with_context(|| {
+                        format!(
+                            "collected {} {} has no tombstone",
+                            group.table, group.group_pid
+                        )
+                    })?;
+                    let after_number = typed::int(after_revisions, tombstone, "revision")?;
+                    let mut desired = old.clone();
+                    typed::set(
+                        revisions,
+                        &mut desired,
+                        "revision",
+                        Cell::Integer(after_number),
+                    )?;
+                    typed::set(revisions, &mut desired, "deleted", Cell::Integer(2))?;
+                    ensure!(
+                        typed::int(revisions, &old, "deleted")? == 0
+                            && after_number > number
+                            && after_number > last_synced
+                            && numbers.insert(after_number)
+                            && desired == *tombstone,
+                        "collected {} {} tombstone is invalid",
+                        group.table,
+                        group.group_pid
+                    );
+                    typed::replace(&mut expected, "entity_revision", &old, desired)?;
+                    group.tombstone = Some((number, after_number));
+                }
+                1 => {
+                    ensure!(
+                        now.iter().all(|(_, k)| *k != 1)
+                            && expected
+                                .get_mut("entity_revision")
+                                .context("revisions absent")?
+                                .rows
+                                .remove(&old)
+                                == Some(1),
+                        "collected {} {} stats revision stayed",
+                        group.table,
+                        group.group_pid
+                    );
+                    group.removed_stats_revision = Some(number);
+                }
+                other => bail!("unmodelled group revision type {other}"),
+            }
+        }
+        ensure!(
+            group.tombstone.is_some(),
+            "collected {} {} has no live revision",
+            group.table,
+            group.group_pid
+        );
+    }
+    playlists::move_revisions(
+        before,
+        after,
+        &mut expected,
+        &mut playlist_removals,
+        last_synced,
+        &mut numbers,
+    )?;
+    let highest = *numbers.last().context("removal has no tombstones")?;
+
+    // Sync properties: exactly one anchor, the highest tombstone or playlist
+    // revision as last synced, and a free generation. Hero progress may follow or stay; it is
+    // checked below, once every revision the session wrote is known.
+    let anchor = base_anchor
+        .checked_add(1)
+        .context("removal anchor exhausted")?;
+    ensure!(
+        decimal(property(after, ANCHOR)?, false)? == i64::from(anchor)
+            && decimal(property(after, LAST_SYNCED)?, false)? == highest,
+        "removal anchor/last-synced properties differ"
+    );
+    let hero = decimal(property(after, HERO)?, false)?;
+    let property_changes = property_changes(before, after, &mut expected)?;
+
+    // Groups stay. A representative that was a target moves to a surviving
+    // member, or to zero when none survives; album representatives may move to
+    // any surviving same-album member. An artist or genre whose
+    // representative has no cover of its own may move to its lowest member
+    // that has one: one removal moved an artist's representative off the
+    // library's one track without a cover, although no target belonged to
+    // that artist, and another moved a genre's off a coverless test tone
+    // with its album and artists. No other group cell may change.
+    let items = table(before, "item")?;
+    let tokens = table(before, "artwork_token")?;
+    let mut covered = BTreeSet::new();
+    for row in tokens.rows.keys() {
+        if typed::int(tokens, row, "entity_type")? == 0 {
+            covered.insert(typed::int(tokens, row, "entity_pid")?);
+        }
+    }
+    let mut representatives = Vec::new();
+    let mut emptied = BTreeSet::new();
+    for (name, key, _) in GROUPS {
+        let mut members: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+        let mut touched = BTreeSet::new();
+        for row in items.rows.keys() {
+            let id = typed::int(items, row, "item_pid")?;
+            let group = typed::int(items, row, key)?;
+            if removed.contains(&id) {
+                touched.insert(group);
+            } else {
+                members.entry(group).or_default().insert(id);
+            }
+        }
+        if name == "album" {
+            emptied.extend(touched.iter().filter(|g| !members.contains_key(g)));
+        }
+        let groups = table(before, name)?;
+        let after_groups = table(after, name)?;
+        for (row, n) in &groups.rows {
+            ensure!(*n == 1, "duplicate {name} row");
+            let id = typed::int(groups, row, key)?;
+            if collected
+                .iter()
+                .any(|g| g.table == name && g.group_pid == id)
+            {
+                continue;
+            }
+            let now_row = after_groups
+                .one(key, id)
+                .with_context(|| format!("removal deleted {name} {id}"))?;
+            let prior = typed::int(groups, row, "representative_item_pid")?;
+            let now = typed::int(after_groups, now_row, "representative_item_pid")?;
+            if prior == now {
+                continue;
+            }
+            let surviving = members.get(&id);
+            let allowed = if removed.contains(&prior) {
+                surviving.map_or(now == 0, |s| s.contains(&now))
+            } else if name == "album" {
+                surviving.is_some_and(|s| s.contains(&now))
+            } else {
+                matches!(name, "album_artist" | "item_artist" | "genre")
+                    && !covered.contains(&prior)
+                    && surviving.and_then(|s| s.iter().find(|m| covered.contains(*m))) == Some(&now)
+            };
+            ensure!(
+                allowed,
+                "unqualified {name} {id} representative {prior} -> {now}"
+            );
+            let mut desired = row.clone();
+            typed::set(
+                groups,
+                &mut desired,
+                "representative_item_pid",
+                Cell::Integer(now),
+            )?;
+            typed::replace(&mut expected, name, row, desired)?;
+            representatives.push(Representative {
+                table: name,
+                group_pid: id,
+                before: prior,
+                after: now,
+            });
+        }
+    }
+
+    let before_albums = table(before, "album")?;
+    let after_albums = table(after, "album")?;
+    let evaluated = unevaluated_albums(before_albums, after_albums, &emptied, &collected)?;
+    let recomputed: BTreeSet<i64> = emptied.union(&evaluated).copied().collect();
+    let mut emptied_albums = BTreeMap::new();
+    for id in &recomputed {
+        let Ok(row) = table(&expected, "album")?.one("album_pid", *id) else {
+            continue;
+        };
+        let row = row.clone();
+        let now = after_albums.one("album_pid", *id)?.clone();
+        if row == now {
+            continue;
+        }
+        let column = before_albums.column("keep_local_status")?;
+        let mut desired = row.clone();
+        desired[column] = now[column].clone();
+        ensure!(
+            desired == now && now[column] == Cell::Integer(2),
+            "album {id} changed beyond keep_local_status 2"
+        );
+        let prior = typed::int(before_albums, &row, "keep_local_status")?;
+        typed::replace(&mut expected, "album", &row, desired)?;
+        emptied_albums.insert(
+            *id,
+            EmptiedAlbum {
+                album_pid: *id,
+                keep_local_status: Some((prior, 2)),
+                revision: None,
+                removed_stats_revision: None,
+            },
+        );
+    }
+
+    // Keep-local evaluations land above everything else the session wrote;
+    // the survivor refresh is compared without them.
+    let keep_local = playlists::keep_local_rows(after, &playlist_removals, &evaluations)?;
+    let mut actual_revisions = table(after, "entity_revision")?.clone();
+    for (_, row, _) in &keep_local {
+        actual_revisions.rows.remove(row);
+    }
+    let (survivor_revision_refresh, album_revisions) = survivor_revision_refresh(
+        expected
+            .get_mut("entity_revision")
+            .context("revisions absent")?,
+        &actual_revisions,
+        &survivors,
+        &recomputed,
+        highest,
+        between_runs.is_some(),
+    )?;
+    // Hero progress stays, follows the highest tombstone, or follows the
+    // highest revision written at all: an emptied album's new revision lies
+    // above the tombstones (observed).
+    let written = survivor_revision_refresh
+        .iter()
+        .map(|r| r.after)
+        .chain(album_revisions.values().map(|(_, after, _)| *after))
+        .fold(highest, i64::max);
+    // A later run cannot tell the session's survivor refresh from the
+    // phone's own renumbering since, so hero progress may stop anywhere
+    // above the tombstones the after state reaches.
+    let reached = |hero: i64| -> Result<bool> {
+        let revisions = table(after, "entity_revision")?;
+        for row in revisions.rows.keys() {
+            if typed::int(revisions, row, "revision")? >= hero {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    ensure!(
+        hero == highest
+            || hero == written
+            || hero == decimal(property(before, HERO)?, false)?
+            || between_runs.is_some() && hero > highest && reached(hero)?,
+        "removal hero revision progress differs"
+    );
+    playlists::add_keep_local(
+        &mut expected,
+        &mut playlist_removals,
+        &mut evaluations,
+        keep_local,
+        written,
+    )?;
+    for (id, (before, after, stats)) in album_revisions {
+        let album = emptied_albums.entry(id).or_insert(EmptiedAlbum {
+            album_pid: id,
+            keep_local_status: None,
+            revision: None,
+            removed_stats_revision: None,
+        });
+        album.revision = Some((before, after));
+        album.removed_stats_revision = stats;
+    }
+    for id in &evaluated {
+        ensure!(
+            emptied_albums.get(id).is_some_and(|a| a.revision.is_some()),
+            "evaluated album {id} kept its revision"
+        );
+    }
+    let (evaluated_albums, emptied_albums): (Vec<_>, Vec<_>) = emptied_albums
+        .into_values()
+        .partition(|album| evaluated.contains(&album.album_pid));
+
+    let between_runs_playback = match between_runs {
+        Some(absorb) => absorb(&mut expected, after, highest)?,
+        None => None,
+    };
+    let mismatches: Vec<_> = expected
+        .iter()
+        .filter(|(n, t)| t.rows != after[*n].rows)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    ensure!(
+        mismatches.is_empty(),
+        "unmodelled removal rows in tables: {}",
+        mismatches.join(", ")
+    );
+    Ok(RemovalReceipt {
+        schema: "music-protocol.removal-sql",
+        targets: receipts,
+        property_changes,
+        representatives,
+        recent_counter_resets,
+        filled_phone_entries,
+        removed_orphan_artwork_rows,
+        survivor_revision_refresh,
+        emptied_albums,
+        evaluated_albums,
+        collected_groups: collected,
+        playlists: playlist_removals,
+        keep_local_evaluations: evaluations,
+        between_runs_playback,
+    })
+}
+
 /// Albums still at keep_local_status 0 that the after state shows at 2 and
 /// that the removal neither emptied nor collected: the phone finishing an
 /// earlier session's evaluation. The caller holds them to the emptied-album
@@ -717,3 +1301,7 @@ fn decimal(value: &str, signed: bool) -> Result<i64> {
     Ok(n)
 }
 pub mod playlists;
+#[cfg(test)]
+mod single_target_tests;
+#[cfg(test)]
+mod tests;
