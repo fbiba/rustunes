@@ -5,7 +5,9 @@
 //! authority; callers retain those obligations around every mutating operation.
 
 pub mod afc;
+pub mod alac;
 pub mod framing;
+pub mod mpeg;
 pub mod operations;
 pub mod signing;
 pub mod trace;
