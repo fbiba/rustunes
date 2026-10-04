@@ -36,6 +36,10 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type Tables = BTreeMap<String, Table>;
+pub use playlist_deletion::{
+    PlaylistDeletionReceipt, deletion_not_applied, qualify_clear, qualify_deletion,
+    verify_deletion, verify_deletion_later,
+};
 
 /// What a later run's capture may hold besides the session: the phone was
 /// used in between (plays and skips, Playback History, its own renumbering of
@@ -1300,6 +1304,8 @@ fn decimal(value: &str, signed: bool) -> Result<i64> {
     );
     Ok(n)
 }
+
+mod playlist_deletion;
 pub mod playlists;
 #[cfg(test)]
 mod single_target_tests;
