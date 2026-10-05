@@ -208,6 +208,170 @@ impl ReceiveCheckpoint {
     }
 }
 
+impl PendingAudioDemand {
+    /// Consume this exact live demand inside the application's authorized child
+    /// continuation. The callback must capture its non-serializable journal permit
+    /// and held source, verify body installation/readbacks and all required own-part
+    /// handling, then return its factual verification receipt digest. Neither this
+    /// context nor an arbitrary returned digest grants that authority.
+    ///
+    /// No deadline argument exists: demand's original absolute caller/channel
+    /// deadline and cancellation Arc govern body, sends and terminal reception.
+    /// Incoming requests/early terminals are monitored while the callback runs.
+    /// Any failure consumes both halves; there is no ordinary Session fallback.
+    pub async fn continue_body_and_complete<F, Fut>(
+        self,
+        permanent_path: &str,
+        body: F,
+    ) -> std::result::Result<PendingCompletionReceipt, PendingCompletionFailure>
+    where
+        F: FnOnce(PendingBodyContext) -> Fut,
+        Fut: Future<Output = Result<[u8; 32]>>,
+    {
+        let evidence = Arc::new(Mutex::new(PendingCompletionEvidence {
+            own_asset_id: self.own_asset_id.clone(),
+            own_parts: self.manifest.own_parts(),
+            permanent_path: permanent_path.to_owned(),
+            media_anchor: self._session.prepared.media_anchor.parse().unwrap_or(0),
+            ready_sha256: self.ready_receipt_sha256,
+            manifest_frame_index: self.observation.frame_index,
+            manifest_sha256: self.observation.frame_sha256,
+            required_foreign_asset_ids: self.manifest.foreign_asset_ids().to_vec(),
+            body_verification_sha256: None,
+            writes: Vec::new(),
+            settled_foreign_asset_ids: Vec::new(),
+            received: Vec::new(),
+            partial_receive: None,
+            terminal: None,
+        }));
+        let result = async {
+            ensure!(self._session.phase == Phase::PendingDemandObserved
+                && self._session.prepared.metadata_mode == MetadataMode::EmptyDelta,
+                "pending completion requires its actual empty-delta manifest phase");
+            validate_music_path(permanent_path)?;
+            let media_anchor = self._session.prepared.media_anchor.parse::<u32>()?;
+            self.original_control.check()?;
+            let control = self.original_control;
+            ensure!(control.deadline <= self._session.channel.deadline,
+                "pending completion cannot extend its original channel deadline");
+            let context = PendingBodyContext {
+                own_asset_id: self.own_asset_id.clone(), own_parts: self.manifest.own_parts(),
+                permanent_path: permanent_path.to_owned(), media_anchor,
+                ready_sha256: self.ready_receipt_sha256,
+                manifest_sha256: self.observation.frame_sha256, control: control.clone(),
+            };
+            let own_asset_id = self.own_asset_id;
+            let foreign = self.manifest.foreign_asset_ids().to_vec();
+            let channel = self._session.channel;
+            let (read, write, output) = channel.client.into_pending_parts(&control)?;
+            let frames = Arc::new(AtomicUsize::new(channel.frames));
+            let indices = Arc::new(AtomicUsize::new(channel.frames));
+            let settled = Arc::new(AtomicBool::new(false));
+            let checkpoint = Arc::new(ReceiveCheckpoint::new());
+            let mut reader = PendingReader {
+                half: read, trace: channel.trace.clone(), frames: Arc::clone(&frames),
+                indices: Arc::clone(&indices), reservation_held: false,
+                settled: Arc::clone(&settled), evidence: Arc::clone(&evidence),
+                checkpoint: Arc::clone(&checkpoint),
+                bytes: Vec::new(), frame_index: None, started_settled: false,
+                raw_attempted: false, output: output.clone(), raw_reservation: None,
+            };
+            let mut writer = PendingWriter {
+                half: write, trace: channel.trace, frames, indices,
+                evidence: Arc::clone(&evidence), current: None,
+                checkpoint: Arc::clone(&checkpoint), output,
+            };
+            let wire_result = async {
+                let work = async {
+                    control.run(remaining(&control), "pending initial receive boundary",
+                        async { checkpoint.observe_before_next_action().await; Ok(()) }).await?;
+                    let digest = control.run(remaining(&control), "pending body deadline",
+                        body(context)).await?;
+                    update(&evidence, |value| value.body_verification_sha256 = Some(digest));
+                    control.run(remaining(&control), "pending callback receive boundary",
+                        async { checkpoint.observe_before_next_action().await; Ok(()) }).await?;
+                    writer.send(&file_complete(&own_asset_id, permanent_path), &control).await?;
+                    for asset_id in &foreign {
+                        writer.send(&file_error(asset_id), &control).await?;
+                        update(&evidence, |value| value.settled_foreign_asset_ids.push(asset_id.clone()));
+                    }
+                    control.check()?;
+                    ensure!(snapshot(&evidence).settled_foreign_asset_ids == foreign,
+                        "pending foreign set is incomplete or reordered");
+                    settled.store(true, Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                };
+                tokio::pin!(work);
+                let mut work_done = false;
+                let mut telemetry = 0usize;
+                loop {
+                    tokio::select! {
+                        // Every callback/write/chunk/flush boundary forces work
+                        // Pending, so this priority applies even to ready chains.
+                        biased;
+                        received = reader.receive(&control) => {
+                            let (message, observed) = received?;
+                            let root = dictionary(&message)?;
+                            ensure!(number(root, "Session")? == 2,
+                                "wrong-session pending completion message");
+                            match string(root, "Command")? {
+                                "Progress" | "SyncAllowed" | "InstalledAssets" | "AssetMetrics" => {
+                                    check_telemetry(root)?;
+                                    telemetry += 1;
+                                    ensure!(telemetry <= 64, "pending completion telemetry bound");
+                                    // Release outgoing work only after the owner
+                                    // has classified the complete incoming frame.
+                                    checkpoint.allowed_telemetry();
+                                }
+                                "SyncFinished" => {
+                                    ensure!(work_done && settled.load(Ordering::SeqCst)
+                                        && observed.started_after_full_settlement,
+                                        "early pending SyncFinished before body and full settlement");
+                                    if root.contains_key("Params") { child(root, "Params")?; }
+                                    let recorded = snapshot(&evidence);
+                                    ensure!(recorded.body_verification_sha256.is_some()
+                                        && recorded.settled_foreign_asset_ids == foreign
+                                        && recorded.writes.len() == 1 + foreign.len()
+                                        && recorded.writes.iter().all(|frame|
+                                            frame.accepted_bytes == frame.frame_bytes && frame.flushed),
+                                        "pending terminal cannot qualify an unsettled outgoing set");
+                                    control.check()?;
+                                    update(&evidence, |value| value.terminal = Some(observed));
+                                    break Ok(());
+                                }
+                                _ => bail!("unexpected pending terminal/request; no further sends"),
+                            }
+                        }
+                        completed = &mut work, if !work_done => {
+                            completed?;
+                            work_done = true;
+                        }
+                    }
+                }
+            }.await; // Work is dropped before inspecting its writer's accepted prefix.
+            let read_retention = reader.retain_partial();
+            let write_retention = writer.retain_current();
+            // Both split halves drop at this scope's end, before any receipt/error
+            // escapes. Full/partial evidence is never a retry or reuse capability.
+            match (wire_result, read_retention, write_retention) {
+                (Ok(()), Ok(()), Ok(())) => Ok(()),
+                (wire, read, write) => {
+                    let mut errors = Vec::new();
+                    if let Err(error) = wire { errors.push(format!("{error:#}")); }
+                    if let Err(error) = read { errors.push(format!("read retention: {error:#}")); }
+                    if let Err(error) = write { errors.push(format!("write retention: {error:#}")); }
+                    bail!("{}", errors.join("; "))
+                }
+            }
+        }.await;
+        let evidence = snapshot(&evidence);
+        match result {
+            Ok(()) => Ok(PendingCompletionReceipt { evidence }),
+            Err(error) => Err(PendingCompletionFailure { error, evidence }),
+        }
+    }
+}
+
 fn file_complete(asset_id: &str, permanent_path: &str) -> Value {
     let params = Dictionary::from_iter::<[(String, Value); 3]>([
         ("AssetID".into(), asset_id.into()),
@@ -252,6 +416,135 @@ struct PendingWriter {
     output: Option<OutputAllowance>,
 }
 impl PendingWriter {
+    async fn send(
+        &mut self,
+        message: &Value,
+        control: &super::super::transfer::CaptureControl,
+    ) -> Result<()> {
+        control.check()?;
+        ensure!(
+            self.current.is_none(),
+            "pending write cannot be reused after failure"
+        );
+        let bounded_index = if self.output.is_some() {
+            reserve_frame(&self.frames)?;
+            Some(self.indices.fetch_add(1, Ordering::SeqCst))
+        } else {
+            None
+        };
+        let frame = if let Some(output) = &self.output {
+            super::super::framing::retain_outgoing_raw(
+                message,
+                &self.trace,
+                bounded_index.unwrap(),
+                output,
+                control,
+            )?
+        } else {
+            let mut payload = Vec::new();
+            message.to_writer_binary(&mut payload)?;
+            ensure!(
+                !payload.is_empty() && payload.len() <= MAX_BYTES,
+                "pending outgoing frame bound"
+            );
+            let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+            frame.extend_from_slice(&payload);
+            frame
+        };
+        let frame_index = if let Some(index) = bounded_index {
+            index
+        } else {
+            reserve_frame(&self.frames)?;
+            self.indices.fetch_add(1, Ordering::SeqCst)
+        };
+        let root = dictionary(message)?;
+        let observation = PendingWriteObservation {
+            frame_index,
+            command: string(root, "Command")?.to_owned(),
+            asset_id: string(child(root, "Params")?, "AssetID")?.to_owned(),
+            frame_bytes: frame.len(),
+            intended_sha256: Sha256::digest(&frame).into(),
+            intended_trace_complete: false,
+            accepted_bytes: 0,
+            accepted_sha256: None,
+            flushed: false,
+        };
+        let observation_index = snapshot(&self.evidence).writes.len();
+        update(&self.evidence, |value| value.writes.push(observation));
+        self.current = Some(CurrentWrite {
+            frame_index,
+            frame,
+            accepted: Vec::new(),
+            retention_attempted: false,
+            accepted_reservation: None,
+        });
+        let result = control
+            .run(remaining(control), "pending send deadline", async {
+                let current = self.current.as_mut().unwrap();
+                if let Some(output) = &self.output {
+                    // Protect every possible accepted byte before the first write.
+                    // The reader cannot spend this capacity while a send is pending.
+                    current.accepted_reservation = Some(
+                        output
+                            .reserve_file(current.frame.len() as u64, current.frame.len() as u64)?,
+                    );
+                    let mut xml = output.create_controlled(
+                        &self.trace.join(format!("{frame_index:03}-outgoing.plist")),
+                        control,
+                    )?;
+                    message.to_writer_xml(&mut xml)?;
+                    xml.finish()?;
+                } else {
+                    private_write(
+                        &self.trace.join(format!("{frame_index:03}-outgoing.atc")),
+                        &current.frame,
+                    )?;
+                    let mut xml = Vec::new();
+                    message.to_writer_xml(&mut xml)?;
+                    private_write(
+                        &self.trace.join(format!("{frame_index:03}-outgoing.plist")),
+                        &xml,
+                    )?;
+                }
+                update(&self.evidence, |value| {
+                    value.writes[observation_index].intended_trace_complete = true
+                });
+                self.checkpoint.observe_before_next_action().await;
+                while current.accepted.len() < current.frame.len() {
+                    let before = current.accepted.len();
+                    let count = self.half.write(&current.frame[before..]).await?;
+                    ensure!(count > 0, "pending ATC write accepted zero bytes");
+                    current
+                        .accepted
+                        .extend_from_slice(&current.frame[before..before + count]);
+                    update(&self.evidence, |value| {
+                        let observed = &mut value.writes[observation_index];
+                        observed.accepted_bytes = current.accepted.len();
+                        observed.accepted_sha256 = Some(Sha256::digest(&current.accepted).into());
+                    });
+                    // A ready write hook can make an early incoming command readable.
+                    // Always re-enter receive priority before more bytes or flush.
+                    self.checkpoint.observe_before_next_action().await;
+                }
+                self.half.flush().await?;
+                update(&self.evidence, |value| {
+                    value.writes[observation_index].flushed = true
+                });
+                self.checkpoint.observe_before_next_action().await;
+                Ok(())
+            })
+            .await;
+        let retained = self.retain_current();
+        match (result, retained) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+            (Err(error), Err(retention)) => {
+                bail!("{error:#}; accepted-byte retention: {retention:#}")
+            }
+        }
+        self.current = None;
+        Ok(())
+    }
     fn retain_current(&mut self) -> Result<()> {
         if let Some(current) = self.current.as_mut() {
             if !current.retention_attempted && !current.accepted.is_empty() {
@@ -304,6 +597,97 @@ struct PendingReader {
     raw_reservation: Option<OutputReservation>,
 }
 impl PendingReader {
+    async fn receive(
+        &mut self,
+        control: &super::super::transfer::CaptureControl,
+    ) -> Result<(Value, PendingReceivedObservation)> {
+        // A work-completion branch may drop this borrowed receive future. Every
+        // successful read has synchronously updated owned bytes; no read_exact
+        // future owns an unrecorded prefix. Resume only inside this consumed path.
+        control
+            .run(remaining(control), "pending terminal deadline", async {
+                if !self.reservation_held {
+                    // Reserve a bounded slot before starting a read; assign its
+                    // chronological trace index only after actual bytes are consumed.
+                    reserve_frame(&self.frames)?;
+                    if let Some(output) = &self.output {
+                        // Only the header is held while waiting. Reserving an entire
+                        // frame here could starve the concurrent completion writer.
+                        self.raw_reservation = Some(output.reserve_file(4, 4)?);
+                    }
+                    self.reservation_held = true;
+                }
+                self.read_until(4).await?;
+                let length = u32::from_le_bytes(self.bytes[..4].try_into()?) as usize;
+                ensure!(
+                    length > 0 && length <= MAX_BYTES,
+                    "pending incoming frame bound"
+                );
+                if self.output.is_some() {
+                    self.raw_reservation
+                        .as_mut()
+                        .context("missing pending header reservation")?
+                        .grow_to((4 + length) as u64)?;
+                }
+                self.read_until(4 + length).await?;
+                let frame_index = self.frame_index.unwrap();
+                self.raw_attempted = true;
+                let raw_path = self.trace.join(format!("{frame_index:03}-received.atc"));
+                if self.output.is_some() {
+                    self.raw_reservation
+                        .take()
+                        .context("missing pending raw reservation")?
+                        .write(&raw_path, &self.bytes)?;
+                } else {
+                    private_write(&raw_path, &self.bytes)?;
+                }
+                let observed = PendingReceivedObservation {
+                    frame_index,
+                    frame_sha256: Sha256::digest(&self.bytes).into(),
+                    started_after_full_settlement: self.started_settled,
+                };
+                update(&self.evidence, |value| {
+                    value.received.push(observed.clone());
+                    value.partial_receive = None;
+                });
+                let message: Value = plist::from_bytes(&self.bytes[4..])
+                    .context("invalid pending incoming plist")?;
+                let xml_path = self.trace.join(format!("{frame_index:03}-received.plist"));
+                if let Some(output) = &self.output {
+                    let mut xml = output.create_controlled(&xml_path, control)?;
+                    message.to_writer_xml(&mut xml)?;
+                    xml.finish()?;
+                } else {
+                    let mut xml = Vec::new();
+                    message.to_writer_xml(&mut xml)?;
+                    private_write(&xml_path, &xml)?;
+                }
+                self.bytes.clear();
+                self.frame_index = None;
+                self.reservation_held = false;
+                self.raw_attempted = false;
+                let root = dictionary(&message)?;
+                let command = string(root, "Command")?;
+                let without_params = command == "Pong"
+                    || (command == "SyncFinished" && !root.contains_key("Params"));
+                exact_keys(
+                    root,
+                    if without_params {
+                        &["Command", "Session", "Type", "Id"]
+                    } else {
+                        &["Command", "Session", "Type", "Id", "Params"]
+                    },
+                )?;
+                ensure!(
+                    number(root, "Type")? == 0,
+                    "unsupported pending incoming message type"
+                );
+                number(root, "Id")?;
+                number(root, "Session")?;
+                Ok((message, observed))
+            })
+            .await
+    }
     async fn read_until(&mut self, needed: usize) -> Result<()> {
         let mut scratch = [0u8; 8192];
         while self.bytes.len() < needed {
