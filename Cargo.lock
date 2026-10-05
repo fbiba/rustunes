@@ -1035,6 +1035,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustunes"
+version = "0.1.0"
+dependencies = [
+ "music-protocol",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

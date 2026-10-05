@@ -1,0 +1,12 @@
+[package]
+name = "rustunes"
+version = "0.1.0"
+edition = "2024"
+description = "Sync local music (ALAC, AAC, MP3, FLAC, WAV, AIFF) into the stock iPhone Music library from Linux, over USB or Wi-Fi"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+music-protocol = { path = "../music-protocol" }
