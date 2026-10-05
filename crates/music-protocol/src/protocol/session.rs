@@ -2319,4 +2319,8 @@ mod tests {
         }
         assert!(MetadataOnlyPolicy::new("own", [("-888".into(), 2), ("999".into(), 4)]).is_err());
     }
+
+    mod bounded;
+    mod pending_audio;
+    mod stage;
 }
