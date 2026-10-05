@@ -11,5 +11,6 @@ pub mod framing;
 pub mod mpeg;
 pub mod operations;
 pub mod signing;
+pub mod templates;
 pub mod trace;
 pub mod transfer;
