@@ -2325,5 +2325,6 @@ mod tests {
     mod empty_delta;
     mod empty_delta_observe;
     mod pending_audio;
+    mod pending_completion;
     mod stage;
 }
