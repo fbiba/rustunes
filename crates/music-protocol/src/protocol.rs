@@ -6,6 +6,7 @@
 
 pub mod afc;
 pub mod alac;
+pub mod ancillary;
 pub mod batch;
 pub mod framing;
 pub mod mpeg;
