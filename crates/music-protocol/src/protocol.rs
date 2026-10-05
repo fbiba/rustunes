@@ -11,6 +11,7 @@ pub mod batch;
 pub mod framing;
 pub mod mpeg;
 pub mod operations;
+pub mod session;
 pub mod signing;
 pub mod templates;
 pub mod trace;
