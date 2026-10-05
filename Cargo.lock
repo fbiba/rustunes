@@ -1038,7 +1038,14 @@ dependencies = [
 name = "rustunes"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "libc",
  "music-protocol",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]
