@@ -2321,6 +2321,9 @@ mod tests {
     }
 
     mod bounded;
+    mod dynamic;
+    mod empty_delta;
+    mod empty_delta_observe;
     mod pending_audio;
     mod stage;
 }
