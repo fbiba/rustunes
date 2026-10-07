@@ -704,6 +704,8 @@ impl Drop for Spool {
     }
 }
 
+mod receipt;
+
 pub mod cache;
 
 use music_protocol::media::other_audio as other;

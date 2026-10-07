@@ -21,6 +21,7 @@
 //! unreadable database, or one whose identity or table differs from this
 //! build's, is set aside and rebuilt. Cache trouble never fails an index pass:
 //! a failed lookup is a miss, and a failed write is reported once and skipped.
+use super::receipt::{self, CodecDto, FingerprintDto};
 use super::*;
 use music_protocol::media::fingerprint;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -280,6 +281,25 @@ pub(super) enum Entry {
         codec: OtherCodec,
         frame_bytes_sha256: Option<[u8; 32]>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntryDto {
+    schema: String,
+    file_bytes: u64,
+    #[serde(default)]
+    fingerprint: Option<FingerprintDto>,
+    #[serde(default)]
+    other: Option<OtherDto>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OtherDto {
+    full_file_sha256: String,
+    codec: CodecDto,
+    #[serde(default)]
+    frame_bytes_sha256: Option<String>,
 }
 
 fn hex(bytes: &[u8]) -> String {
