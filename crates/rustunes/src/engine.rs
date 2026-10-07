@@ -17,6 +17,7 @@ mod observation;
 pub use observation::Observation;
 pub(crate) mod planning;
 pub(crate) mod state;
+pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use events::Event;
 
 type Observer = Arc<dyn for<'a> Fn(Event<'a>) -> Result<()> + Send + Sync>;
