@@ -1042,6 +1042,7 @@ dependencies = [
  "idevice",
  "libc",
  "music-protocol",
+ "plist",
  "rusqlite",
  "serde",
  "serde_json",
