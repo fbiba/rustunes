@@ -1039,6 +1039,7 @@ name = "rustunes"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "idevice",
  "libc",
  "music-protocol",
  "rusqlite",
