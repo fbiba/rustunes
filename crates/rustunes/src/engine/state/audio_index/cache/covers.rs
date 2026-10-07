@@ -32,6 +32,19 @@ pub(crate) struct PhoneStat {
     pub birthtime: i64,
     pub mtime: i64,
 }
+impl PhoneStat {
+    pub(crate) fn new(attrs: &Attributes) -> Option<Self> {
+        let number = |key: &str| -> Option<i64> { attrs.get(key)?.parse().ok() };
+        if attrs.get("st_ifmt").map(String::as_str) != Some("S_IFREG") {
+            return None;
+        }
+        Some(Self {
+            file_bytes: u64::try_from(number("st_size")?).ok()?,
+            birthtime: number("st_birthtime")?,
+            mtime: number("st_mtime")?,
+        })
+    }
+}
 
 /// What one verified readback measured on a cover's two files.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +59,92 @@ pub(crate) struct CoverProof {
     pub height: u16,
     /// The decoded raster's size and SHA-256; None for an empty rendition.
     pub rgb24: Option<(u64, [u8; 32])>,
+}
+
+/// The proof last verified for this original at exactly this stat, if any.
+/// Only inside a reusing scope; any trouble is a miss.
+pub(crate) fn verified_cover(
+    device: &[u8; 32],
+    original_path: &str,
+    original: &PhoneStat,
+) -> Option<CoverProof> {
+    let cache = current().filter(Config::reuses)?;
+    let device = &cache.phone(device)?;
+    let found = cache.with_in(&cache.shared.covers, open, false, |c| {
+        let row = c
+            .query_row(
+                "SELECT original_sha256, derivative_path, derivative_bytes, derivative_birthtime, derivative_mtime, derivative_sha256, width, height, rgb24_bytes, rgb24_sha256 FROM proofs
+                 WHERE device=?1 AND original_path=?2 AND original_bytes=?3 AND original_birthtime=?4 AND original_mtime=?5",
+                params![
+                    &device[..],
+                    original_path,
+                    i64::try_from(original.file_bytes)?,
+                    original.birthtime,
+                    original.mtime
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Vec<u8>>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                        r.get::<_, Option<i64>>(8)?,
+                        r.get::<_, Option<Vec<u8>>>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((sha, path, bytes, birthtime, mtime, derivative_sha, width, height, rgb_bytes, rgb_sha)) =
+            row
+        else {
+            return Ok(None);
+        };
+        let digest = |v: Vec<u8>| -> Result<[u8; 32]> {
+            v.try_into()
+                .map_err(|_| anyhow::anyhow!("cover proof digest is not 32 bytes"))
+        };
+        let rgb24 = match (rgb_bytes, rgb_sha) {
+            (Some(bytes), Some(sha)) => Some((u64::try_from(bytes)?, digest(sha)?)),
+            (None, None) => None,
+            _ => bail!("cover proof raster is incomplete"),
+        };
+        Ok(Some(CoverProof {
+            original_path: original_path.to_owned(),
+            original: *original,
+            original_sha256: digest(sha)?,
+            derivative_path: path,
+            derivative: PhoneStat {
+                file_bytes: u64::try_from(bytes)?,
+                birthtime,
+                mtime,
+            },
+            derivative_sha256: digest(derivative_sha)?,
+            width: u16::try_from(width)?,
+            height: u16::try_from(height)?,
+            rgb24,
+        }))
+    });
+    let proof = match found {
+        Ok(proof) => proof.flatten()?,
+        Err(error) => {
+            cache.warn(&error);
+            return None;
+        }
+    };
+    // Use is bookkeeping for pruning; failing to record it keeps the hit.
+    let _ = cache.with_in(&cache.shared.covers, open, false, |c| {
+        c.execute(
+            "UPDATE proofs SET last_seen=?3, hits=hits+1 WHERE device=?1 AND original_path=?2",
+            params![&device[..], original_path, unix_now()],
+        )?;
+        Ok(())
+    });
+    cache.shared.covers_reused.fetch_add(1, Ordering::Relaxed);
+    Some(proof)
 }
 
 /// Whether any proof is kept for this original, whatever its stat: without
@@ -116,6 +215,25 @@ pub(crate) fn cover_verified(device: &[u8; 32], proof: &CoverProof) {
     }
 }
 
+/// Remove proofs no lookup or write has touched since `cutoff`.
+pub(super) fn prune(directory: &Path, cutoff: i64, dry_run: bool) -> Result<u64> {
+    if !directory.join(DATABASE).exists() {
+        return Ok(0);
+    }
+    let c = open(directory)?;
+    Ok(if dry_run {
+        c.query_row(
+            "SELECT count(*) FROM proofs WHERE last_seen<?1",
+            [cutoff],
+            |r| r.get::<_, i64>(0),
+        )? as u64
+    } else {
+        let removed = c.execute("DELETE FROM proofs WHERE last_seen<?1", [cutoff])? as u64;
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        removed
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +248,105 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
         .collect()
+    }
+
+    fn proof(rgb24: Option<(u64, [u8; 32])>) -> CoverProof {
+        CoverProof {
+            original_path: "iTunes_Control/iTunes/Artwork/Originals/ab/cd".into(),
+            original: PhoneStat::new(&attrs(1000, 10, 20)).unwrap(),
+            original_sha256: [1; 32],
+            derivative_path: "iTunes_Control/iTunes/Artwork/Caches/556x556/ab/cd".into(),
+            derivative: PhoneStat::new(&attrs(rgb24.map_or(0, |_| 500), 11, 21)).unwrap(),
+            derivative_sha256: [2; 32],
+            width: 556,
+            height: 556,
+            rgb24,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cover_proof_is_reused_only_at_the_stat_it_was_verified_at() {
+        let dir = std::env::temp_dir().join(format!("cover-proofs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let device = [7; 32];
+        let decoded = proof(Some((556 * 556 * 3, [3; 32])));
+        let empty = CoverProof {
+            original_path: "iTunes_Control/iTunes/Artwork/Originals/ef/01".into(),
+            ..proof(None)
+        };
+        let reuse = Config::new(dir.clone(), Mode::Reuse);
+        reuse.select(device, phone_key("phone"));
+        scope(Some(reuse.clone()), async {
+            assert!(verified_cover(&device, &decoded.original_path, &decoded.original).is_none());
+            assert!(!cover_proof_known(&device, &decoded.original_path));
+            cover_verified(&device, &decoded);
+            cover_verified(&device, &empty);
+            assert!(cover_proof_known(&device, &decoded.original_path));
+            assert!(!cover_proof_known(&[8; 32], &decoded.original_path));
+            let found = verified_cover(&device, &decoded.original_path, &decoded.original);
+            assert_eq!(found.as_ref(), Some(&decoded));
+            assert_eq!(
+                verified_cover(&device, &empty.original_path, &empty.original).as_ref(),
+                Some(&empty)
+            );
+            // Another stat, path or device is a miss.
+            let moved = PhoneStat {
+                mtime: 99,
+                ..decoded.original
+            };
+            assert!(verified_cover(&device, &decoded.original_path, &moved).is_none());
+            assert!(verified_cover(&device, "other", &decoded.original).is_none());
+            assert!(verified_cover(&[8; 32], &decoded.original_path, &decoded.original).is_none());
+        })
+        .await;
+        assert_eq!(reuse.shared.covers_reused.load(Ordering::Relaxed), 2);
+        assert_eq!(reuse.shared.covers_stored.load(Ordering::Relaxed), 2);
+
+        // Full readback never reuses, and still stores.
+        let refresh = Config::new(dir.clone(), Mode::Refresh);
+        refresh.select(device, phone_key("phone"));
+        scope(Some(refresh.clone()), async {
+            assert!(verified_cover(&device, &decoded.original_path, &decoded.original).is_none());
+            assert!(!cover_proof_known(&device, &decoded.original_path));
+            cover_verified(&device, &decoded);
+        })
+        .await;
+        assert_eq!(refresh.shared.covers_stored.load(Ordering::Relaxed), 1);
+
+        // A release that names the phone by another digest still finds its
+        // proofs; the digest it no longer uses finds none.
+        let renamed = Config::new(dir.clone(), Mode::Reuse);
+        renamed.select([9; 32], phone_key("phone"));
+        scope(Some(renamed), async {
+            assert!(verified_cover(&[9; 32], &decoded.original_path, &decoded.original).is_some());
+            assert!(verified_cover(&device, &decoded.original_path, &decoded.original).is_none());
+        })
+        .await;
+
+        // Outside a scope nothing is read or written.
+        assert!(verified_cover(&device, &decoded.original_path, &decoded.original).is_none());
+
+        assert_eq!(prune(&dir, unix_now() + 1, true).unwrap(), 2);
+        assert_eq!(prune(&dir, unix_now() + 1, false).unwrap(), 2);
+        assert!(!reuse.shared.warned.load(Ordering::Relaxed));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_rendition_has_a_stat_but_a_directory_does_not() {
+        assert_eq!(
+            PhoneStat::new(&attrs(0, 1, 2)),
+            Some(PhoneStat {
+                file_bytes: 0,
+                birthtime: 1,
+                mtime: 2
+            })
+        );
+        let mut directory = attrs(0, 1, 2);
+        directory.insert("st_ifmt".into(), "S_IFDIR".into());
+        assert!(PhoneStat::new(&directory).is_none());
+        let mut timeless = attrs(5, 1, 2);
+        timeless.remove("st_birthtime");
+        assert!(PhoneStat::new(&timeless).is_none());
     }
 }

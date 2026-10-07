@@ -6,6 +6,36 @@ use serde_json::json;
 use std::{fs::Metadata, io::Read};
 
 const MAX_RECEIPT: u64 = 128 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Receipt {
+    schema: String,
+    complete: bool,
+    identity: IdentityDto,
+    catalog: CatalogDto,
+    track_count: usize,
+    total_bytes: u64,
+    encoded_audio_kind: String,
+    records: Vec<TrackDto>,
+    other_records: Vec<OtherDto>,
+    alac_track_count: usize,
+    other_track_count: usize,
+    /// Rows without audio the capture was told to expect; written only when
+    /// there are any.
+    #[serde(default)]
+    unfilled_records: Vec<String>,
+    /// Catalogued rows whose file was missing, when the capture allowed it;
+    /// written only when there are any.
+    #[serde(default)]
+    gone_records: Vec<String>,
+    progress_sha256: String,
+    completed_unix_time_ns: String,
+    fresh_prefs_before_after_components_equal: bool,
+    atomic_snapshot_claim: bool,
+    // Descriptive metadata is deliberately not an identity or matching input.
+    catalog_metadata: serde::de::IgnoredAny,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityDto {
@@ -20,6 +50,15 @@ struct CatalogDto {
     wal_sha256: Option<String>,
     wal_bytes: Option<u64>,
     persisted_media_anchor: u32,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrackDto {
+    sync_id: String,
+    afc_path: String,
+    #[serde(deserialize_with = "attributes")]
+    attributes: Attributes,
+    fingerprint: FingerprintDto,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,6 +234,111 @@ pub(super) fn read_pinned(path: &Path, expected: [u8; 32]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+pub(super) fn load(
+    path: &Path,
+    expected: [u8; 32],
+    catalog: &Catalog,
+    identity: &IndexIdentity,
+    absent: Absent<'_>,
+) -> Result<DeviceAudioIndex> {
+    let bytes = read_pinned(path, expected)?;
+    let (targets, unfilled) = targets_allowing(catalog, &absent.rows(catalog))?;
+    let index = parse_allowing(
+        &bytes,
+        &CatalogBinding::from_catalog(catalog),
+        identity,
+        &targets,
+        &unfilled,
+        absent.gone,
+    )?;
+    index.ensure_matches(catalog, identity)?;
+    Ok(index)
+}
+
+#[cfg(test)]
+pub(super) fn parse(
+    bytes: &[u8],
+    expected: &CatalogBinding,
+    identity: &IndexIdentity,
+    targets: &[Target],
+) -> Result<DeviceAudioIndex> {
+    parse_allowing(bytes, expected, identity, targets, &BTreeSet::new(), false)
+}
+
+/// The receipt must list exactly `unfilled` as its rows without audio; rows
+/// it lists as gone must be targets, and only when `gone` allows them.
+fn parse_allowing(
+    bytes: &[u8],
+    expected: &CatalogBinding,
+    identity: &IndexIdentity,
+    targets: &[Target],
+    unfilled: &BTreeSet<u64>,
+    gone: bool,
+) -> Result<DeviceAudioIndex> {
+    ensure!(
+        bytes.len() as u64 <= MAX_RECEIPT,
+        "receipt exceeds input bound"
+    );
+    let receipt: Receipt =
+        serde_json::from_slice(bytes).context("invalid complete-index receipt")?;
+    ensure!(
+        receipt.schema == "rustunes.device-audio-index"
+            && receipt.alac_track_count == receipt.records.len()
+            && receipt.other_track_count == receipt.other_records.len()
+            && receipt.complete
+            && receipt.fresh_prefs_before_after_components_equal
+            && !receipt.atomic_snapshot_claim
+            && receipt.encoded_audio_kind == "encoded-alac-not-pcm",
+        "unsupported or incomplete audio-index receipt"
+    );
+    let _metadata = receipt.catalog_metadata;
+    hash(&receipt.progress_sha256)?;
+    ensure!(
+        !receipt.completed_unix_time_ns.is_empty()
+            && receipt.completed_unix_time_ns.len() <= 39
+            && receipt
+                .completed_unix_time_ns
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            && receipt.completed_unix_time_ns.parse::<u128>()?.to_string()
+                == receipt.completed_unix_time_ns,
+        "invalid receipt completion time"
+    );
+    let listed = record_ids(&receipt.unfilled_records)?;
+    ensure!(
+        listed.iter().copied().collect::<BTreeSet<_>>() == *unfilled,
+        "receipt rows without audio differ from the catalog's"
+    );
+    let missing: BTreeSet<u64> = record_ids(&receipt.gone_records)?.into_iter().collect();
+    ensure!(
+        missing.is_empty()
+            || (gone
+                && missing
+                    .iter()
+                    .all(|id| targets.iter().any(|t| t.sync_id == *id))),
+        "receipt rows whose file is gone are not allowed here or not in the catalog"
+    );
+    let present: Vec<Target> = targets
+        .iter()
+        .filter(|t| !missing.contains(&t.sync_id))
+        .cloned()
+        .collect();
+    let mut index = validate_rows(
+        receipt.identity,
+        receipt.catalog,
+        receipt.track_count,
+        receipt.total_bytes,
+        receipt.records,
+        receipt.other_records,
+        expected,
+        identity,
+        &present,
+    )?;
+    index.unfilled = unfilled.clone();
+    index.gone = missing;
+    Ok(index)
+}
+
 /// Ascending upper-case track identities, as a receipt lists them.
 fn record_ids(records: &[String]) -> Result<Vec<u64>> {
     let ids = records
@@ -217,6 +361,153 @@ fn record_ids(records: &[String]) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
+fn validate_rows(
+    observed_identity_dto: IdentityDto,
+    catalog_dto: CatalogDto,
+    track_count: usize,
+    total_bytes: u64,
+    records: Vec<TrackDto>,
+    other_records: Vec<OtherDto>,
+    expected: &CatalogBinding,
+    identity: &IndexIdentity,
+    targets: &[Target],
+) -> Result<DeviceAudioIndex> {
+    let observed_identity = IndexIdentity {
+        device_identifier_sha256: hash(&observed_identity_dto.device_identifier_sha256)?,
+        library_identity_sha256: hash(&observed_identity_dto.library_identity_sha256)?,
+    };
+    ensure!(
+        &observed_identity == identity
+            && identity.device_identifier_sha256 != [0; 32]
+            && identity.library_identity_sha256 != [0; 32],
+        "receipt device/library binding differs"
+    );
+    let binding = CatalogBinding {
+        database_sha256: hash(&catalog_dto.database_sha256)?,
+        database_bytes: catalog_dto.database_bytes,
+        wal_sha256: catalog_dto.wal_sha256.as_deref().map(hash).transpose()?,
+        wal_bytes: catalog_dto.wal_bytes,
+        persisted_media_anchor: catalog_dto.persisted_media_anchor,
+    };
+    ensure!(
+        &binding == expected && binding.wal_sha256.is_some() == binding.wal_bytes.is_some(),
+        "receipt catalog binding differs"
+    );
+    ensure!(
+        track_count == targets.len()
+            && records.len() + other_records.len() == targets.len()
+            && targets.len() <= MAX_TRACKS,
+        "receipt coverage count differs"
+    );
+    let expected_tracks: BTreeMap<_, _> = targets
+        .iter()
+        .map(|target| (target.sync_id, target))
+        .collect();
+    let mut rows = BTreeMap::new();
+    let mut other_rows = BTreeMap::new();
+    let mut paths = BTreeMap::new();
+    let mut total = 0u64;
+    for row in records {
+        let id = sync_id(&row.sync_id)?;
+        let target = expected_tracks
+            .get(&id)
+            .context("unexpected receipt track identity")?;
+        ensure!(
+            safe_path(&row.afc_path)
+                && row.afc_path == target.path
+                && !row.attributes.contains_key("st_atime"),
+            "receipt track path/attributes differ"
+        );
+        let fingerprint = fingerprint(row.fingerprint)?;
+        ensure!(
+            fingerprint.file_bytes == target.bytes
+                && regular_size(&row.attributes)? == target.bytes,
+            "receipt track size differs"
+        );
+        total = total
+            .checked_add(fingerprint.file_bytes)
+            .context("receipt total overflow")?;
+        ensure!(
+            total <= MAX_TOTAL_BYTES
+                && paths
+                    .insert(row.afc_path.to_ascii_lowercase(), ())
+                    .is_none(),
+            "receipt total/path ambiguity"
+        );
+        ensure!(
+            rows.insert(
+                id,
+                TrackAudio {
+                    sync_id: id,
+                    afc_path: row.afc_path,
+                    attributes: row.attributes,
+                    fingerprint
+                }
+            )
+            .is_none(),
+            "duplicate receipt track identity"
+        );
+    }
+    for row in other_records {
+        let id = sync_id(&row.sync_id)?;
+        let target = expected_tracks
+            .get(&id)
+            .context("unexpected other-audio identity")?;
+        ensure!(
+            safe_path(&row.afc_path)
+                && row.afc_path == target.path
+                && !row.attributes.contains_key("st_atime"),
+            "other-audio receipt path/attributes differ"
+        );
+        ensure!(
+            (1..=MAX_FILE_BYTES).contains(&row.file_bytes)
+                && row.file_bytes == target.bytes
+                && regular_size(&row.attributes)? == target.bytes,
+            "other-audio receipt size differs"
+        );
+        let codec = codec(row.codec, row.file_bytes)?;
+        total = total
+            .checked_add(row.file_bytes)
+            .context("other-audio total overflow")?;
+        ensure!(
+            total <= MAX_TOTAL_BYTES
+                && !rows.contains_key(&id)
+                && paths
+                    .insert(row.afc_path.to_ascii_lowercase(), ())
+                    .is_none(),
+            "other-audio identity/path ambiguity"
+        );
+        ensure!(
+            other_rows
+                .insert(
+                    id,
+                    OtherAudio {
+                        sync_id: id,
+                        afc_path: row.afc_path,
+                        attributes: row.attributes,
+                        file_bytes: row.file_bytes,
+                        full_file_sha256: hash(&row.full_file_sha256)?,
+                        codec
+                    }
+                )
+                .is_none(),
+            "duplicate other-audio identity"
+        );
+    }
+    ensure!(
+        total == total_bytes && rows.len() + other_rows.len() == targets.len(),
+        "receipt total/coverage differs"
+    );
+    Ok(DeviceAudioIndex {
+        identity: observed_identity,
+        catalog: binding,
+        tracks: rows,
+        other_audio: other_rows,
+        unfilled: BTreeSet::new(),
+        gone: BTreeSet::new(),
+    })
+}
+
 /// The JSON a receipt, cache entry or pending record holds for a codec;
 /// [`codec`] reads it back.
 pub(crate) fn codec_json(codec: &OtherCodec) -> serde_json::Value {
@@ -237,6 +528,16 @@ pub(crate) fn codec_json(codec: &OtherCodec) -> serde_json::Value {
             "audio_bytes":e.audio_bytes,"config_sha256":music_protocol::media::mpeg::hex(&e.config_sha256),
             "audio_sha256":music_protocol::media::mpeg::hex(&e.audio_sha256)}),
     }
+}
+
+/// The JSON a receipt, cache entry or planner record holds for an ALAC source
+/// fingerprint; [`fingerprint`] reads it back from its DTO.
+pub(crate) fn fingerprint_json(fingerprint: &SourceFingerprint) -> serde_json::Value {
+    use music_protocol::media::mpeg::hex;
+    let audio = &fingerprint.audio;
+    json!({"file_bytes":fingerprint.file_bytes,"full_file_sha256":hex(&fingerprint.full_file_sha256),"audio":{
+        "sha256":hex(&audio.sha256),"alac_config_sha256":hex(&audio.alac_config_sha256),"sample_sizes_sha256":hex(&audio.sample_sizes_sha256),
+        "media_sha256":hex(&audio.media_sha256),"timescale":audio.timescale,"duration_ticks":audio.duration_ticks,"media_bytes":audio.media_bytes}})
 }
 
 pub(super) fn codec(dto: CodecDto, file_bytes: u64) -> Result<OtherCodec> {
@@ -300,5 +601,50 @@ pub(super) fn codec(dto: CodecDto, file_bytes: u64) -> Result<OtherCodec> {
                 trailing_tag_bytes,
             }
         }
+    })
+}
+
+pub(super) fn fingerprint(dto: FingerprintDto) -> Result<SourceFingerprint> {
+    read_fingerprint(dto, true)
+}
+
+/// A cached fingerprint, whose composite is computed again from its other
+/// fields: an entry stays usable when this build defines the composite
+/// differently from the build that stored it.
+pub(super) fn cached_fingerprint(dto: FingerprintDto) -> Result<SourceFingerprint> {
+    read_fingerprint(dto, false)
+}
+
+fn read_fingerprint(dto: FingerprintDto, stored_composite: bool) -> Result<SourceFingerprint> {
+    let audio = dto.audio;
+    ensure!(
+        (1..=MAX_FILE_BYTES).contains(&dto.file_bytes)
+            && audio.timescale > 0
+            && audio.duration_ticks > 0
+            && audio.media_bytes > 0
+            && audio.media_bytes <= dto.file_bytes,
+        "invalid receipt fingerprint dimensions"
+    );
+    let mut audio = EncodedAlac {
+        sha256: hash(&audio.sha256)?,
+        alac_config_sha256: hash(&audio.alac_config_sha256)?,
+        sample_sizes_sha256: hash(&audio.sample_sizes_sha256)?,
+        media_sha256: hash(&audio.media_sha256)?,
+        timescale: audio.timescale,
+        duration_ticks: audio.duration_ticks,
+        media_bytes: audio.media_bytes,
+    };
+    if stored_composite {
+        ensure!(
+            audio.composite_sha256() == audio.sha256,
+            "receipt encoded fingerprint composite differs"
+        );
+    } else {
+        audio.sha256 = audio.composite_sha256();
+    }
+    Ok(SourceFingerprint {
+        file_bytes: dto.file_bytes,
+        full_file_sha256: hash(&dto.full_file_sha256)?,
+        audio,
     })
 }

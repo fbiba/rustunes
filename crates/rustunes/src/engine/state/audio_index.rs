@@ -181,6 +181,28 @@ pub struct DeviceAudioIndex {
     gone: BTreeSet<u64>,
 }
 impl DeviceAudioIndex {
+    /// Load only an explicitly SHA-pinned complete capture. This verifies saved
+    /// evidence against supplied catalog/identity, not fresh device state.
+    #[cfg(test)]
+    pub fn load_complete(
+        path: &Path,
+        expected_sha256: [u8; 32],
+        catalog: &Catalog,
+        identity: &IndexIdentity,
+    ) -> Result<Self> {
+        receipt::load(path, expected_sha256, catalog, identity, Absent::NONE)
+    }
+    /// The same, accepting rows without audio among `allowed` (an unfinished
+    /// insertion's own targets) when the capture recorded exactly those.
+    pub fn load_complete_allowing(
+        path: &Path,
+        expected_sha256: [u8; 32],
+        catalog: &Catalog,
+        identity: &IndexIdentity,
+        absent: Absent<'_>,
+    ) -> Result<Self> {
+        receipt::load(path, expected_sha256, catalog, identity, absent)
+    }
     pub fn identity(&self) -> &IndexIdentity {
         &self.identity
     }
@@ -198,6 +220,143 @@ impl DeviceAudioIndex {
     }
     pub fn gone(&self) -> &BTreeSet<u64> {
         &self.gone
+    }
+    /// Whether `after` holds every file of this index outside `except` as the
+    /// same file (`TrackAudio::same_file`).
+    pub(crate) fn kept_in(&self, after: &Self, except: &BTreeSet<u64>) -> bool {
+        self.tracks
+            .iter()
+            .filter(|(id, _)| !except.contains(id))
+            .all(|(id, t)| after.tracks.get(id).is_some_and(|a| a.same_file(t)))
+            && self
+                .other_audio
+                .iter()
+                .filter(|(id, _)| !except.contains(id))
+                .all(|(id, o)| after.other_audio.get(id).is_some_and(|a| a.same_file(o)))
+    }
+    /// Whether both indexes hold exactly the same files.
+    pub(crate) fn same_files(&self, other: &Self) -> bool {
+        self.tracks.len() == other.tracks.len()
+            && self.other_audio.len() == other.other_audio.len()
+            && self.kept_in(other, &BTreeSet::new())
+    }
+    /// The files both indexes hold as the same file whose allocation
+    /// (`st_blocks`) differs.
+    pub(crate) fn allocation_changed(&self, after: &Self) -> Vec<u64> {
+        let tracks = self.tracks.iter().filter(|(id, t)| {
+            after
+                .tracks
+                .get(id)
+                .is_some_and(|a| a.same_file(t) && a.attributes != t.attributes)
+        });
+        let other = self.other_audio.iter().filter(|(id, o)| {
+            after
+                .other_audio
+                .get(id)
+                .is_some_and(|a| a.same_file(o) && a.attributes != o.attributes)
+        });
+        tracks
+            .map(|(id, _)| *id)
+            .chain(other.map(|(id, _)| *id))
+            .collect()
+    }
+    /// Compare an existing transferred binding with complete captured bytes.
+    /// This is read-only identity matching, never insertion authority.
+    /// The index records no MPEG frame digest: exact full-file equality binds
+    /// those bytes, while every independently recorded layout fact must also
+    /// agree. It does not infer equality across differing containers.
+    pub fn matches_transferred_source(
+        &self,
+        track_pid: u64,
+        path: &str,
+        source: &fingerprint::TransferredSource,
+    ) -> bool {
+        match (
+            self.tracks.get(&track_pid),
+            self.other_audio.get(&track_pid),
+        ) {
+            (Some(audio), None) if source.is_alac() => {
+                audio.afc_path == path && audio.fingerprint == *source
+            }
+            (None, Some(audio)) if matches!(audio.codec, OtherCodec::Encoded(_)) => {
+                audio.afc_path == path
+                    && audio.file_bytes == source.file_bytes
+                    && audio.full_file_sha256 == source.full_file_sha256
+                    && matches!(&audio.codec, OtherCodec::Encoded(e) if source.audio.encoded() == Some(e))
+            }
+            (None, Some(audio)) => source.audio.mpeg().is_some_and(|expected| {
+                let OtherCodec::Mpeg1Layer3 {
+                    sample_rate,
+                    channels,
+                    frame_count,
+                    audio_offset,
+                    audio_bytes,
+                    trailing_tag_bytes,
+                } = audio.codec
+                else {
+                    return false;
+                };
+                audio.afc_path == path
+                    && audio.file_bytes == source.file_bytes
+                    && audio.full_file_sha256 == source.full_file_sha256
+                    && sample_rate == expected.sample_rate
+                    && channels == expected.channels
+                    && frame_count == expected.frame_count
+                    && audio_offset == expected.audio_offset
+                    && audio_bytes == expected.audio_bytes
+                    && u64::from(trailing_tag_bytes) == expected.trailing_bytes
+            }),
+            _ => false,
+        }
+    }
+    pub fn ensure_matches(&self, catalog: &Catalog, identity: &IndexIdentity) -> Result<()> {
+        ensure!(
+            &self.identity == identity,
+            "audio index device/library binding differs"
+        );
+        ensure!(
+            self.catalog == CatalogBinding::from_catalog(catalog),
+            "audio index catalog binding differs: the phone's library changed since this snapshot was taken (playing music changes it, and the phone also renumbers its library on its own a few minutes after a sync); take a fresh snapshot and plan again"
+        );
+        let (targets, unfilled) = targets_allowing(catalog, &self.unfilled)?;
+        ensure!(
+            unfilled == self.unfilled,
+            "audio index rows without audio differ from the catalog"
+        );
+        let located: BTreeSet<u64> = targets.iter().map(|t| t.sync_id).collect();
+        ensure!(
+            self.gone.is_subset(&located),
+            "audio index rows whose file is gone differ from the catalog"
+        );
+        let present: Vec<Target> = targets
+            .into_iter()
+            .filter(|t| !self.gone.contains(&t.sync_id))
+            .collect();
+        self.ensure_target_coverage(&present)
+    }
+    // Every present target has exactly one indexed row with its path and
+    // size, and nothing else is indexed.
+    fn ensure_target_coverage(&self, targets: &[Target]) -> Result<()> {
+        ensure!(
+            targets.len() == self.tracks.len() + self.other_audio.len()
+                && targets.iter().all(|target| {
+                    match (
+                        self.tracks.get(&target.sync_id),
+                        self.other_audio.get(&target.sync_id),
+                    ) {
+                        (Some(row), None) => {
+                            row.afc_path == target.path
+                                && row.fingerprint.file_bytes == target.bytes
+                        }
+                        (None, Some(row)) => {
+                            row.afc_path == target.path && row.file_bytes == target.bytes
+                        }
+                        _ => false,
+                    }
+                }),
+            "audio index does not cover the exact catalog"
+        );
+        Ok(())
     }
 }
 
@@ -389,6 +548,320 @@ fn safe_path(path: &str) -> bool {
         && parts[3]
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// Consumes the connection so a timeout/cancellation cannot accidentally reuse
+/// a protocol stream with an outstanding reply. Only a fully checked pass returns
+/// DeviceAudioIndex. Prior Fingerprinted events remain explicitly incomplete.
+/// For the state an interrupted insertion left, rows without audio among
+/// `absent.unfilled` are recorded as such instead of refusing the catalog.
+pub async fn read_all_allowing(
+    afc: AfcClient,
+    catalog: &Catalog,
+    absent: Absent<'_>,
+    identity: IndexIdentity,
+    spool_parent: &Path,
+    control: &ReadControl<'_>,
+    mut progress: impl FnMut(IndexProgress) -> Result<()>,
+) -> Result<DeviceAudioIndex> {
+    let (targets, unfilled) = targets_allowing(catalog, &absent.rows(catalog))?;
+    ensure!(
+        identity.device_identifier_sha256 != [0; 32] && identity.library_identity_sha256 != [0; 32],
+        "audio index identity binding is empty"
+    );
+    let binding = CatalogBinding::from_catalog(catalog);
+    let mut index = run_checked(
+        afc,
+        targets,
+        identity,
+        binding,
+        spool_parent,
+        control,
+        &mut progress,
+        absent.gone,
+    )
+    .await?;
+    index.unfilled = unfilled;
+    Ok(index)
+}
+
+#[cfg(test)]
+async fn run(
+    afc: AfcClient,
+    targets: Vec<Target>,
+    identity: IndexIdentity,
+    binding: CatalogBinding,
+    spool_parent: &Path,
+    control: &ReadControl<'_>,
+    progress: &mut impl FnMut(IndexProgress) -> Result<()>,
+) -> Result<DeviceAudioIndex> {
+    run_checked(
+        afc,
+        targets,
+        identity,
+        binding,
+        spool_parent,
+        control,
+        progress,
+        false,
+    )
+    .await
+}
+
+/// With `gone`, a target whose file is missing is listed as gone instead of
+/// failing the pass, and must still be missing at its end.
+#[allow(clippy::too_many_arguments)]
+async fn run_checked(
+    mut afc: AfcClient,
+    targets: Vec<Target>,
+    identity: IndexIdentity,
+    binding: CatalogBinding,
+    spool_parent: &Path,
+    control: &ReadControl<'_>,
+    progress: &mut impl FnMut(IndexProgress) -> Result<()>,
+    gone: bool,
+) -> Result<DeviceAudioIndex> {
+    check_control(control)?;
+    let spool = Spool::new(spool_parent)?;
+    let before = verify_catalog(&mut afc, &binding, control)
+        .await
+        .map_err(|error| {
+            if error.downcast_ref::<CatalogGuardDrift>().is_some() {
+                anyhow::Error::from(InitialCatalogGuardDrift(error))
+            } else {
+                error
+            }
+        })?;
+    progress(IndexProgress::Started {
+        track_count: targets.len(),
+        total_bytes: targets.iter().map(|t| t.bytes).sum(),
+        identity: identity.clone(),
+        catalog: binding.clone(),
+    })?;
+    let mut tracks = BTreeMap::new();
+    let mut other_audio = BTreeMap::new();
+    let mut missing = BTreeMap::new();
+    let mut copied = false;
+    let cache = cache::current();
+    // Every file is stat first; a file copied later is still stat again after
+    // its copy, which must find the same attributes.
+    let paths: Vec<&str> = targets.iter().map(|t| t.path.as_str()).collect();
+    let mut stats = stat_all(&mut afc, &paths, control).await?.into_iter();
+    drop(paths);
+    for target in targets {
+        check_control(control)?;
+        progress(IndexProgress::FileStarted {
+            sync_id: target.sync_id,
+            afc_path: target.path.clone(),
+            file_bytes: target.bytes,
+        })?;
+        let Some(attrs) = stats.next().context("index stat missing")? else {
+            ensure!(gone, missing_file(&target));
+            missing.insert(target.sync_id, target.path);
+            continue;
+        };
+        ensure!(
+            regular_size(&attrs)? == target.bytes,
+            "audio size differs from catalog; index incomplete"
+        );
+        let key = cache::FileKey::new(&identity.device_identifier_sha256, &target.path, &attrs);
+        let reused = match (&cache, &key) {
+            (Some(cache), Some(key)) if cache.reuses() => cache.get(key),
+            _ => None,
+        };
+        if let Some(entry) = reused {
+            progress(IndexProgress::Reused {
+                sync_id: target.sync_id,
+            })?;
+            match entry {
+                cache::Entry::Alac(fingerprint) => {
+                    let row = TrackAudio {
+                        sync_id: target.sync_id,
+                        afc_path: target.path,
+                        attributes: without_access_time(attrs),
+                        fingerprint,
+                    };
+                    progress(IndexProgress::Fingerprinted(row.clone()))?;
+                    ensure!(
+                        tracks.insert(target.sync_id, row).is_none(),
+                        "duplicate indexed ALAC identity"
+                    );
+                }
+                cache::Entry::Other {
+                    full_file_sha256,
+                    codec,
+                    ..
+                } => {
+                    let row = OtherAudio {
+                        sync_id: target.sync_id,
+                        afc_path: target.path,
+                        attributes: without_access_time(attrs),
+                        file_bytes: target.bytes,
+                        full_file_sha256,
+                        codec,
+                    };
+                    progress(IndexProgress::OtherFingerprinted(row.clone()))?;
+                    ensure!(
+                        other_audio.insert(target.sync_id, row).is_none(),
+                        "duplicate indexed other-audio identity"
+                    );
+                }
+            }
+            continue;
+        }
+        copied = true;
+        let mut file = spool.open()?;
+        let (bytes, digest) = {
+            let mut output = Output {
+                sink: &mut file,
+                digest: Sha256::new(),
+                bytes: 0,
+                maximum: target.bytes,
+                notify: |bytes| {
+                    progress(IndexProgress::FileBytes {
+                        sync_id: target.sync_id,
+                        file_bytes_read: bytes,
+                    })
+                },
+            };
+            copy(
+                &mut afc,
+                &target.path,
+                target.bytes,
+                MAX_FILE_BYTES,
+                &mut output,
+                control,
+            )
+            .await?;
+            output.flush()?;
+            (output.bytes, <[u8; 32]>::from(output.digest.finalize()))
+        };
+        drop(file);
+        let after = stat(&mut afc, &target.path, control)
+            .await?
+            .context("audio disappeared after read; index incomplete")?;
+        ensure!(
+            unchanged(&attrs, &after),
+            "audio attributes changed during read; index incomplete"
+        );
+        check_control(control)?;
+        ensure!(bytes == target.bytes, "audio copy length differs");
+        // The stat before and after the copy matched, so it names these bytes.
+        let seed = cache.as_ref().zip(key);
+        match fingerprint::read(&spool.file) {
+            Ok(fingerprint) => {
+                check_control(control)?;
+                ensure!(
+                    fingerprint.file_bytes == bytes && fingerprint.full_file_sha256 == digest,
+                    "local ALAC spool differs from AFC bytes"
+                );
+                spool.clear()?;
+                if let Some((cache, key)) = &seed {
+                    cache.put(key, &cache::Entry::Alac(fingerprint.clone()));
+                }
+                let row = TrackAudio {
+                    sync_id: target.sync_id,
+                    afc_path: target.path,
+                    attributes: without_access_time(attrs),
+                    fingerprint,
+                };
+                progress(IndexProgress::Fingerprinted(row.clone()))?;
+                ensure!(
+                    tracks.insert(target.sync_id, row).is_none(),
+                    "duplicate indexed ALAC identity"
+                );
+            }
+            Err(alac_error) => {
+                let (file_bytes, full_file_sha256, codec) =
+                    other::read(&spool.file).with_context(|| {
+                        format!("unsupported audio; ALAC inspection: {alac_error:#}")
+                    })?;
+                check_control(control)?;
+                ensure!(
+                    file_bytes == bytes && full_file_sha256 == digest,
+                    "local other-audio spool differs from AFC bytes"
+                );
+                if let Some((cache, key)) = &seed {
+                    let frame_bytes_sha256 = cache::frame_bytes_sha256(&spool.file, &codec)?;
+                    cache.put(
+                        key,
+                        &cache::Entry::Other {
+                            full_file_sha256,
+                            codec: codec.clone(),
+                            frame_bytes_sha256,
+                        },
+                    );
+                }
+                spool.clear()?;
+                let row = OtherAudio {
+                    sync_id: target.sync_id,
+                    afc_path: target.path,
+                    attributes: without_access_time(attrs),
+                    file_bytes,
+                    full_file_sha256,
+                    codec,
+                };
+                progress(IndexProgress::OtherFingerprinted(row.clone()))?;
+                ensure!(
+                    other_audio.insert(target.sync_id, row).is_none(),
+                    "duplicate indexed other-audio identity"
+                );
+            }
+        }
+    }
+    // A later file transfer must not hide a change to an earlier indexed path.
+    // The phone trimming a new file's allocation meanwhile is not a change.
+    // A pass that copied nothing stated each file once, seconds apart, between
+    // the two catalogue guards; it is not stated again.
+    let indexed: Vec<(&String, &Attributes)> = tracks
+        .values()
+        .map(|r| (&r.afc_path, &r.attributes))
+        .chain(other_audio.values().map(|r| (&r.afc_path, &r.attributes)))
+        .filter(|_| copied)
+        .collect();
+    let paths: Vec<&str> = indexed.iter().map(|(path, _)| path.as_str()).collect();
+    for ((_, attributes), current) in indexed
+        .iter()
+        .zip(stat_all(&mut afc, &paths, control).await?)
+    {
+        let current = current.context("indexed audio disappeared before completion")?;
+        ensure!(
+            same_attributes(&without_access_time(current), attributes),
+            "indexed audio changed later in the pass; partial evidence only"
+        );
+    }
+    let paths: Vec<&str> = missing.values().map(String::as_str).collect();
+    for (path, current) in paths.iter().zip(stat_all(&mut afc, &paths, control).await?) {
+        ensure!(
+            current.is_none(),
+            "missing audio {path} appeared later in the pass; partial evidence only"
+        );
+    }
+    let after = verify_catalog(&mut afc, &binding, control)
+        .await
+        .map_err(|error| {
+            if error.downcast_ref::<CatalogGuardDrift>().is_some() {
+                anyhow::Error::from(LateCatalogGuardDrift(error))
+            } else {
+                error
+            }
+        })?;
+    if before != after {
+        return Err(LateCatalogGuardDrift(anyhow::anyhow!(
+            "catalog attributes changed during whole audio pass; partial evidence only"
+        ))
+        .into());
+    }
+    check_control(control)?;
+    spool.finish()?;
+    Ok(DeviceAudioIndex {
+        identity,
+        catalog: binding,
+        tracks,
+        other_audio,
+        unfilled: BTreeSet::new(),
+        gone: missing.into_keys().collect(),
+    })
 }
 
 /// The refusal for a catalogued file that is not on the phone.
@@ -704,7 +1177,11 @@ impl Drop for Spool {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod tests;
+
 mod receipt;
+pub(crate) use receipt::{codec_json, fingerprint_json};
 
 pub mod cache;
 

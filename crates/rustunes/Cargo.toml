@@ -18,3 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+# Offline test fixtures only; the production dependency leaves them off.
+music-protocol = { path = "../music-protocol", features = ["offline-test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
