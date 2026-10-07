@@ -704,6 +704,8 @@ impl Drop for Spool {
     }
 }
 
+pub mod cache;
+
 use music_protocol::media::other_audio as other;
 pub use other::OtherCodec;
 pub(crate) use other::inspect as inspect_mpeg_frames;
