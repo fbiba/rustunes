@@ -32,4 +32,53 @@ impl Journal {
             retired_binding_count: count("SELECT count(*) FROM binding_tombstones")?,
         })
     }
+
+    /// The active binding of this audio identity, with its reference.
+    #[cfg(test)]
+    pub fn lookup_active(
+        &self,
+        audio: &impl music_protocol::media::fingerprint::EncodedIdentity,
+    ) -> Result<Option<ActiveBinding>> {
+        self.ordinary_inspectable()?;
+        active(&self.connection, audio.encoded_sha256())
+    }
+    /// The active binding stored under one encoded-audio key, if any.
+    pub(crate) fn active_binding_for(&self, audio: &[u8; 32]) -> Result<Option<ActiveBinding>> {
+        self.ordinary_inspectable()?;
+        active(&self.connection, audio)
+    }
+    /// The outstanding attempt alone, ignoring any outstanding batch. Status
+    /// shows it beside them.
+    pub(crate) fn outstanding_attempt(&self) -> Result<Option<Attempt>> {
+        self.ordinary_inspectable()?;
+        let id: Option<i64> = self
+            .connection
+            .query_row("SELECT id FROM attempts WHERE state IN(0,1)", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        id.map(|id| load_attempt(&self.connection, AttemptId(id)))
+            .transpose()
+    }
+}
+
+fn active(c: &Connection, audio: &[u8; 32]) -> Result<Option<ActiveBinding>> {
+    let reference: Option<(i64, u32)> = c
+        .query_row(
+            "SELECT binding_id,version FROM active_bindings WHERE audio=?1",
+            [audio],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    reference
+        .map(|(id, version)| {
+            Ok(ActiveBinding {
+                reference: BindingRef {
+                    id: BindingId(id),
+                    version,
+                },
+                binding: lookup(c, audio)?.context("active binding missing")?,
+            })
+        })
+        .transpose()
 }

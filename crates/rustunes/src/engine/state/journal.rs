@@ -34,6 +34,8 @@ const SCHEMA: &str = include_str!("journal/schema.sql");
 
 mod active;
 
+mod insertion_batch;
+mod metadata_batch;
 mod rows;
 
 mod bindings;
@@ -238,6 +240,18 @@ pub struct Binding {
     pub media_anchor: u32,
 }
 
+impl Binding {
+    /// Digest of the entire last verified transferred Content, not desired tags.
+    pub fn content_sha256(&self) -> Result<[u8; 32]> {
+        let bytes = encode_content(&self.content)?;
+        let mut h = Sha256::new();
+        h.update(b"rustunes/binding-content\0");
+        h.update((bytes.len() as u64).to_be_bytes());
+        h.update(bytes);
+        Ok(h.finalize().into())
+    }
+}
+
 pub struct StartEvidence {
     pub ready_media_anchor: u32,
     pub ready_receipt_sha256: [u8; 32],
@@ -306,6 +320,15 @@ impl Journal {
         bindings::active_id(&self.connection, audio.encoded_sha256())
     }
 
+    /// Active verified content for this audio.
+    pub fn lookup_active_verified(
+        &self,
+        audio: &impl music_protocol::media::fingerprint::EncodedIdentity,
+    ) -> Result<Option<Binding>> {
+        self.ordinary_inspectable()?;
+        lookup(&self.connection, audio.encoded_sha256())
+    }
+
     /// Rebind an already open journal to newly observed device preferences.
     pub fn ensure_identity(&self, identity: &Identity) -> Result<()> {
         self.ordinary_inspectable()?;
@@ -319,6 +342,101 @@ impl Journal {
             "journal does not belong to the observed device and library"
         );
         Ok(())
+    }
+
+    pub fn attempt(&self, id: AttemptId) -> Result<Attempt> {
+        self.ordinary_inspectable()?;
+        load_attempt(&self.connection, id)
+    }
+
+    /// Read the durable transition evidence; never recreates a write permit.
+    pub fn start_evidence(&self, id: AttemptId) -> Result<Option<StartEvidence>> {
+        self.ordinary_inspectable()?;
+        let attempt = load_attempt(&self.connection, id)?;
+        let (ready, signature): (Option<Vec<u8>>, Option<Vec<u8>>) = self.connection.query_row(
+            "SELECT ready_receipt,signature FROM attempts WHERE id=?1",
+            [id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        match (ready, signature) {
+            (None, None)
+                if matches!(
+                    attempt.state,
+                    AttemptState::Prepared | AttemptState::Cancelled
+                ) =>
+            {
+                Ok(None)
+            }
+            (Some(ready), Some(signature))
+                if matches!(
+                    attempt.state,
+                    AttemptState::ReconciliationRequired
+                        | AttemptState::Verified
+                        | AttemptState::NotApplied
+                        | AttemptState::Abandoned
+                ) =>
+            {
+                let ready_receipt_sha256 = array(&ready)?;
+                let signature: [u8; 21] = array(&signature)?;
+                nonzero_hash(&ready_receipt_sha256)?;
+                ensure!(signature[0] == 1, "invalid stored signature envelope");
+                Ok(Some(StartEvidence {
+                    ready_media_anchor: attempt.prepared.current_media_anchor,
+                    ready_receipt_sha256,
+                    signature,
+                }))
+            }
+            _ => anyhow::bail!("stored start evidence disagrees with attempt state"),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        id: AttemptId,
+        evidence: CompletionEvidence,
+        reconciled: bool,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = load_attempt(&transaction, id)?;
+        attempt.prepared.content.source.require_alac()?; // Storage decoding is not start/completion authority.
+        ensure!(
+            attempt.state == AttemptState::ReconciliationRequired,
+            "only Started attempts may be verified"
+        );
+        verify_content(&attempt.prepared.content, &evidence)?;
+        let expected_anchor = attempt.prepared.current_media_anchor + 1;
+        ensure!(
+            if reconciled {
+                evidence.media_anchor >= expected_anchor
+            } else {
+                evidence.media_anchor == expected_anchor
+            },
+            "verification anchor does not cover prepared revision"
+        );
+        bindings::store_binding(
+            &transaction,
+            &attempt.prepared.content,
+            &evidence,
+            attempt.prepared.kind == AttemptKind::Artwork,
+            id,
+        )?;
+        transaction.execute(
+            "UPDATE reservations SET consumed=1 WHERE attempt=?1",
+            [id.0],
+        )?;
+        transaction.execute(
+            "UPDATE attempts SET state=2,verified_receipt=?1,verified_anchor=?2 WHERE id=?3",
+            params![evidence.receipt_sha256, evidence.media_anchor, id.0],
+        )?;
+        bindings::database_bound(&transaction, 0)?;
+        durable_commit(
+            transaction,
+            &self.database,
+            &self.directory,
+            &mut self.poisoned,
+        )
     }
 
     fn ordinary_inspectable(&self) -> Result<()> {
@@ -583,6 +701,60 @@ fn kind_number(kind: AttemptKind) -> i64 {
     }
 }
 
+fn load_attempt(connection: &Connection, id: AttemptId) -> Result<Attempt> {
+    let raw = connection.query_row("SELECT kind,state,content,operation,operation_sha,album,artist,base_anchor,input_receipt FROM attempts WHERE id=?1", [id.0], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, Option<Vec<u8>>>(5)?, row.get::<_, Option<Vec<u8>>>(6)?, row.get::<_, u32>(7)?, row.get::<_, Vec<u8>>(8)?))
+    }).context("journal attempt not found")?;
+    let kind = match raw.0 {
+        1 => AttemptKind::Insert,
+        2 => AttemptKind::Artwork,
+        _ => bail!("invalid journal attempt kind"),
+    };
+    let state = match raw.1 {
+        0 => AttemptState::Prepared,
+        1 => AttemptState::ReconciliationRequired,
+        2 => AttemptState::Verified,
+        3 => AttemptState::Cancelled,
+        4 => AttemptState::Compensated,
+        5 => AttemptState::NotApplied,
+        6 => AttemptState::Abandoned,
+        _ => bail!("invalid journal attempt state"),
+    };
+    let actual_sha: [u8; 32] = Sha256::digest(&raw.3).into();
+    ensure!(
+        actual_sha == array::<32>(&raw.4)?,
+        "prepared operation digest differs"
+    );
+    let prepared = PreparedAttempt {
+        kind,
+        content: decode_content(&raw.2)?,
+        operation: raw.3,
+        new_album_pid: raw
+            .5
+            .map(|b| Ok::<_, anyhow::Error>(u64::from_be_bytes(array(&b)?)))
+            .transpose()?,
+        new_artist_pid: raw
+            .6
+            .map(|b| Ok::<_, anyhow::Error>(u64::from_be_bytes(array(&b)?)))
+            .transpose()?,
+        current_media_anchor: raw.7,
+        input_receipt_sha256: array(&raw.8)?,
+    };
+    validate_prepared(&prepared)?;
+    Ok(Attempt {
+        id,
+        state,
+        prepared,
+    })
+}
+
+fn lookup(connection: &Connection, audio: &[u8; 32]) -> Result<Option<Binding>> {
+    let raw = connection
+        .query_row(&binding_query(" WHERE audio=?1"), [audio], read_binding)
+        .optional()?;
+    raw.map(decode_binding).transpose()
+}
+
 fn binding_query(suffix: &str) -> String {
     format!("SELECT audio,content,receipt,anchor,track,path,receipt_kind FROM bindings{suffix}")
 }
@@ -608,6 +780,22 @@ fn read_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBinding> {
     })
 }
 
+fn decode_binding(raw: RawBinding) -> Result<Binding> {
+    let content = decode_content(&raw.content)?;
+    ensure!(
+        content.source.audio.sha256.as_slice() == raw.audio
+            && content.track_pid.to_be_bytes().as_slice() == raw.track
+            && content.path == raw.path,
+        "journal binding key differs from content"
+    );
+    Ok(Binding {
+        content,
+        receipt_sha256: array(&raw.receipt)?,
+        receipt_kind: BindingReceiptKind::from_number(raw.receipt_kind)?,
+        media_anchor: raw.anchor,
+    })
+}
+
 fn verify_content(content: &Content, evidence: &CompletionEvidence) -> Result<()> {
     nonzero_hash(&evidence.receipt_sha256)?;
     ensure!(
@@ -618,6 +806,166 @@ fn verify_content(content: &Content, evidence: &CompletionEvidence) -> Result<()
             && content.artwork.as_ref().map(|art| art.sha256) == evidence.artwork_sha256,
         "verified content differs from the prepared binding"
     );
+    Ok(())
+}
+
+fn validate_prepared(prepared: &PreparedAttempt) -> Result<()> {
+    validate_content(&prepared.content)?;
+    ensure!(
+        prepared.content.source.is_alac() || prepared.kind == AttemptKind::Insert,
+        "MPEG artwork intent is not qualified"
+    );
+    nonzero_hash(&prepared.input_receipt_sha256)?;
+    let revision = prepared
+        .current_media_anchor
+        .checked_add(1)
+        .context("Media anchor exhausted")?;
+    ensure!(
+        !prepared.operation.is_empty() && prepared.operation.len() <= MAX_OPERATION,
+        "prepared operation exceeds bounds"
+    );
+    let mut ids = BTreeSet::from([prepared.content.track_pid]);
+    for id in [prepared.new_album_pid, prepared.new_artist_pid]
+        .into_iter()
+        .flatten()
+    {
+        ensure!(
+            id != 0 && ids.insert(id),
+            "new identities must be nonzero and distinct"
+        );
+    }
+    // A narrow command/target guard prevents opaque prepared bytes from turning
+    // this Insert/Artwork API into a deletion or multi-track write permit. The
+    // protocol builder remains responsible for all other metadata semantics.
+    let value = Value::from_reader(Cursor::new(&prepared.operation))
+        .context("invalid prepared operation plist")?;
+    let root = value
+        .as_dictionary()
+        .context("operation envelope is not a dictionary")?;
+    ensure!(
+        root.len() == 3
+            && root.get("timestamp").and_then(Value::as_date).is_some()
+            && root.get("revision").and_then(Value::as_unsigned_integer)
+                == Some(u64::from(revision)),
+        "operation revision or envelope differs"
+    );
+    let operations = root
+        .get("operations")
+        .and_then(Value::as_array)
+        .context("operation list missing")?;
+    ensure!(
+        operations.len() == 2,
+        "journal only accepts one track operation plus unchanged database information"
+    );
+    let first = operations[0]
+        .as_dictionary()
+        .context("invalid database operation")?;
+    ensure!(
+        first.len() == 3
+            && first.get("operation").and_then(Value::as_string) == Some("update_db_info")
+            && first
+                .get("pid")
+                .and_then(Value::as_signed_integer)
+                .is_some_and(|id| id != 0)
+            && first
+                .get("db_info")
+                .and_then(Value::as_dictionary)
+                .is_some_and(|d| d.len() == 1
+                    && d.get("primary_container_pid")
+                        .and_then(Value::as_signed_integer)
+                        .is_some_and(|id| id != 0)),
+        "unsupported database operation"
+    );
+    let own = operations[1]
+        .as_dictionary()
+        .context("invalid track operation")?;
+    ensure!(
+        own.get("pid")
+            .and_then(Value::as_signed_integer)
+            .map(|id| id as u64)
+            == Some(prepared.content.track_pid),
+        "operation targets another track"
+    );
+    let item = own
+        .get("item")
+        .and_then(Value::as_dictionary)
+        .context("track item missing")?;
+    match prepared.kind {
+        AttemptKind::Insert => {
+            ensure!(
+                own.get("operation").and_then(Value::as_string) == Some("insert_track")
+                    && prepared.content.artwork.is_none(),
+                "unsupported insertion operation"
+            );
+            for (key, id) in [
+                ("album_pid", prepared.new_album_pid),
+                ("artist_pid", prepared.new_artist_pid),
+            ] {
+                if let Some(id) = id {
+                    ensure!(
+                        item.get(key)
+                            .and_then(Value::as_signed_integer)
+                            .map(|pid| pid as u64)
+                            == Some(id),
+                        "reserved collection differs from operation"
+                    );
+                }
+            }
+        }
+        AttemptKind::Artwork => {
+            let art = prepared
+                .content
+                .artwork
+                .as_ref()
+                .context("artwork operation has no artwork")?;
+            ensure!(
+                prepared.new_album_pid.is_none()
+                    && prepared.new_artist_pid.is_none()
+                    && own.len() == 3
+                    && own.get("operation").and_then(Value::as_string) == Some("update_track")
+                    && item.len() == 2
+                    && item
+                        .get("artwork_cache_id")
+                        .and_then(Value::as_unsigned_integer)
+                        == Some(u64::from(art.cache_id))
+                    && item
+                        .get("artwork_checksum")
+                        .and_then(Value::as_unsigned_integer)
+                        == art.bytes.checked_add(17),
+                "unsupported artwork-only operation"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_content(content: &Content) -> Result<()> {
+    ensure!(content.track_pid != 0, "invalid content track identity");
+    content.source.validate()?;
+    let extension = content.source.format().extension();
+    let parts: Vec<_> = content.path.split('/').collect();
+    ensure!(
+        parts.len() == 4
+            && parts[0] == "iTunes_Control"
+            && parts[1] == "Music"
+            && parts[2].len() == 3
+            && parts[2].starts_with('F')
+            && parts[2][1..].bytes().all(|b| b.is_ascii_digit())
+            && parts[3].len() == 4 + extension.len()
+            && parts[3].ends_with(extension)
+            && parts[3][..4].bytes().all(|b| b.is_ascii_alphabetic()),
+        "unsupported permanent music path"
+    );
+    if let Some(art) = &content.artwork {
+        ensure!(
+            art.cache_id >= 100 && (4..=32 * 1024 * 1024).contains(&art.bytes),
+            "invalid artwork reservation"
+        );
+        nonzero_hash(&art.sha256)?;
+    }
+    if let Some(collection) = content.collection {
+        nonzero_hash(&collection)?;
+    }
     Ok(())
 }
 
@@ -632,8 +980,189 @@ fn array<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
         .map_err(|_| anyhow::anyhow!("invalid journal binary field length"))
 }
 
+// Local fixed-field record led by its codec kind. No phone protocol is encoded here.
+fn encode_content(content: &Content) -> Result<Vec<u8>> {
+    validate_content(content)?;
+    let source = &content.source;
+    let mut bytes;
+    if let Some(audio) = source.audio.encoded() {
+        bytes = vec![3];
+        bytes.extend(source.file_bytes.to_be_bytes());
+        bytes.extend(source.full_file_sha256);
+        bytes.extend(source.audio.sha256);
+        bytes.extend(audio.to_bytes());
+    } else if let Some(audio) = source.audio.mpeg() {
+        bytes = vec![2];
+        bytes.extend(source.file_bytes.to_be_bytes());
+        bytes.extend(source.full_file_sha256);
+        bytes.extend(source.audio.sha256);
+        bytes.extend(audio.sample_rate.to_be_bytes());
+        bytes.push(audio.channels);
+        bytes.extend(audio.frame_count.to_be_bytes());
+        bytes.extend(audio.audio_offset.to_be_bytes());
+        bytes.extend(audio.audio_bytes.to_be_bytes());
+        bytes.extend(audio.trailing_bytes.to_be_bytes());
+        bytes.extend(audio.frame_bytes_sha256);
+    } else {
+        let audio = source.audio.alac()?;
+        bytes = vec![1];
+        bytes.extend(source.file_bytes.to_be_bytes());
+        for hash in [
+            &source.full_file_sha256,
+            &audio.sha256,
+            &audio.alac_config_sha256,
+            &audio.sample_sizes_sha256,
+            &audio.media_sha256,
+        ] {
+            bytes.extend(hash);
+        }
+        bytes.extend(audio.timescale.to_be_bytes());
+        bytes.extend(audio.duration_ticks.to_be_bytes());
+        bytes.extend(audio.media_bytes.to_be_bytes());
+    }
+    bytes.extend(content.track_pid.to_be_bytes());
+    bytes.extend(u16::try_from(content.path.len())?.to_be_bytes());
+    bytes.extend(content.path.as_bytes());
+    bytes.push(u8::from(content.artwork.is_some()));
+    if let Some(art) = &content.artwork {
+        bytes.extend(art.cache_id.to_be_bytes());
+        bytes.extend(art.bytes.to_be_bytes());
+        bytes.extend(art.sha256);
+    }
+    bytes.push(u8::from(content.collection.is_some()));
+    if let Some(collection) = &content.collection {
+        bytes.extend(collection);
+    }
+    ensure!(
+        bytes.len() <= MAX_CONTENT,
+        "content record exceeds journal bounds"
+    );
+    Ok(bytes)
+}
+
 /// A stored audio identity this build computes differently from its stored
 /// components: another build's hash definitions wrote it.
 const STALE_IDENTITY: &str = "its audio identities were hashed differently";
+
+fn decode_content(bytes: &[u8]) -> Result<Content> {
+    decode_content_as(bytes, true)
+}
+
+/// `decode_content`; with `stored_identity` false, a stored audio identity
+/// this build computes differently is replaced by this build's, from the
+/// stored components (a predecessor's content, `carry`), instead of refused.
+fn decode_content_as(bytes: &[u8], stored_identity: bool) -> Result<Content> {
+    ensure!(
+        bytes.len() <= MAX_CONTENT,
+        "content record exceeds journal bounds"
+    );
+    fn take<const N: usize>(reader: &mut Cursor<&[u8]>) -> Result<[u8; N]> {
+        let mut value = [0; N];
+        reader
+            .read_exact(&mut value)
+            .context("truncated journal content")?;
+        Ok(value)
+    }
+    fn flag(reader: &mut Cursor<&[u8]>) -> Result<bool> {
+        let byte = take::<1>(reader)?[0];
+        ensure!(byte <= 1, "invalid journal content flag");
+        Ok(byte == 1)
+    }
+    let mut reader = Cursor::new(bytes);
+    // The codec kind: 1 ALAC, 2 MPEG-1 Layer III, 3 any other format.
+    let kind = take::<1>(&mut reader)?[0];
+    ensure!(matches!(kind, 1..=3), "unknown content record kind");
+    let file_bytes = u64::from_be_bytes(take(&mut reader)?);
+    let full_file_sha256 = take(&mut reader)?;
+    let sha256 = take(&mut reader)?;
+    let source = if kind == 1 {
+        let mut audio = EncodedAlac {
+            sha256,
+            alac_config_sha256: take(&mut reader)?,
+            sample_sizes_sha256: take(&mut reader)?,
+            media_sha256: take(&mut reader)?,
+            timescale: u32::from_be_bytes(take(&mut reader)?),
+            duration_ticks: u64::from_be_bytes(take(&mut reader)?),
+            media_bytes: u64::from_be_bytes(take(&mut reader)?),
+        };
+        if audio.composite_sha256() != sha256 {
+            if stored_identity {
+                return Err(Superseded(STALE_IDENTITY).into());
+            }
+            audio.sha256 = audio.composite_sha256();
+        }
+        SourceFingerprint {
+            file_bytes,
+            full_file_sha256,
+            audio,
+        }
+        .into()
+    } else if kind == 3 {
+        let mut audio = [0; music_protocol::media::fingerprint::EncodedAudio::BYTES];
+        reader
+            .read_exact(&mut audio)
+            .context("truncated journal content")?;
+        let value = music_protocol::media::fingerprint::TransferredSource::encoded(
+            file_bytes,
+            full_file_sha256,
+            music_protocol::media::fingerprint::EncodedAudio::from_bytes(&audio)?,
+        )?;
+        if stored_identity && value.audio.sha256 != sha256 {
+            return Err(Superseded(STALE_IDENTITY).into());
+        }
+        value
+    } else {
+        let value = music_protocol::media::fingerprint::TransferredSource::mpeg(
+            file_bytes,
+            full_file_sha256,
+            music_protocol::media::fingerprint::EncodedMpeg1Layer3 {
+                sample_rate: u32::from_be_bytes(take(&mut reader)?),
+                channels: take::<1>(&mut reader)?[0],
+                frame_count: u32::from_be_bytes(take(&mut reader)?),
+                audio_offset: u64::from_be_bytes(take(&mut reader)?),
+                audio_bytes: u64::from_be_bytes(take(&mut reader)?),
+                trailing_bytes: u64::from_be_bytes(take(&mut reader)?),
+                frame_bytes_sha256: take(&mut reader)?,
+            },
+        )?;
+        if stored_identity && value.audio.sha256 != sha256 {
+            return Err(Superseded(STALE_IDENTITY).into());
+        }
+        value
+    };
+    let track_pid = u64::from_be_bytes(take(&mut reader)?);
+    let length = usize::from(u16::from_be_bytes(take(&mut reader)?));
+    ensure!(length <= 128, "journal path exceeds bounds");
+    let mut path = vec![0; length];
+    reader.read_exact(&mut path)?;
+    let path = String::from_utf8(path).context("invalid journal path encoding")?;
+    let artwork = if flag(&mut reader)? {
+        Some(Artwork {
+            cache_id: u32::from_be_bytes(take(&mut reader)?),
+            bytes: u64::from_be_bytes(take(&mut reader)?),
+            sha256: take(&mut reader)?,
+        })
+    } else {
+        None
+    };
+    let collection = if flag(&mut reader)? {
+        Some(take(&mut reader)?)
+    } else {
+        None
+    };
+    ensure!(
+        reader.position() == bytes.len() as u64,
+        "trailing journal content bytes"
+    );
+    let content = Content {
+        source,
+        track_pid,
+        path,
+        artwork,
+        collection,
+    };
+    validate_content(&content)?;
+    Ok(content)
+}
 
 pub(crate) mod mpeg_insert;
