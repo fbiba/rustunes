@@ -156,6 +156,14 @@ impl Config {
 fn phone_key(udid: &str) -> [u8; 32] {
     Sha256::digest(udid.as_bytes()).into()
 }
+/// Note the phone this run selected, so the files it stats are looked up and
+/// stored under its key. Outside a cache scope this does nothing.
+pub(crate) fn phone_selected(udid: &str) {
+    let Some(cache) = current() else { return };
+    if let Ok(device) = crate::engine::state::journal::device_binding(udid) {
+        cache.select(device, phone_key(udid));
+    }
+}
 
 tokio::task_local! { static CURRENT: Config; }
 
@@ -696,5 +704,51 @@ mod tests {
             hex(&phone_key("00008030-001A2B3C4D5E6F70")),
             "ee297680083bea81c354067b3d66292691e4319cb32f3c79e704ab90494148a2"
         );
+    }
+
+    #[tokio::test]
+    async fn entries_outlast_a_redefined_device_digest() {
+        let fixture =
+            crate::test_fixtures::workspace_root().join("tests/fixtures/silence-alac.m4a");
+        let attrs: Attributes = [
+            ("st_ifmt", "S_IFREG".to_owned()),
+            ("st_size", fs::metadata(&fixture).unwrap().len().to_string()),
+            ("st_birthtime", "10".to_owned()),
+            ("st_mtime", "20".to_owned()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        let dir = std::env::temp_dir().join(format!("fingerprint-phones-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = "iTunes_Control/Music/F00/ABCD.m4a";
+        let (before, after) = ([1; 32], [2; 32]);
+        let key = |device| FileKey::new(device, path, &attrs).unwrap();
+
+        // Selecting a phone maps the digest journals name it by to its key.
+        let selected = Config::new(dir.clone(), Mode::Reuse);
+        scope(Some(selected.clone()), async { phone_selected("phone") }).await;
+        let binding = crate::engine::state::journal::device_binding("phone").unwrap();
+        assert_eq!(selected.phone(&binding), Some(phone_key("phone")));
+
+        // A phone this run did not select is neither stored nor looked up.
+        let unselected = Config::new(dir.clone(), Mode::Reuse);
+        seed_for_tests(&unselected, &key(&before), &fixture).unwrap();
+        assert_eq!(counts_for_tests(&unselected), (0, 0));
+
+        let first = Config::new(dir.clone(), Mode::Reuse);
+        first.select(before, phone_key("phone"));
+        seed_for_tests(&first, &key(&before), &fixture).unwrap();
+        assert_eq!(counts_for_tests(&first), (0, 1));
+
+        // A release that names the same phone by another digest reuses it.
+        let upgraded = Config::new(dir.clone(), Mode::Reuse);
+        upgraded.select(after, phone_key("phone"));
+        assert!(upgraded.get(&key(&after)).is_some());
+        assert!(upgraded.get(&key(&before)).is_none());
+        let other = Config::new(dir.clone(), Mode::Reuse);
+        other.select(after, phone_key("another phone"));
+        assert!(other.get(&key(&after)).is_none());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
