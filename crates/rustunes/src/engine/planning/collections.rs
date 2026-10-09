@@ -659,6 +659,55 @@ mod tests {
     }
 
     #[test]
+    fn compilation_and_explicit_album_artist_remain_bound_to_prepared_source() {
+        let catalog = music_protocol::test_support::catalogue::collection_catalog(12);
+        let mut s = source();
+        s.compilation = Some(true);
+        s.album_artist = vec!["CLI Compilation Σύνολο".into()];
+        let planned = Planner::new(&catalog, &BTreeSet::new())
+            .plan(&s, candidates(10000))
+            .unwrap();
+        crate::engine::execution::insert::prepare_live(
+            &s,
+            &planned,
+            &catalog,
+            std::time::UNIX_EPOCH,
+        )
+        .unwrap();
+        s.compilation = Some(false);
+        assert!(
+            crate::engine::execution::insert::prepare_live(
+                &s,
+                &planned,
+                &catalog,
+                std::time::UNIX_EPOCH
+            )
+            .is_err()
+        );
+        s.compilation = Some(true);
+        s.album_artist[0] = "Different ensemble".into();
+        assert!(
+            crate::engine::execution::insert::prepare_live(
+                &s,
+                &planned,
+                &catalog,
+                std::time::UNIX_EPOCH
+            )
+            .is_err()
+        );
+        s.album_artist = vec!["CLI Compilation Σύνολο".into(), "Second value".into()];
+        assert!(
+            crate::engine::execution::insert::prepare_live(
+                &s,
+                &planned,
+                &catalog,
+                std::time::UNIX_EPOCH
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn existing_artist_new_album_allocates_only_album_and_missing_candidates_are_atomic() {
         let mut p = planner();
         let mut s = source();
@@ -720,5 +769,53 @@ mod tests {
         for (a, b) in [("A;B", "A, B"), ("ABC", " ABC"), ("Σ", "σ"), ("É", "é")] {
             assert!(!same_name(a, b));
         }
+    }
+
+    #[test]
+    fn fresh_sql_plan_serializes_reused_ids_and_rejects_changed_source_or_snapshot() {
+        let catalog = music_protocol::test_support::catalogue::collection_catalog(12);
+        let mut s = source();
+        s.artist = vec!["Synthetic Artist".into()];
+        s.album = vec!["Synthetic Album".into()];
+        let mut p = Planner::new(&catalog, &BTreeSet::from([10001]));
+        assert!(p.plan(&s, candidates(10001)).is_err());
+        let plan = p.plan(&s, candidates(10000)).unwrap();
+        assert_eq!(plan.artist_pid(), (-21i64) as u64);
+        assert_eq!(plan.album_pid(), (-31i64) as u64);
+        let raw = crate::engine::execution::insert::prepare_live(
+            &s,
+            &plan,
+            &catalog,
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let value: plist::Value = plist::from_bytes(&raw).unwrap();
+        let envelope = value.as_dictionary().unwrap();
+        assert_eq!(envelope["revision"].as_unsigned_integer(), Some(13));
+        let operations = envelope["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 2);
+        let item = operations[1].as_dictionary().unwrap()["item"]
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(item["artist_pid"].as_signed_integer(), Some(-21));
+        assert_eq!(item["album_pid"].as_signed_integer(), Some(-31));
+        assert!(!item.contains_key("album_artist"));
+        assert!(
+            plan.check(
+                &s,
+                &music_protocol::test_support::catalogue::collection_catalog(13)
+            )
+            .is_err()
+        );
+        s.title = vec!["Changed".into()];
+        assert!(
+            crate::engine::execution::insert::prepare_live(
+                &s,
+                &plan,
+                &catalog,
+                std::time::SystemTime::UNIX_EPOCH
+            )
+            .is_err()
+        );
     }
 }
