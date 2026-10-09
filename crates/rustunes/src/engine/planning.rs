@@ -6,3 +6,4 @@ use music_protocol::protocol::trace::private_write;
 use std::{fs::File, path::Path, time::Instant};
 pub(crate) mod source_collection;
 pub(crate) mod source_reads;
+pub(crate) mod source_validation;
