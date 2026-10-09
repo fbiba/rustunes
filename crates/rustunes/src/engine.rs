@@ -17,8 +17,10 @@ mod observation;
 pub use observation::Observation;
 pub(crate) mod planning;
 pub(crate) mod state;
+pub(crate) mod verification;
 pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use events::Event;
+pub use verification::VerificationRequest;
 
 type Observer = Arc<dyn for<'a> Fn(Event<'a>) -> Result<()> + Send + Sync>;
 tokio::task_local! { static CURRENT_OBSERVER: Observer; }
