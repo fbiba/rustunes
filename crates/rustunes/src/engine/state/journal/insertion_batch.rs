@@ -171,3 +171,304 @@ impl Conversion {
         Ok(())
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InsertBatchId(pub(super) i64);
+impl InsertBatchId {
+    pub fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertBatchState {
+    Prepared,
+    Started,
+    /// Every target is bound.
+    Verified,
+    /// Never sent.
+    Cancelled,
+    /// Sent, then proven unapplied by a fresh observation.
+    NotApplied,
+    /// Some rows reached the catalogue without a file; outstanding until compensated.
+    Partial,
+    /// No unbound target is left in the catalogue: the locationless rows of a
+    /// Partial batch were removed by a verified removal batch, or the phone
+    /// deleted every unbound target itself.
+    Compensated,
+}
+impl InsertBatchState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Started => "started",
+            Self::Verified => "verified",
+            Self::Cancelled => "cancelled",
+            Self::NotApplied => "not_applied",
+            Self::Partial => "partial",
+            Self::Compensated => "compensated",
+        }
+    }
+    fn decode(n: i64) -> Result<Self> {
+        Ok(match n {
+            0 => Self::Prepared,
+            1 => Self::Started,
+            2 => Self::Verified,
+            3 => Self::Cancelled,
+            4 => Self::NotApplied,
+            5 => Self::Partial,
+            6 => Self::Compensated,
+            _ => bail!("invalid insert batch state"),
+        })
+    }
+}
+/// What settlement found of one target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetOutcome {
+    /// Verified and bound as an active binding.
+    Bound,
+    /// A catalogue row without its file, awaiting a compensating removal.
+    PendingCompensation,
+    /// Removed again by a verified compensating removal batch.
+    Compensated,
+    /// Created and deleted again by the phone within the session.
+    RemovedByPhone,
+}
+impl TargetOutcome {
+    fn decode(n: Option<i64>) -> Result<Option<Self>> {
+        Ok(match n {
+            None => None,
+            Some(1) => Some(Self::Bound),
+            Some(2) => Some(Self::PendingCompensation),
+            Some(3) => Some(Self::Compensated),
+            Some(4) => Some(Self::RemovedByPhone),
+            _ => bail!("invalid insert target outcome"),
+        })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InsertTargetRecord {
+    pub target: InsertTarget,
+    pub outcome: Option<TargetOutcome>,
+    /// The binding version a bound target created.
+    pub binding: Option<(BindingId, u32)>,
+}
+/// Insert batches by state.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InsertBatchCounts {
+    pub prepared: u64,
+    pub started: u64,
+    pub verified: u64,
+    pub cancelled: u64,
+    pub not_applied: u64,
+    pub partial: u64,
+    pub compensated: u64,
+}
+
+/// Returned only after the durable Started commit. Not Clone: one send. A lost
+/// value requires fresh reconciliation, never another permit.
+pub struct StartedInsertBatch {
+    operation: Vec<u8>,
+    signature: [u8; 21],
+}
+impl StartedInsertBatch {
+    pub fn operation(&self) -> &[u8] {
+        &self.operation
+    }
+    pub fn signature(&self) -> &[u8; 21] {
+        &self.signature
+    }
+}
+impl music_protocol::protocol::session::StartedOperation for StartedInsertBatch {
+    fn operation(&self) -> &[u8] {
+        StartedInsertBatch::operation(self)
+    }
+    fn signature(&self) -> &[u8; 21] {
+        StartedInsertBatch::signature(self)
+    }
+}
+
+/// The artwork cache IDs an insert batch reserves in namespace 2, one per cover.
+fn reserved_caches(targets: &[InsertTarget]) -> impl Iterator<Item = u32> + '_ {
+    targets
+        .iter()
+        .filter_map(|t| t.content.artwork.as_ref().map(|a| a.cache_id))
+}
+
+/// Every identity an insert batch reserves in namespace 1, each once: the
+/// tracks, then the new albums, then the new artists. Collections shared by
+/// several targets are reserved once.
+fn reserved_pids(targets: &[InsertTarget]) -> Vec<u64> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for pid in targets
+        .iter()
+        .map(|t| Some(t.content.track_pid))
+        .chain(targets.iter().map(|t| t.new_album_pid))
+        .chain(targets.iter().map(|t| t.new_artist_pid))
+        .flatten()
+    {
+        if seen.insert(pid) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// The verified compensating removal batch took `removed` locationless rows
+/// out: those targets become Compensated and the insert batch with them.
+pub(super) fn settle_compensated(
+    tx: &Connection,
+    batch: InsertBatchId,
+    removed: usize,
+) -> Result<()> {
+    ensure!(
+        tx.execute(
+            "UPDATE insert_targets SET outcome=3 WHERE batch=?1 AND outcome=2",
+            [batch.0]
+        )? == removed,
+        "compensated insert targets differ from the removal batch"
+    );
+    ensure!(
+        tx.execute(
+            "UPDATE insert_batches SET state=6 WHERE id=?1 AND state=5",
+            [batch.0]
+        )? == 1,
+        "compensated insert batch CAS differs"
+    );
+    Ok(())
+}
+
+/// A verified target's first binding version: ours, inserted by a batch.
+fn bind_target(
+    tx: &Connection,
+    content: &Content,
+    evidence: &CompletionEvidence,
+) -> Result<BindingId> {
+    bindings::capacity(tx, true, 0)?;
+    let bytes = encode_content(content)?;
+    tx.execute(
+        "INSERT INTO binding_records(audio,track,path,first_attempt,provenance) VALUES(?1,?2,?3,NULL,2)",
+        params![
+            content.source.audio.sha256,
+            content.track_pid.to_be_bytes(),
+            content.path
+        ],
+    )
+    .context("verified binding conflicts with existing content")?;
+    let binding = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO binding_versions VALUES(?1,1,?2,?3,?4,NULL,3)",
+        params![
+            binding,
+            bytes,
+            evidence.receipt_sha256,
+            evidence.media_anchor
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO active_bindings VALUES(?1,?2,1)",
+        params![content.source.audio.sha256, binding],
+    )?;
+    Ok(BindingId(binding))
+}
+
+/// Conversions of active tracks: an insert batch's, or a pulled binding's.
+const ACTIVE_CONVERSIONS: &str = "SELECT c.track,c.source_path,c.source_bytes,c.source_sha,c.source_audio,c.ffmpeg FROM (SELECT t.track,c.source_path,c.source_bytes,c.source_sha,c.source_audio,c.ffmpeg FROM insert_conversions c JOIN insert_targets t ON t.batch=c.batch AND t.ordinal=c.ordinal JOIN active_bindings a ON a.binding_id=t.binding_id WHERE t.outcome=1 UNION ALL SELECT r.track,p.source_path,p.source_bytes,p.source_sha,p.source_audio,p.ffmpeg FROM binding_conversions p JOIN binding_records r ON r.id=p.binding_id JOIN active_bindings a ON a.binding_id=p.binding_id) c WHERE 1";
+
+fn read_conversion(r: &rusqlite::Row<'_>) -> Result<(u64, Conversion)> {
+    Ok((
+        u64::from_be_bytes(array(&r.get::<_, Vec<u8>>(0)?)?),
+        Conversion {
+            source_path: PathBuf::from(r.get::<_, String>(1)?),
+            source_bytes: u64::try_from(r.get::<_, i64>(2)?)?,
+            source_sha256: array(&r.get::<_, Vec<u8>>(3)?)?,
+            source_audio: array(&r.get::<_, Vec<u8>>(4)?)?,
+            ffmpeg: r.get(5)?,
+        },
+    ))
+}
+
+/// Consume one reservation of a batch.
+fn consume(tx: &Connection, batch: InsertBatchId, namespace: i64, value: &[u8]) -> Result<()> {
+    ensure!(
+        tx.execute(
+            "UPDATE reservations SET consumed=1 WHERE insert_batch=?1 AND namespace=?2 AND value=?3 AND consumed=0",
+            params![batch.0, namespace, value],
+        )? == 1,
+        "insert batch reservations changed during settlement"
+    );
+    Ok(())
+}
+
+impl Journal {
+    fn insert_batch_storage(&self) -> Result<()> {
+        self.usable()?;
+        Ok(())
+    }
+
+    pub(super) fn insert_batch_writer(&self) -> Result<()> {
+        self.insert_batch_storage()?;
+        ensure!(
+            self._read_only_copy.is_none(),
+            "read-only journal cannot write insert batch storage"
+        );
+        Ok(())
+    }
+
+    /// A Prepared batch that never started may be abandoned. Started batches
+    /// have no cancel: they settle from fresh evidence. Its identities stay
+    /// reserved.
+    pub fn cancel_insert_batch(&mut self, id: InsertBatchId) -> Result<()> {
+        self.insert_batch_writer()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cancel_insert(&tx, id)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
+    }
+
+    /// Record that a sent batch was proven unapplied by a fresh observation.
+    /// Nothing is bound; the identities stay reserved.
+    pub fn mark_insert_batch_not_applied(
+        &mut self,
+        id: InsertBatchId,
+        proof_receipt: [u8; 32],
+    ) -> Result<()> {
+        self.insert_batch_writer()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_not_applied(&tx, id, proof_receipt)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
+    }
+}
+
+/// Prepared -> Cancelled in `tx`.
+pub(super) fn cancel_insert(tx: &Connection, id: InsertBatchId) -> Result<()> {
+    ensure!(
+        tx.execute(
+            "UPDATE insert_batches SET state=3 WHERE id=?1 AND state=0",
+            [id.0]
+        )? == 1,
+        "only a Prepared insert batch can be cancelled"
+    );
+    Ok(())
+}
+
+/// Started -> NotApplied in `tx`.
+pub(super) fn insert_not_applied(
+    tx: &Connection,
+    id: InsertBatchId,
+    proof_receipt: [u8; 32],
+) -> Result<()> {
+    nonzero_hash(&proof_receipt)?;
+    ensure!(
+        tx.execute(
+            "UPDATE insert_batches SET state=4,result_receipt=?1 WHERE id=?2 AND state=1",
+            params![proof_receipt, id.0],
+        )? == 1,
+        "only a Started insert batch can be marked not applied"
+    );
+    Ok(())
+}
