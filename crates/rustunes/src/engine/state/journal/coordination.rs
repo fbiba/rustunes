@@ -988,6 +988,81 @@ impl Journal {
         }
         Ok(counts)
     }
+
+    /// Durable local intent only, with its targets and (for a coordinated
+    /// batch) the coordination's next step in one transaction. This grants no
+    /// native permit. Removed tracks and paths become reserved for good.
+    pub fn prepare_removal_batch(&mut self, intent: &RemovalIntent) -> Result<BatchId> {
+        self.coordination_writer()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = prepare_removal(&tx, intent, None)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)?;
+        Ok(id)
+    }
+
+    /// Durable Prepared -> Started before the signed operation is sent. There
+    /// is no retry: a lost `StartedBatch` requires fresh reconciliation.
+    pub fn start_removal_batch(
+        &mut self,
+        id: BatchId,
+        ready_receipt: [u8; 32],
+        signature: [u8; 21],
+    ) -> Result<StartedBatch> {
+        self.coordination_writer()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let started = start_removal(&tx, id, ready_receipt, signature)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)?;
+        Ok(started)
+    }
+
+    /// A Prepared batch that never started may be abandoned. Started batches
+    /// have no cancel: they settle Verified or NotApplied from fresh evidence.
+    pub fn cancel_removal_batch(&mut self, id: BatchId) -> Result<()> {
+        self.coordination_writer()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cancel_removal(&tx, id)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
+    }
+
+    /// Record that a sent batch was proven unapplied by a fresh observation.
+    /// Its targets stay as they were; nothing is retired.
+    pub fn mark_removal_batch_not_applied(
+        &mut self,
+        id: BatchId,
+        proof_receipt: [u8; 32],
+    ) -> Result<()> {
+        self.coordination_writer()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        removal_not_applied(&tx, id, proof_receipt)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
+    }
+
+    /// Verify a Started batch, retire every owned target, and (for a
+    /// compensating batch) settle its Started Insert as Compensated or its
+    /// Partial insert batch as Compensated, all in one transaction. This
+    /// releases the journal for new attempts.
+    pub fn settle_removal_batch(
+        &mut self,
+        id: BatchId,
+        result_receipt: [u8; 32],
+        verified_anchor: u32,
+    ) -> Result<()> {
+        self.coordination_writer()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        settle_removal(&tx, id, result_receipt, verified_anchor)?;
+        validate_schema(&tx)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
+    }
 }
 
 /// An owned target must be the active version of a binding whose identity it
@@ -1033,5 +1108,206 @@ pub(super) fn link_step(c: &Connection, coordination: CoordinationId, work: Work
         params![coordination.0, step, id],
     )
     .context("coordination step conflicts with an existing link")?;
+    Ok(())
+}
+
+/// Prepare `intent` in `tx`, as `Journal::prepare_removal_batch` does; with
+/// `session`, as the removal half of that Prepared insert batch's session.
+pub(super) fn prepare_removal(
+    tx: &Connection,
+    intent: &RemovalIntent,
+    session: Option<InsertBatchId>,
+) -> Result<BatchId> {
+    validate_intent(intent)?;
+    let evidence = evidence_text(&intent.evidence)?;
+    ensure!(
+        session.is_none()
+            || (intent.coordination.is_none()
+                && intent.compensates.is_none()
+                && intent.compensates_insert_batch.is_none()
+                && intent.playlists.is_empty()),
+        "a session's removal half removes tracks and nothing else"
+    );
+    ensure!(outstanding_batch_id(tx)?.is_none(), OUTSTANDING_BATCH);
+    match intent.coordination {
+        Some(id) => ensure!(
+            active_id(tx)? == Some(id.0),
+            "removal batch names a coordination that is not Active"
+        ),
+        None => ensure_no_route_owner(tx)?,
+    }
+    insertion_batch::ensure_removal_admitted(tx, intent, session)?;
+    let outstanding: Vec<i64> = tx
+        .prepare("SELECT id FROM attempts WHERE state IN(0,1)")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    match intent.compensates {
+        Some(parent) => ensure!(
+            outstanding == [parent.0],
+            "a compensating batch needs its Started Insert as the only outstanding attempt"
+        ),
+        None => ensure!(
+            outstanding.is_empty(),
+            "an outstanding attempt requires completion, cancellation, or reconciliation"
+        ),
+    }
+    for target in &intent.targets {
+        check_owned_target(tx, target)?;
+    }
+    tx.execute(
+            "INSERT INTO removal_batches(compensates,compensates_insert_batch,with_insert_batch,state,operation,operation_sha,base_anchor,before_current,before_index,input_receipt,evidence) VALUES(?1,?2,?3,0,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                intent.compensates.map(|a| a.0),
+                intent.compensates_insert_batch.map(|b| b.0),
+                session.map(|b| b.as_i64()),
+                intent.operation,
+                digest(&intent.operation),
+                intent.base_anchor,
+                intent.before_current,
+                intent.before_index,
+                intent.input_receipt,
+                evidence
+            ],
+        )?;
+    let id = BatchId(tx.last_insert_rowid());
+    for (ordinal, target) in intent.targets.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO removal_targets VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                id.0,
+                i64::try_from(ordinal)?,
+                target.track.to_be_bytes(),
+                target.item_pid,
+                target.path,
+                target.file_bytes.map(i64::try_from).transpose()?,
+                target.file_sha256,
+                target.binding.map(|b| b.0.as_i64()),
+                target.binding.map(|b| b.1)
+            ],
+        )?;
+    }
+    for (ordinal, playlist) in intent.playlists.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO removal_playlists VALUES(?1,?2,?3,?4)",
+            params![
+                id.0,
+                i64::try_from(ordinal)?,
+                playlist.container.to_be_bytes(),
+                playlist.name
+            ],
+        )?;
+    }
+    if let Some(coordination) = intent.coordination {
+        link_step(tx, coordination, Work::Removal(id))?;
+    }
+    bindings::database_bound(tx, 4 * 1024 * 1024)?;
+    Ok(id)
+}
+
+/// Prepared -> Started in `tx`, as `Journal::start_removal_batch` does.
+pub(super) fn start_removal(
+    tx: &Connection,
+    id: BatchId,
+    ready_receipt: [u8; 32],
+    signature: [u8; 21],
+) -> Result<StartedBatch> {
+    nonzero_hash(&ready_receipt)?;
+    ensure!(signature[0] == 1, "unsupported metadata signature envelope");
+    let batch = load_batch(tx, id)?;
+    ensure!(
+        batch.state == BatchState::Prepared,
+        "removal batch already started or closed; reconcile instead of retrying"
+    );
+    ensure!(
+        tx.execute(
+            "UPDATE removal_batches SET state=1,ready_receipt=?1,signature=?2 WHERE id=?3 AND state=0",
+            params![ready_receipt, signature.as_slice(), id.0],
+        )? == 1,
+        "removal batch start CAS differs"
+    );
+    bindings::database_bound(tx, 4 * 1024 * 1024)?;
+    Ok(StartedBatch {
+        operation: batch.operation,
+        signature,
+    })
+}
+
+/// Prepared -> Cancelled in `tx`.
+pub(super) fn cancel_removal(tx: &Connection, id: BatchId) -> Result<()> {
+    ensure!(
+        tx.execute(
+            "UPDATE removal_batches SET state=3 WHERE id=?1 AND state=0",
+            [id.0]
+        )? == 1,
+        "only a Prepared removal batch can be cancelled"
+    );
+    Ok(())
+}
+
+/// Started -> NotApplied in `tx`.
+pub(super) fn removal_not_applied(
+    tx: &Connection,
+    id: BatchId,
+    proof_receipt: [u8; 32],
+) -> Result<()> {
+    nonzero_hash(&proof_receipt)?;
+    ensure!(
+        tx.execute(
+            "UPDATE removal_batches SET state=4,result_receipt=?1 WHERE id=?2 AND state=1",
+            params![proof_receipt, id.0],
+        )? == 1,
+        "only a Started removal batch can be marked not applied"
+    );
+    Ok(())
+}
+
+/// Started -> Verified in `tx`, retiring every owned target and settling what
+/// the batch compensates, as `Journal::settle_removal_batch` does.
+pub(super) fn settle_removal(
+    tx: &Connection,
+    id: BatchId,
+    result_receipt: [u8; 32],
+    verified_anchor: u32,
+) -> Result<()> {
+    nonzero_hash(&result_receipt)?;
+    let batch = load_batch(tx, id)?;
+    ensure!(
+        batch.state == BatchState::Started,
+        "removal batch is not Started"
+    );
+    ensure!(
+        verified_anchor > batch.base_anchor,
+        "verified removal does not cover its revision"
+    );
+    ensure!(
+        tx.execute(
+            "UPDATE removal_batches SET state=2,result_receipt=?1,verified_anchor=?2 WHERE id=?3 AND state=1",
+            params![result_receipt, verified_anchor, id.0],
+        )? == 1,
+        "removal batch verification CAS differs"
+    );
+    for target in &batch.targets {
+        if let Some((binding, version)) = target.binding {
+            ensure!(
+                tx.execute(
+                    "DELETE FROM active_bindings WHERE binding_id=?1 AND version=?2",
+                    params![binding.as_i64(), version],
+                )? == 1,
+                "owned removal target is no longer the active binding version"
+            );
+        }
+    }
+    if let Some(parent) = batch.compensates {
+        ensure!(
+            tx.execute(
+                "UPDATE attempts SET state=4 WHERE id=?1 AND kind=1 AND state=1",
+                [parent.0],
+            )? == 1,
+            "compensated parent CAS differs"
+        );
+    }
+    if let Some(parent) = batch.compensates_insert_batch {
+        insertion_batch::settle_compensated(tx, parent, batch.targets.len())?;
+    }
     Ok(())
 }
