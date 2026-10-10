@@ -322,6 +322,172 @@ pub struct Journal {
 }
 
 impl Journal {
+    /// Parent must already exist. Never opens or replaces an existing directory.
+    /// An interrupted creation is left in place for inspection, not overwritten.
+    pub fn create(directory: &Path, identity: &Identity) -> Result<Self> {
+        let parent = directory
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory)
+            .context("creating private journal directory")?;
+        File::open(parent)?.sync_all()?;
+        let directory_file = private_directory(directory)?;
+        let path = directory.join(DB_NAME);
+        let database = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        database.sync_all()?;
+        directory_file.sync_all()?;
+        let mut connection = connect(&path)?;
+        configure(&connection)?;
+        let mut nonce = [0; 32];
+        File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA)?;
+        transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+        transaction.execute(
+            "INSERT INTO scope VALUES(1,?1,?2,?3)",
+            params![&identity.device, &identity.library, &nonce],
+        )?;
+        let mut poisoned = false;
+        durable_commit(transaction, &database, &directory_file, &mut poisoned)?;
+        Ok(Self {
+            connection,
+            directory: directory_file,
+            directory_path: fs::canonicalize(directory)?,
+            database,
+            nonce,
+            poisoned,
+            _read_only_copy: None,
+        })
+    }
+
+    /// Refuses other schemas, other device/library bindings, symlinks, and
+    /// non-private permissions. Normal SQLite rollback-journal recovery is used.
+    pub fn open(directory: &Path, identity: &Identity) -> Result<Self> {
+        Self::open_existing(directory, identity, false)
+    }
+
+    /// Inspect a pinned private copy of a quiescent existing journal (64 MiB
+    /// maximum). SQLite never receives the original path, even if another
+    /// process changes its mode during inspection. Source bytes, identity and
+    /// recovery state must remain unchanged while opening the snapshot.
+    /// Any rollback/WAL/shared-memory sidecar refuses, even if empty; persisted
+    /// WAL mode also refuses when its sidecars happen to be absent. Later writes
+    /// to the original are not reflected in this read-only snapshot.
+    pub fn open_read_only(directory: &Path, identity: &Identity) -> Result<Self> {
+        Self::open_existing(directory, identity, true)
+    }
+
+    /// Recheck the original namespace and bytes behind this read-only snapshot.
+    /// Used around local evidence publication; it grants no journal transition.
+    pub(crate) fn recheck_read_only_source(&self) -> Result<[u8; 32]> {
+        self.ordinary_inspectable()?;
+        let copy = self
+            ._read_only_copy
+            .as_ref()
+            .context("source recheck requires a journal opened read-only")?;
+        // Opening hashed these bytes into the private copy. A recheck (planning
+        // makes thousands) proves the source still has that opening's
+        // device, inode, size, mtime and ctime, and no recovery sidecar.
+        require_source_unchanged(
+            &self.directory_path,
+            &self.directory,
+            &self.database,
+            &copy.source_metadata,
+            None,
+        )?;
+        Ok(copy.sha256)
+    }
+
+    fn open_existing(directory: &Path, identity: &Identity, read_only: bool) -> Result<Self> {
+        let directory_file = private_directory(directory)?;
+        let path = directory.join(DB_NAME);
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.permissions().mode() & 0o777 == 0o600,
+            "journal must be a private regular file"
+        );
+        let database = OpenOptions::new()
+            .read(true)
+            .write(!read_only)
+            .open(&path)?;
+        let opened = database.metadata()?;
+        ensure!(
+            opened.dev() == metadata.dev() && opened.ino() == metadata.ino(),
+            "journal changed while opening"
+        );
+        let read_only_copy = if read_only {
+            require_quiescent_read_only(directory, &database)?;
+            let copy = ReadOnlyCopy::new(&database, opened.len())?;
+            require_source_unchanged(
+                directory,
+                &directory_file,
+                &database,
+                &opened,
+                Some(copy.sha256),
+            )?;
+            Some(std::sync::Arc::new(copy))
+        } else {
+            None
+        };
+        let connection = match &read_only_copy {
+            Some(copy) => copy.connect()?,
+            None => connect(&path)?,
+        };
+        validate_schema(&connection)?;
+        let (device, library, nonce): (Vec<u8>, Vec<u8>, Vec<u8>) = connection.query_row(
+            "SELECT device,library,nonce FROM scope WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        ensure!(
+            device == identity.device && library == identity.library,
+            "journal belongs to a different device or library"
+        );
+        let nonce = array(&nonce)?;
+        if let Some(copy) = &read_only_copy {
+            require_source_unchanged(
+                directory,
+                &directory_file,
+                &database,
+                &opened,
+                Some(copy.sha256),
+            )?;
+        } else {
+            configure(&connection)?;
+        }
+        Ok(Self {
+            connection,
+            directory: directory_file,
+            directory_path: fs::canonicalize(directory)?,
+            database,
+            nonce,
+            poisoned: false,
+            _read_only_copy: read_only_copy,
+        })
+    }
+
+    /// Append-only versions for one binding lifetime; does not include other lifetimes.
+    #[cfg(test)]
+    pub fn binding_history(
+        &self,
+        id: BindingId,
+        after_version: u32,
+        limit: u32,
+    ) -> Result<Vec<bindings::BindingVersion>> {
+        self.ordinary_inspectable()?;
+        bindings::history(&self.connection, id, after_version, limit)
+    }
+
     /// Stable lifetime identity for an active binding.
     #[cfg(test)]
     pub fn active_binding_id(
@@ -354,6 +520,32 @@ impl Journal {
             "journal does not belong to the observed device and library"
         );
         Ok(())
+    }
+
+    /// Active verified content only. Pending or retired lifetimes never become
+    /// active ownership.
+    pub fn active_verified_bindings(&self) -> Result<Vec<Binding>> {
+        self.ordinary_inspectable()?;
+        let mut statement = self
+            .connection
+            .prepare(&binding_query(" ORDER BY audio LIMIT 50001"))?;
+        let mut bindings = Vec::new();
+        for row in statement.query_map([], read_binding)? {
+            ensure!(
+                bindings.len() < 50_000,
+                "journal binding inventory exceeds limit"
+            );
+            bindings.push(decode_binding(row?)?);
+        }
+        Ok(bindings)
+    }
+
+    /// The absolute source path each active binding records, by track: what
+    /// a pull matched or what an insertion sent. A binding that records none
+    /// is named only through retained run history.
+    pub fn recorded_sources(&self) -> Result<std::collections::BTreeMap<u64, PathBuf>> {
+        self.ordinary_inspectable()?;
+        bindings::recorded_sources(&self.connection)
     }
 
     /// Record the absolute source path a verified single insertion sent, so a
@@ -424,6 +616,107 @@ impl Journal {
             }
             _ => anyhow::bail!("stored start evidence disagrees with attempt state"),
         }
+    }
+
+    /// Includes every reservation, cancelled attempts' too, and every removed
+    /// row's identity. Historical native identities never recycle.
+    pub fn reserved_pids(&self) -> Result<BTreeSet<u64>> {
+        self.ordinary_inspectable()?;
+        reservation_values(&self.connection, 1)?
+            .into_iter()
+            .map(|b| Ok(u64::from_be_bytes(array(&b)?)))
+            .collect()
+    }
+    pub fn reserved_cache_ids(&self) -> Result<BTreeSet<u32>> {
+        self.ordinary_inspectable()?;
+        reservation_values(&self.connection, 2)?
+            .into_iter()
+            .map(|b| Ok(u32::from_be_bytes(array(&b)?)))
+            .collect()
+    }
+    /// ASCII-folded safe Music paths, removed MP3 rows' included. Insertion
+    /// generation and Content validation keep their strict generated M4A shape.
+    pub fn reserved_paths(&self) -> Result<BTreeSet<String>> {
+        self.ordinary_inspectable()?;
+        reservation_values(&self.connection, 3)?
+            .into_iter()
+            .map(|b| Ok(String::from_utf8(b)?))
+            .collect()
+    }
+
+    pub fn prepare(&mut self, prepared: PreparedAttempt) -> Result<AttemptId> {
+        self.ordinary_usable()?;
+        validate_prepared(&prepared)?;
+        prepared.content.source.require_alac()?;
+        let content = encode_content(&prepared.content)?;
+        let operation_sha: [u8; 32] = Sha256::digest(&prepared.operation).into();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_idle(&transaction)?;
+        match prepared.kind {
+            AttemptKind::Insert => ensure!(
+                lookup(&transaction, &prepared.content.source.audio.sha256)?.is_none(),
+                "encoded audio is already bound; do not reinsert"
+            ),
+            AttemptKind::Artwork => {
+                let binding = lookup(&transaction, &prepared.content.source.audio.sha256)?
+                    .context("artwork requires an existing verified binding")?;
+                let mut expected = binding.content;
+                expected.artwork = prepared.content.artwork.clone();
+                ensure!(
+                    expected == prepared.content,
+                    "artwork must retain the existing audio binding and collection"
+                );
+            }
+        }
+        bindings::prepare(&transaction, &prepared, &content, operation_sha)?;
+        let id = AttemptId(transaction.last_insert_rowid());
+        // ordinary_usable admitted this writer, so an Active coordination is
+        // the one whose permit this process holds: the attempt is its next step.
+        if let Some(coordination) = coordination::active_id(&transaction)? {
+            coordination::link_step(
+                &transaction,
+                coordination::CoordinationId(coordination),
+                coordination::Work::Attempt(id),
+            )?;
+        }
+        if prepared.kind == AttemptKind::Insert {
+            for pid in [
+                Some(prepared.content.track_pid),
+                prepared.new_album_pid,
+                prepared.new_artist_pid,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                reserve(&transaction, 1, &pid.to_be_bytes(), Some(id), false)?;
+            }
+            reserve(
+                &transaction,
+                3,
+                prepared.content.path.to_ascii_lowercase().as_bytes(),
+                Some(id),
+                false,
+            )?;
+        }
+        if let Some(artwork) = &prepared.content.artwork {
+            reserve(
+                &transaction,
+                2,
+                &artwork.cache_id.to_be_bytes(),
+                Some(id),
+                false,
+            )?;
+        }
+        bindings::database_bound(&transaction, 4 * 1024 * 1024)?;
+        durable_commit(
+            transaction,
+            &self.database,
+            &self.directory,
+            &mut self.poisoned,
+        )?;
+        Ok(id)
     }
 
     pub fn cancel_prepared(&mut self, id: AttemptId) -> Result<()> {
@@ -633,6 +926,24 @@ impl Journal {
     }
 }
 
+fn private_directory(path: &Path) -> Result<File> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir() && metadata.permissions().mode() & 0o777 == 0o700,
+        "journal directory must be private and nonsymlink"
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        opened.dev() == metadata.dev() && opened.ino() == metadata.ino(),
+        "journal directory changed while opening"
+    );
+    Ok(file)
+}
+
 fn connect(path: &Path) -> Result<Connection> {
     connect_existing(path, false)
 }
@@ -665,6 +976,40 @@ struct ReadOnlyCopy {
 }
 
 impl ReadOnlyCopy {
+    fn new(source: &File, bytes: u64) -> Result<Self> {
+        ensure!(
+            (512..=MAX_READ_ONLY_DATABASE).contains(&bytes),
+            "read-only journal exceeds supported database size"
+        );
+        for _ in 0..32 {
+            let directory = std::env::temp_dir().join(format!(
+                "rustunes-journal-read-{}-{}",
+                std::process::id(),
+                READ_ONLY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&directory) {
+                Ok(()) => {
+                    let mut copy = Self {
+                        directory,
+                        sha256: [0; 32],
+                        source_metadata: source.metadata()?,
+                        schema_checked: std::sync::OnceLock::new(),
+                    };
+                    let mut destination = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(copy.directory.join(DB_NAME))?;
+                    copy.sha256 = read_only_bytes(source, bytes, &mut destination)?;
+                    return Ok(copy);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).context("create private journal inspection copy"),
+            }
+        }
+        bail!("cannot allocate private journal inspection copy")
+    }
+
     fn connect(&self) -> Result<Connection> {
         let connection = connect_existing(&self.directory.join(DB_NAME), true)?;
         connection.pragma_update(None, "query_only", true)?;
@@ -708,6 +1053,48 @@ fn read_only_bytes(source: &File, bytes: u64, output: &mut impl Write) -> Result
         "journal grew during read-only opening"
     );
     Ok(hash.finalize().into())
+}
+
+fn require_source_unchanged(
+    directory: &Path,
+    directory_file: &File,
+    database: &File,
+    before: &fs::Metadata,
+    expected_sha256: Option<[u8; 32]>,
+) -> Result<()> {
+    require_quiescent_read_only(directory, database)?;
+    let current_directory = private_directory(directory)?;
+    let held = directory_file.metadata()?;
+    let current = current_directory.metadata()?;
+    ensure!(
+        held.dev() == current.dev() && held.ino() == current.ino(),
+        "journal directory changed during read-only opening"
+    );
+    if let Some(expected_sha256) = expected_sha256 {
+        ensure!(
+            read_only_bytes(database, before.len(), &mut std::io::sink())? == expected_sha256,
+            "journal bytes changed during read-only opening"
+        );
+    }
+    let path = fs::symlink_metadata(directory.join(DB_NAME))?;
+    let opened = database.metadata()?;
+    for after in [&path, &opened] {
+        ensure!(
+            after.is_file()
+                && after.nlink() == 1
+                && after.permissions().mode() & 0o777 == 0o600
+                && after.dev() == before.dev()
+                && after.ino() == before.ino()
+                && after.len() == before.len()
+                && after.mtime() == before.mtime()
+                && after.mtime_nsec() == before.mtime_nsec()
+                && after.ctime() == before.ctime()
+                && after.ctime_nsec() == before.ctime_nsec(),
+            "journal changed during read-only opening"
+        );
+    }
+    require_quiescent_read_only(directory, database)?;
+    Ok(())
 }
 
 fn require_quiescent_read_only(directory: &Path, database: &File) -> Result<()> {
@@ -812,6 +1199,32 @@ fn validate_path_key(value: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn validate_schema(connection: &Connection) -> Result<()> {
+    ensure!(
+        connection.query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))?
+            == APPLICATION_ID,
+        "not a journal"
+    );
+    // Compare SQLite's canonical stored DDL, including constraints and triggers.
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(SCHEMA)?;
+    fn definitions(connection: &Connection) -> Result<Vec<(String, String)>> {
+        let mut query = connection
+            .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")?;
+        Ok(query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    if definitions(connection)? != definitions(&reference)? {
+        return Err(Superseded("its schema differs from this build's").into());
+    }
+    ensure!(
+        connection.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))? == "ok",
+        "journal integrity check failed"
+    );
+    insertion_batch::validate_storage(connection)
+}
+
 fn durable_commit(
     transaction: Transaction<'_>,
     database: &File,
@@ -836,6 +1249,55 @@ fn ensure_idle(connection: &Connection) -> Result<()> {
         "an outstanding attempt requires completion, cancellation, or reconciliation"
     );
     coordination::ensure_no_outstanding_batch(connection)
+}
+
+fn reservation_values(c: &Connection, namespace: i64) -> Result<BTreeSet<Vec<u8>>> {
+    let mut out = BTreeSet::new();
+    let mut q =
+        c.prepare("SELECT DISTINCT value FROM reservations WHERE namespace=?1 LIMIT 250001")?;
+    let mut rows = q.query([namespace])?;
+    while let Some(row) = rows.next()? {
+        ensure!(out.len() < 250_000, "namespace inventory exceeds bound");
+        let value: Vec<u8> = row.get(0)?;
+        match namespace {
+            1 => ensure!(u64::from_be_bytes(array(&value)?) != 0, "zero reserved PID"),
+            2 => ensure!(
+                u32::from_be_bytes(array(&value)?) >= 100,
+                "invalid reserved cache ID"
+            ),
+            3 => {
+                decode_reserved_path(&value)?;
+            }
+            _ => bail!("invalid namespace"),
+        }
+        out.insert(value);
+    }
+    // Rows a removal batch names are gone or going: their identities and
+    // paths never return, whatever became of the batch.
+    let column = match namespace {
+        1 => "track",
+        3 => "lower(path)",
+        _ => return Ok(out),
+    };
+    let mut q = c.prepare(&format!(
+        "SELECT DISTINCT {column} FROM removal_targets WHERE {column} IS NOT NULL LIMIT 250001"
+    ))?;
+    let mut rows = q.query([])?;
+    while let Some(row) = rows.next()? {
+        ensure!(out.len() < 250_000, "namespace inventory exceeds bound");
+        let value: Vec<u8> = if namespace == 1 {
+            row.get(0)?
+        } else {
+            row.get::<_, String>(0)?.into_bytes()
+        };
+        if namespace == 1 {
+            ensure!(u64::from_be_bytes(array(&value)?) != 0, "zero reserved PID");
+        } else {
+            validate_path_key(&value)?;
+        }
+        out.insert(value);
+    }
+    Ok(out)
 }
 
 fn reserve(

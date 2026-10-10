@@ -42,6 +42,23 @@ impl Journal {
         self.ordinary_inspectable()?;
         active(&self.connection, audio.encoded_sha256())
     }
+    pub fn active_bindings(&self) -> Result<Vec<ActiveBinding>> {
+        self.ordinary_inspectable()?;
+        let mut q = self
+            .connection
+            .prepare("SELECT audio FROM active_bindings ORDER BY audio LIMIT 50001")?;
+        let mut rows = q.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            ensure!(out.len() < 50_000, "active binding bound exceeded");
+            let hash: Vec<u8> = row.get(0)?;
+            out.push(
+                active(&self.connection, &array::<32>(&hash)?)?
+                    .context("active binding disappeared")?,
+            );
+        }
+        Ok(out)
+    }
     /// The active binding stored under one encoded-audio key, if any.
     pub(crate) fn active_binding_for(&self, audio: &[u8; 32]) -> Result<Option<ActiveBinding>> {
         self.ordinary_inspectable()?;

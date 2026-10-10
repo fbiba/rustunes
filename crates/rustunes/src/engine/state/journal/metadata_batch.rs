@@ -139,6 +139,108 @@ fn validate_intent(intent: &MetadataIntent) -> Result<()> {
     Ok(())
 }
 
+fn load_batch(c: &Connection, id: MetadataBatchId) -> Result<MetadataBatchRecord> {
+    type Raw = (
+        Option<i64>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        u32,
+        [Vec<u8>; 3],
+        String,
+        (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>),
+        Option<u32>,
+    );
+    let raw: Raw = c
+        .query_row(
+            "SELECT coordination,state,operation,operation_sha,base_anchor,before_current,before_index,input_receipt,evidence,ready_receipt,signature,result_receipt,verified_anchor FROM metadata_batches WHERE id=?1",
+            [id.0],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    [r.get(5)?, r.get(6)?, r.get(7)?],
+                    r.get(8)?,
+                    (r.get(9)?, r.get(10)?, r.get(11)?),
+                    r.get(12)?,
+                ))
+            },
+        )
+        .optional()?
+        .context("metadata batch not found")?;
+    ensure!(
+        coordination::digest(&raw.2) == array::<32>(&raw.3)?,
+        "metadata batch operation digest differs"
+    );
+    let mut tracks = Vec::new();
+    {
+        let mut query = c.prepare(
+            "SELECT ordinal,track FROM metadata_targets WHERE batch=?1 ORDER BY ordinal LIMIT 1001",
+        )?;
+        let mut rows = query.query([id.0])?;
+        while let Some(r) = rows.next()? {
+            ensure!(tracks.len() < MAX_TRACKS, "metadata batch target bound");
+            ensure!(
+                usize::try_from(r.get::<_, i64>(0)?)? == tracks.len(),
+                "metadata batch targets have a gap"
+            );
+            tracks.push(u64::from_be_bytes(array(&r.get::<_, Vec<u8>>(1)?)?));
+        }
+    }
+    let [before_current, before_index, input_receipt] = raw.5;
+    let (ready, signature, result) = raw.7;
+    let record = MetadataBatchRecord {
+        id,
+        coordination: raw.0.map(CoordinationId),
+        state: MetadataBatchState::decode(raw.1)?,
+        operation: raw.2,
+        base_anchor: raw.4,
+        before_current: array(&before_current)?,
+        before_index: array(&before_index)?,
+        input_receipt: array(&input_receipt)?,
+        evidence: PathBuf::from(raw.6),
+        ready_receipt: ready.as_deref().map(array).transpose()?,
+        signature: signature.as_deref().map(array).transpose()?,
+        result_receipt: result.as_deref().map(array).transpose()?,
+        verified_anchor: raw.8,
+        tracks,
+    };
+    if record.state != MetadataBatchState::Cancelled || !record.tracks.is_empty() {
+        validate_intent(&MetadataIntent {
+            coordination: record.coordination,
+            operation: record.operation.clone(),
+            base_anchor: record.base_anchor,
+            before_current: record.before_current,
+            before_index: record.before_index,
+            input_receipt: record.input_receipt,
+            evidence: record.evidence.clone(),
+            tracks: record.tracks.clone(),
+        })?;
+    }
+    for receipt in [&record.ready_receipt, &record.result_receipt]
+        .into_iter()
+        .flatten()
+    {
+        nonzero_hash(receipt)?;
+    }
+    if let Some(signature) = &record.signature {
+        ensure!(
+            signature[0] == 1,
+            "invalid metadata batch signature envelope"
+        );
+    }
+    if let Some(anchor) = record.verified_anchor {
+        ensure!(
+            anchor > record.base_anchor,
+            "verified metadata anchor does not cover its revision"
+        );
+    }
+    Ok(record)
+}
+
 /// Cross-table facts of one batch; its own cells were checked by `load_batch`.
 fn validate_batch(c: &Connection, record: &MetadataBatchRecord) -> Result<()> {
     ensure!(
@@ -159,6 +261,33 @@ fn validate_batch(c: &Connection, record: &MetadataBatchRecord) -> Result<()> {
     Ok(())
 }
 
+/// Every metadata batch of a journal, plus the facts that join them.
+pub(super) fn validate_rows(c: &Connection) -> Result<()> {
+    ensure!(
+        c.query_row("SELECT count(*) FROM metadata_batches", [], |r| r
+            .get::<_, i64>(0))?
+            <= coordination::MAX_BATCHES,
+        "metadata batch history bound"
+    );
+    let ids = c
+        .prepare("SELECT id FROM metadata_batches ORDER BY id")?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        let record = load_batch(c, MetadataBatchId(id))?;
+        validate_batch(c, &record)?;
+    }
+    ensure!(
+        !c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata_targets t LEFT JOIN metadata_batches b ON b.id=t.batch WHERE b.id IS NULL)",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "a metadata target names a missing batch"
+    );
+    Ok(())
+}
+
 impl Journal {
     fn metadata_batch_storage(&self) -> Result<()> {
         self.usable()?;
@@ -172,6 +301,114 @@ impl Journal {
             "read-only journal cannot write metadata batch storage"
         );
         Ok(())
+    }
+
+    pub fn metadata_batch(&self, id: MetadataBatchId) -> Result<MetadataBatchRecord> {
+        self.metadata_batch_storage()?;
+        load_batch(&self.connection, id)
+    }
+
+    /// Every metadata batch, oldest first.
+    #[cfg(test)]
+    pub fn metadata_batches(&self) -> Result<Vec<MetadataBatchRecord>> {
+        self.usable()?;
+        let ids = self
+            .connection
+            .prepare("SELECT id FROM metadata_batches ORDER BY id")?
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| load_batch(&self.connection, MetadataBatchId(id)))
+            .collect()
+    }
+
+    /// The single Prepared or Started batch, if any.
+    pub fn outstanding_metadata_batch(&self) -> Result<Option<MetadataBatchRecord>> {
+        self.usable()?;
+        outstanding_id(&self.connection)?
+            .map(|id| load_batch(&self.connection, MetadataBatchId(id)))
+            .transpose()
+    }
+
+    /// Durable local intent only, with its tracks and (for a coordinated
+    /// batch) the coordination's next step in one transaction. This grants no
+    /// native permit.
+    pub fn prepare_metadata_batch(&mut self, intent: &MetadataIntent) -> Result<MetadataBatchId> {
+        self.metadata_batch_writer()?;
+        validate_intent(intent)?;
+        let evidence = coordination::evidence_text(&intent.evidence)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match intent.coordination {
+            Some(id) => ensure!(
+                coordination::active_id(&tx)? == Some(id.as_i64()),
+                "metadata batch names a coordination that is not Active"
+            ),
+            None => coordination::ensure_no_route_owner(&tx)?,
+        }
+        coordination::ensure_quiescent(&tx)?;
+        bindings::database_bound(&tx, 4 * 1024 * 1024)?;
+        tx.execute(
+            "INSERT INTO metadata_batches(coordination,state,operation,operation_sha,base_anchor,before_current,before_index,input_receipt,evidence) VALUES(?1,0,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                intent.coordination.map(|c| c.as_i64()),
+                intent.operation,
+                coordination::digest(&intent.operation),
+                intent.base_anchor,
+                intent.before_current,
+                intent.before_index,
+                intent.input_receipt,
+                evidence
+            ],
+        )?;
+        let id = MetadataBatchId(tx.last_insert_rowid());
+        for (ordinal, track) in intent.tracks.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO metadata_targets(batch,ordinal,track) VALUES(?1,?2,?3)",
+                params![id.0, i64::try_from(ordinal)?, track.to_be_bytes()],
+            )?;
+        }
+        if let Some(coordination) = intent.coordination {
+            coordination::link_step(&tx, coordination, Work::Metadata(id))?;
+        }
+        bindings::database_bound(&tx, 4 * 1024 * 1024)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)?;
+        Ok(id)
+    }
+
+    /// Durable Prepared -> Started before the signed operation is sent. There
+    /// is no retry: a lost `StartedMetadataBatch` requires fresh reconciliation.
+    pub fn start_metadata_batch(
+        &mut self,
+        id: MetadataBatchId,
+        ready_receipt: [u8; 32],
+        signature: [u8; 21],
+    ) -> Result<StartedMetadataBatch> {
+        self.metadata_batch_writer()?;
+        nonzero_hash(&ready_receipt)?;
+        ensure!(signature[0] == 1, "unsupported metadata signature envelope");
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let batch = load_batch(&tx, id)?;
+        ensure!(
+            batch.state == MetadataBatchState::Prepared,
+            "metadata batch already started or closed; reconcile instead of retrying"
+        );
+        ensure!(
+            tx.execute(
+                "UPDATE metadata_batches SET state=1,ready_receipt=?1,signature=?2 WHERE id=?3 AND state=0",
+                params![ready_receipt, signature.as_slice(), id.0],
+            )? == 1,
+            "metadata batch start CAS differs"
+        );
+        bindings::database_bound(&tx, 4 * 1024 * 1024)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)?;
+        Ok(StartedMetadataBatch {
+            operation: batch.operation,
+            signature,
+        })
     }
 
     /// A Prepared batch that never started may be abandoned. Started batches
@@ -209,6 +446,38 @@ impl Journal {
                 params![proof_receipt, id.0],
             )? == 1,
             "only a Started metadata batch can be marked not applied"
+        );
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
+    }
+
+    /// Verify a Started batch from fresh evidence. This releases the journal
+    /// for new writes; no binding changes, because the audio files did not.
+    pub fn settle_metadata_batch(
+        &mut self,
+        id: MetadataBatchId,
+        result_receipt: [u8; 32],
+        verified_anchor: u32,
+    ) -> Result<()> {
+        self.metadata_batch_writer()?;
+        nonzero_hash(&result_receipt)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let batch = load_batch(&tx, id)?;
+        ensure!(
+            batch.state == MetadataBatchState::Started,
+            "metadata batch is not Started"
+        );
+        ensure!(
+            verified_anchor > batch.base_anchor,
+            "verified metadata edit does not cover its revision"
+        );
+        ensure!(
+            tx.execute(
+                "UPDATE metadata_batches SET state=2,result_receipt=?1,verified_anchor=?2 WHERE id=?3 AND state=1",
+                params![result_receipt, verified_anchor, id.0],
+            )? == 1,
+            "metadata batch verification CAS differs"
         );
         durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
     }

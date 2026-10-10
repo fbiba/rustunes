@@ -351,6 +351,33 @@ fn load_coordination(c: &Connection, id: CoordinationId) -> Result<CoordinationR
     })
 }
 
+fn load_steps(c: &Connection, id: CoordinationId) -> Result<Vec<CoordinationStep>> {
+    let mut query = c.prepare(
+        "SELECT step,batch,attempt,insert_batch,metadata_batch FROM coordination_steps WHERE coordination=?1 ORDER BY step",
+    )?;
+    let rows = query
+        .query_map([id.0], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                [r.get::<_, Option<i64>>(1)?, r.get(2)?, r.get(3)?, r.get(4)?],
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .enumerate()
+        .map(|(n, (step, [batch, attempt, insert, metadata]))| {
+            ensure!(usize::try_from(step)? == n, "coordination steps have a gap");
+            Ok(CoordinationStep {
+                step,
+                batch: batch.map(BatchId),
+                attempt: attempt.map(AttemptId),
+                insert_batch: insert.map(InsertBatchId),
+                metadata_batch: metadata.map(MetadataBatchId),
+            })
+        })
+        .collect()
+}
+
 fn validate_target(target: &RemovalTarget) -> Result<()> {
     ensure!(
         target.track != 0 && target.item_pid != 0,
@@ -455,6 +482,268 @@ fn validate_intent(intent: &RemovalIntent) -> Result<()> {
     Ok(())
 }
 
+fn load_batch(c: &Connection, id: BatchId) -> Result<BatchRecord> {
+    type Raw = (
+        Option<i64>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        u32,
+        [Vec<u8>; 3],
+        String,
+        (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>),
+        Option<u32>,
+    );
+    let raw: Raw = c
+        .query_row(
+            "SELECT compensates,state,operation,operation_sha,base_anchor,before_current,before_index,input_receipt,evidence,ready_receipt,signature,result_receipt,verified_anchor FROM removal_batches WHERE id=?1",
+            [id.0],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    [r.get(5)?, r.get(6)?, r.get(7)?],
+                    r.get(8)?,
+                    (r.get(9)?, r.get(10)?, r.get(11)?),
+                    r.get(12)?,
+                ))
+            },
+        )
+        .optional()?
+        .context("removal batch not found")?;
+    ensure!(
+        digest(&raw.2) == array::<32>(&raw.3)?,
+        "removal batch operation digest differs"
+    );
+    let coordination: Option<i64> = c
+        .query_row(
+            "SELECT coordination FROM coordination_steps WHERE batch=?1",
+            [id.0],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let (compensates_insert_batch, with_insert_batch): (Option<i64>, Option<i64>) = c.query_row(
+        "SELECT compensates_insert_batch,with_insert_batch FROM removal_batches WHERE id=?1",
+        [id.0],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut targets = Vec::new();
+    {
+        let mut query = c.prepare("SELECT ordinal,track,item_pid,path,file_bytes,file_sha,binding_id,binding_version FROM removal_targets WHERE batch=?1 ORDER BY ordinal")?;
+        let mut rows = query.query([id.0])?;
+        while let Some(r) = rows.next()? {
+            ensure!(targets.len() < MAX_TARGETS, "removal batch target bound");
+            ensure!(
+                usize::try_from(r.get::<_, i64>(0)?)? == targets.len(),
+                "removal batch targets have a gap"
+            );
+            let bytes: Option<i64> = r.get(4)?;
+            let sha: Option<Vec<u8>> = r.get(5)?;
+            let binding: Option<i64> = r.get(6)?;
+            targets.push(RemovalTarget {
+                track: u64::from_be_bytes(array(&r.get::<_, Vec<u8>>(1)?)?),
+                item_pid: r.get(2)?,
+                path: r.get(3)?,
+                file_bytes: bytes.map(u64::try_from).transpose()?,
+                file_sha256: sha.as_deref().map(array).transpose()?,
+                binding: binding
+                    .map(|b| Ok::<_, anyhow::Error>((BindingId(b), r.get(7)?)))
+                    .transpose()?,
+            });
+        }
+    }
+    let mut playlists = Vec::new();
+    let mut query = c.prepare(
+        "SELECT ordinal,container,name FROM removal_playlists WHERE batch=?1 ORDER BY ordinal",
+    )?;
+    let mut rows = query.query([id.0])?;
+    while let Some(r) = rows.next()? {
+        ensure!(
+            playlists.len() < MAX_TARGETS,
+            "removal batch playlist bound"
+        );
+        ensure!(
+            usize::try_from(r.get::<_, i64>(0)?)? == playlists.len(),
+            "removal batch playlists have a gap"
+        );
+        playlists.push(PlaylistTarget {
+            container: u64::from_be_bytes(array(&r.get::<_, Vec<u8>>(1)?)?),
+            name: r.get(2)?,
+        });
+    }
+    let [before_current, before_index, input_receipt] = raw.5;
+    let (ready, signature, result) = raw.7;
+    let record = BatchRecord {
+        id,
+        coordination: coordination.map(CoordinationId),
+        compensates: raw.0.map(AttemptId),
+        compensates_insert_batch: compensates_insert_batch.map(InsertBatchId),
+        with_insert_batch: with_insert_batch.map(InsertBatchId),
+        state: BatchState::decode(raw.1)?,
+        operation: raw.2,
+        base_anchor: raw.4,
+        before_current: array(&before_current)?,
+        before_index: array(&before_index)?,
+        input_receipt: array(&input_receipt)?,
+        evidence: PathBuf::from(raw.6),
+        ready_receipt: ready.as_deref().map(array).transpose()?,
+        signature: signature.as_deref().map(array).transpose()?,
+        result_receipt: result.as_deref().map(array).transpose()?,
+        verified_anchor: raw.8,
+        targets,
+        playlists,
+    };
+    if record.state != BatchState::Cancelled
+        || !record.targets.is_empty()
+        || !record.playlists.is_empty()
+    {
+        validate_intent(&RemovalIntent {
+            coordination: record.coordination,
+            compensates: record.compensates,
+            compensates_insert_batch: record.compensates_insert_batch,
+            operation: record.operation.clone(),
+            base_anchor: record.base_anchor,
+            before_current: record.before_current,
+            before_index: record.before_index,
+            input_receipt: record.input_receipt,
+            evidence: record.evidence.clone(),
+            targets: record.targets.clone(),
+            playlists: record.playlists.clone(),
+        })?;
+    }
+    for receipt in [&record.ready_receipt, &record.result_receipt]
+        .into_iter()
+        .flatten()
+    {
+        nonzero_hash(receipt)?;
+    }
+    if let Some(signature) = &record.signature {
+        ensure!(
+            signature[0] == 1,
+            "invalid removal batch signature envelope"
+        );
+    }
+    Ok(record)
+}
+
+/// Cross-table facts of one batch; its own cells were checked by `load_batch`.
+fn validate_batch(c: &Connection, record: &BatchRecord) -> Result<()> {
+    ensure!(
+        record.state == BatchState::Cancelled
+            || !record.targets.is_empty()
+            || !record.playlists.is_empty(),
+        "a sent or settled removal batch has no targets"
+    );
+    for target in &record.targets {
+        let Some((id, version)) = target.binding else {
+            continue;
+        };
+        let active: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM active_bindings WHERE binding_id=?1 AND version=?2)",
+            params![id.as_i64(), version],
+            |r| r.get(0),
+        )?;
+        match record.state {
+            BatchState::Verified => ensure!(
+                !active,
+                "a Verified removal batch left an owned target active"
+            ),
+            BatchState::Prepared | BatchState::Started => {
+                ensure!(active, "an outstanding removal batch lost an owned target")
+            }
+            BatchState::Cancelled | BatchState::NotApplied => {}
+        }
+    }
+    if record.state == BatchState::Verified {
+        ensure!(
+            record
+                .verified_anchor
+                .is_some_and(|anchor| anchor > record.base_anchor),
+            "verified removal anchor does not cover its revision"
+        );
+    }
+    if let Some(parent) = record.compensates {
+        let (kind, state): (i64, i64) = c.query_row(
+            "SELECT kind,state FROM attempts WHERE id=?1",
+            [parent.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        ensure!(kind == 1, "compensating batch parent is not an Insert");
+        match record.state {
+            BatchState::Verified => ensure!(state == 4, "compensating batch parent differs"),
+            BatchState::Prepared | BatchState::Started => {
+                ensure!(state == 1, "compensating batch parent is not Started")
+            }
+            BatchState::Cancelled | BatchState::NotApplied => {}
+        }
+    }
+    if let Some(parent) = record.compensates_insert_batch {
+        insertion_batch::validate_compensation(c, parent, record)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_rows(c: &Connection) -> Result<()> {
+    bindings::database_bound(c, 0)?;
+    let count = |sql: &str| -> Result<i64> { Ok(c.query_row(sql, [], |r| r.get(0))?) };
+    ensure!(
+        count("SELECT count(*) FROM coordinations")? <= MAX_COORDINATIONS
+            && count("SELECT count(*) FROM removal_batches")? <= MAX_BATCHES,
+        "coordination history bound"
+    );
+    let ids = c
+        .prepare("SELECT id FROM coordinations ORDER BY id")?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        let id = CoordinationId(id);
+        load_coordination(c, id)?;
+        load_steps(c, id)?;
+    }
+    // Steps may also link an insert batch or a metadata batch.
+    let (joins, missing, open) = (
+        " LEFT JOIN insert_batches i ON i.id=s.insert_batch LEFT JOIN metadata_batches m ON m.id=s.metadata_batch",
+        " OR (s.insert_batch IS NOT NULL AND i.id IS NULL) OR (s.metadata_batch IS NOT NULL AND m.id IS NULL)",
+        " OR i.state IN(0,1,5) OR m.state IN(0,1)",
+    );
+    ensure!(
+        !c.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM coordination_steps s LEFT JOIN removal_batches b ON b.id=s.batch LEFT JOIN attempts a ON a.id=s.attempt{joins} WHERE (s.batch IS NOT NULL AND b.id IS NULL) OR (s.attempt IS NOT NULL AND a.id IS NULL){missing})"),
+            [],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "coordination step names missing work"
+    );
+    ensure!(
+        !c.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM coordination_steps s JOIN coordinations c ON c.id=s.coordination LEFT JOIN removal_batches b ON b.id=s.batch LEFT JOIN attempts a ON a.id=s.attempt{joins} WHERE c.state!=0 AND (b.state IN(0,1) OR a.state IN(0,1){open}))"),
+            [],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "a closed coordination left outstanding work"
+    );
+    let batches = c
+        .prepare("SELECT id FROM removal_batches ORDER BY id")?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in batches {
+        let record = load_batch(c, BatchId(id))?;
+        validate_batch(c, &record)?;
+    }
+    ensure!(
+        !c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM removal_batches b JOIN attempts a ON a.state IN(0,1) WHERE b.state IN(0,1) AND (b.compensates IS NULL OR a.id!=b.compensates))",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "a removal batch and an attempt are outstanding together"
+    );
+    Ok(())
+}
+
 impl Journal {
     /// The ID of the Active coordination that owns the journal until it
     /// closes.
@@ -487,6 +776,27 @@ impl Journal {
     pub fn coordination(&self, id: CoordinationId) -> Result<CoordinationRecord> {
         self.coordination_storage()?;
         load_coordination(&self.connection, id)
+    }
+
+    /// Every coordination, oldest first.
+    #[cfg(test)]
+    pub fn coordinations(&self) -> Result<Vec<CoordinationRecord>> {
+        self.usable()?;
+        let ids = self
+            .connection
+            .prepare("SELECT id FROM coordinations ORDER BY id")?
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| load_coordination(&self.connection, CoordinationId(id)))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn coordination_steps(&self, id: CoordinationId) -> Result<Vec<CoordinationStep>> {
+        self.coordination_storage()?;
+        load_coordination(&self.connection, id)?;
+        load_steps(&self.connection, id)
     }
 
     /// Start a coordination on an idle journal with no Active coordination.
@@ -556,6 +866,39 @@ impl Journal {
         Ok(expected_revision + 1)
     }
 
+    /// Close an Active coordination as Completed. No attempt, batch or
+    /// compensation may be outstanding.
+    pub fn complete_coordination(
+        &mut self,
+        id: CoordinationId,
+        expected_revision: u64,
+        outcome: &[u8],
+    ) -> Result<()> {
+        self.coordination_writer()?;
+        ensure!(
+            (2..=MAX_OUTCOME).contains(&outcome.len()),
+            "coordination outcome exceeds bounds"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_coordination(&tx, id)?;
+        ensure!(
+            current.state == CoordinationState::Active && current.revision == expected_revision,
+            "stale or closed coordination revision"
+        );
+        ensure_quiescent(&tx)?;
+        ensure!(
+            tx.execute(
+                "UPDATE coordinations SET state=1,outcome=?1,revision=revision+1 WHERE id=?2 AND state=0 AND revision=?3",
+                params![outcome, id.0, i64::try_from(expected_revision)?],
+            )? == 1,
+            "coordination revision CAS differs"
+        );
+        validate_rows(&tx)?;
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
+    }
+
     /// Admit this process as the Active coordination's writer. Ordinary
     /// journal writes opened by the coordinator pass the ownership check until
     /// the returned permit drops. One permit exists at a time per process.
@@ -571,6 +914,25 @@ impl Journal {
         Ok(CoordinationPermit(()))
     }
 
+    pub fn removal_batch(&self, id: BatchId) -> Result<BatchRecord> {
+        self.coordination_storage()?;
+        load_batch(&self.connection, id)
+    }
+
+    /// Every removal batch, oldest first.
+    #[cfg(test)]
+    pub fn removal_batches(&self) -> Result<Vec<BatchRecord>> {
+        self.usable()?;
+        let ids = self
+            .connection
+            .prepare("SELECT id FROM removal_batches ORDER BY id")?
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| load_batch(&self.connection, BatchId(id)))
+            .collect()
+    }
+
     /// Playlists the Verified removal batches of coordination `id` deleted.
     pub fn coordination_deleted_playlists(&self, id: CoordinationId) -> Result<usize> {
         self.usable()?;
@@ -580,6 +942,51 @@ impl Journal {
             |r| r.get(0),
         )?;
         Ok(usize::try_from(count)?)
+    }
+
+    /// Tracks of every removal batch the phone did not apply. Such a session
+    /// may still have deleted a target's file before the phone rolled it back.
+    pub fn not_applied_removal_tracks(&self) -> Result<BTreeSet<u64>> {
+        self.usable()?;
+        let mut tracks = BTreeSet::new();
+        let mut query = self.connection.prepare(
+            "SELECT DISTINCT t.track FROM removal_targets t JOIN removal_batches b ON b.id=t.batch WHERE b.state=4",
+        )?;
+        let mut rows = query.query([])?;
+        while let Some(r) = rows.next()? {
+            tracks.insert(u64::from_be_bytes(array(&r.get::<_, Vec<u8>>(0)?)?));
+        }
+        Ok(tracks)
+    }
+
+    /// The single Prepared or Started batch, if any.
+    pub fn outstanding_removal_batch(&self) -> Result<Option<BatchRecord>> {
+        self.usable()?;
+        outstanding_batch_id(&self.connection)?
+            .map(|id| load_batch(&self.connection, BatchId(id)))
+            .transpose()
+    }
+
+    pub fn removal_batch_counts(&self) -> Result<BatchCounts> {
+        self.usable()?;
+        let mut counts = BatchCounts::default();
+        let mut query = self
+            .connection
+            .prepare("SELECT state,count(*) FROM removal_batches GROUP BY state")?;
+        let rows = query
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (state, n) in rows {
+            let n = u64::try_from(n)?;
+            match BatchState::decode(state)? {
+                BatchState::Prepared => counts.prepared = n,
+                BatchState::Started => counts.started = n,
+                BatchState::Verified => counts.verified = n,
+                BatchState::Cancelled => counts.cancelled = n,
+                BatchState::NotApplied => counts.not_applied = n,
+            }
+        }
+        Ok(counts)
     }
 }
 
@@ -605,5 +1012,26 @@ fn check_owned_target(c: &Connection, target: &RemovalTarget) -> Result<()> {
                 .is_none_or(|p| p.eq_ignore_ascii_case(&path)),
         "removal target differs from its binding"
     );
+    Ok(())
+}
+
+/// Append `work` as the next step of an Active coordination.
+pub(super) fn link_step(c: &Connection, coordination: CoordinationId, work: Work) -> Result<()> {
+    let step: i64 = c.query_row(
+        "SELECT count(*) FROM coordination_steps WHERE coordination=?1",
+        [coordination.0],
+        |r| r.get(0),
+    )?;
+    let (column, id) = match work {
+        Work::Removal(id) => ("batch", id.0),
+        Work::Attempt(id) => ("attempt", id.0),
+        Work::Insert(id) => ("insert_batch", id.0),
+        Work::Metadata(id) => ("metadata_batch", id.0),
+    };
+    c.execute(
+        &format!("INSERT INTO coordination_steps(coordination,step,{column}) VALUES(?1,?2,?3)"),
+        params![coordination.0, step, id],
+    )
+    .context("coordination step conflicts with an existing link")?;
     Ok(())
 }
