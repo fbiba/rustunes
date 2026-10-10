@@ -7,6 +7,7 @@
 //!
 //! At most one native write of any kind is outstanding, enforced in Rust and by
 //! triggers in every direction; see `insertion_batch` for the shared rules.
+use super::coordination::{self, CoordinationId, Work};
 use super::*;
 
 pub(super) const OUTSTANDING_BATCH: &str = "an outstanding metadata batch requires settlement";
@@ -20,6 +21,23 @@ pub(super) fn outstanding_id(c: &Connection) -> Result<Option<i64>> {
         |r| r.get(0),
     )
     .optional()?)
+}
+
+/// Fresh observations bound into the Prepared row. The operation is the exact
+/// signed metadata operation, so its timestamp is fixed at preparation.
+#[derive(Clone)]
+pub struct MetadataIntent {
+    /// The Active coordination this batch is the next step of, if any.
+    pub coordination: Option<CoordinationId>,
+    pub operation: Vec<u8>,
+    pub base_anchor: u32,
+    pub before_current: [u8; 32],
+    pub before_index: [u8; 32],
+    pub input_receipt: [u8; 32],
+    /// Absolute run directory holding the saved Before evidence.
+    pub evidence: PathBuf,
+    /// The tracks the operation edits, in operation order.
+    pub tracks: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -60,6 +78,23 @@ impl MetadataBatchState {
         })
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataBatchRecord {
+    pub id: MetadataBatchId,
+    pub coordination: Option<CoordinationId>,
+    pub state: MetadataBatchState,
+    pub operation: Vec<u8>,
+    pub base_anchor: u32,
+    pub before_current: [u8; 32],
+    pub before_index: [u8; 32],
+    pub input_receipt: [u8; 32],
+    pub evidence: PathBuf,
+    pub ready_receipt: Option<[u8; 32]>,
+    pub signature: Option<[u8; 21]>,
+    pub result_receipt: Option<[u8; 32]>,
+    pub verified_anchor: Option<u32>,
+    pub tracks: Vec<u64>,
+}
 /// Returned only after the durable Started commit. Not Clone: one send. A lost
 /// value requires fresh reconciliation, never another permit.
 pub struct StartedMetadataBatch {
@@ -73,6 +108,55 @@ impl StartedMetadataBatch {
     pub fn signature(&self) -> &[u8; 21] {
         &self.signature
     }
+}
+
+fn validate_intent(intent: &MetadataIntent) -> Result<()> {
+    ensure!(
+        !intent.operation.is_empty() && intent.operation.len() <= MAX_OPERATION,
+        "metadata operation exceeds bounds"
+    );
+    ensure!(
+        intent.base_anchor < u32::MAX,
+        "metadata base anchor exhausted"
+    );
+    for hash in [
+        &intent.before_current,
+        &intent.before_index,
+        &intent.input_receipt,
+    ] {
+        nonzero_hash(hash)?;
+    }
+    coordination::evidence_text(&intent.evidence)?;
+    ensure!(
+        !intent.tracks.is_empty() && intent.tracks.len() <= MAX_TRACKS,
+        "a metadata batch edits between one and {MAX_TRACKS} tracks"
+    );
+    let mut seen = BTreeSet::new();
+    for track in &intent.tracks {
+        ensure!(*track != 0, "invalid metadata batch track identity");
+        ensure!(seen.insert(*track), "metadata batch lists a track twice");
+    }
+    Ok(())
+}
+
+/// Cross-table facts of one batch; its own cells were checked by `load_batch`.
+fn validate_batch(c: &Connection, record: &MetadataBatchRecord) -> Result<()> {
+    ensure!(
+        record.state == MetadataBatchState::Cancelled || !record.tracks.is_empty(),
+        "a sent or settled metadata batch has no targets"
+    );
+    let step: Option<i64> = c
+        .query_row(
+            "SELECT coordination FROM coordination_steps WHERE metadata_batch=?1",
+            [record.id.0],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ensure!(
+        step == record.coordination.map(|id| id.as_i64()),
+        "metadata batch coordination differs from its step"
+    );
+    Ok(())
 }
 
 impl Journal {

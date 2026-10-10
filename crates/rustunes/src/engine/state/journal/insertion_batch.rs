@@ -16,6 +16,7 @@
 //! A target the phone created and deleted again within the session has
 //! outcome 4; a batch whose unbound targets were all deleted that way settles
 //! Compensated directly.
+use super::coordination::{self, CoordinationId, Work};
 use super::*;
 use std::collections::BTreeMap;
 
@@ -171,6 +172,21 @@ impl Conversion {
         Ok(())
     }
 }
+/// Fresh observations bound into the Prepared row. The operation is the exact
+/// signed metadata operation, so its timestamp is fixed at preparation.
+#[derive(Clone)]
+pub struct InsertIntent {
+    /// The Active coordination this batch is the next step of, if any.
+    pub coordination: Option<CoordinationId>,
+    pub operation: Vec<u8>,
+    pub base_anchor: u32,
+    pub before_current: [u8; 32],
+    pub before_index: [u8; 32],
+    pub input_receipt: [u8; 32],
+    /// Absolute run directory holding the saved Before evidence.
+    pub evidence: PathBuf,
+    pub targets: Vec<InsertTarget>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InsertBatchId(pub(super) i64);
@@ -252,6 +268,23 @@ pub struct InsertTargetRecord {
     /// The binding version a bound target created.
     pub binding: Option<(BindingId, u32)>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InsertBatchRecord {
+    pub id: InsertBatchId,
+    pub coordination: Option<CoordinationId>,
+    pub state: InsertBatchState,
+    pub operation: Vec<u8>,
+    pub base_anchor: u32,
+    pub before_current: [u8; 32],
+    pub before_index: [u8; 32],
+    pub input_receipt: [u8; 32],
+    pub evidence: PathBuf,
+    pub ready_receipt: Option<[u8; 32]>,
+    pub signature: Option<[u8; 21]>,
+    pub result_receipt: Option<[u8; 32]>,
+    pub verified_anchor: Option<u32>,
+    pub targets: Vec<InsertTargetRecord>,
+}
 /// Insert batches by state.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -288,6 +321,85 @@ impl music_protocol::protocol::session::StartedOperation for StartedInsertBatch 
     }
 }
 
+/// The tracks, paths, audio and collections of one batch must be distinct
+/// from each other, and each target's content and conversion valid.
+fn validate_intent(intent: &InsertIntent) -> Result<()> {
+    ensure!(
+        !intent.operation.is_empty() && intent.operation.len() <= MAX_OPERATION,
+        "insert operation exceeds bounds"
+    );
+    ensure!(
+        intent.base_anchor < u32::MAX,
+        "insert base anchor exhausted"
+    );
+    for hash in [
+        &intent.before_current,
+        &intent.before_index,
+        &intent.input_receipt,
+    ] {
+        nonzero_hash(hash)?;
+    }
+    coordination::evidence_text(&intent.evidence)?;
+    ensure!(
+        !intent.targets.is_empty() && intent.targets.len() <= coordination::MAX_TARGETS,
+        "an insert batch inserts between one and {} tracks",
+        coordination::MAX_TARGETS
+    );
+    let (mut tracks, mut paths, mut audio) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let (mut albums, mut artists, mut caches) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let mut converted = BTreeSet::new();
+    for target in &intent.targets {
+        let content = &target.content;
+        // ALAC or MP3 (`validate_content` checks the path's extension). A
+        // cover rides in the same session under its own new cache ID.
+        validate_content(content)?;
+        if let Some(conversion) = &target.conversion {
+            conversion.validate()?;
+            ensure!(content.source.is_alac(), "only an ALAC target is converted");
+            ensure!(
+                converted.insert(conversion.source_audio),
+                "insert batch converts the same audio twice"
+            );
+        }
+        if let Some(artwork) = &content.artwork {
+            ensure!(
+                caches.insert(artwork.cache_id),
+                "insert batch lists an artwork cache ID twice"
+            );
+        }
+        ensure!(
+            tracks.insert(content.track_pid),
+            "insert batch lists a track twice"
+        );
+        ensure!(
+            paths.insert(content.path.to_ascii_lowercase()),
+            "insert batch lists a path twice"
+        );
+        ensure!(
+            audio.insert(content.source.audio.sha256),
+            "insert batch lists the same audio twice"
+        );
+        for (pid, set) in [
+            (target.new_album_pid, &mut albums),
+            (target.new_artist_pid, &mut artists),
+        ] {
+            if let Some(pid) = pid {
+                ensure!(pid != 0, "new identities must be nonzero and distinct");
+                set.insert(pid);
+            }
+        }
+        ensure!(
+            target.new_album_pid.is_none() || target.new_album_pid != target.new_artist_pid,
+            "new identities must be nonzero and distinct"
+        );
+    }
+    ensure!(
+        albums.is_disjoint(&artists) && albums.is_disjoint(&tracks) && artists.is_disjoint(&tracks),
+        "new identities must be nonzero and distinct"
+    );
+    Ok(())
+}
+
 /// The artwork cache IDs an insert batch reserves in namespace 2, one per cover.
 fn reserved_caches(targets: &[InsertTarget]) -> impl Iterator<Item = u32> + '_ {
     targets
@@ -313,6 +425,68 @@ fn reserved_pids(targets: &[InsertTarget]) -> Vec<u64> {
         }
     }
     out
+}
+
+/// The reservations an insert batch owns, with whether each is consumed: every
+/// track, path and cover cache ID, and every collection it allocates; bound
+/// targets (and the collections they use) are consumed.
+fn expected_reservations(record: &InsertBatchRecord) -> BTreeMap<(i64, Vec<u8>), bool> {
+    let mut out = BTreeMap::new();
+    for t in &record.targets {
+        let bound = t.outcome == Some(TargetOutcome::Bound);
+        let content = &t.target.content;
+        out.insert((1, content.track_pid.to_be_bytes().to_vec()), bound);
+        out.insert((3, content.path.to_ascii_lowercase().into_bytes()), bound);
+        if let Some(artwork) = &content.artwork {
+            out.insert((2, artwork.cache_id.to_be_bytes().to_vec()), bound);
+        }
+        for pid in [t.target.new_album_pid, t.target.new_artist_pid]
+            .into_iter()
+            .flatten()
+        {
+            *out.entry((1, pid.to_be_bytes().to_vec())).or_insert(false) |= bound;
+        }
+    }
+    out
+}
+
+/// The first version of a bound target's binding is what its batch created.
+fn validate_binding(
+    c: &Connection,
+    record: &InsertBatchRecord,
+    content: &Content,
+    binding: BindingId,
+) -> Result<()> {
+    type Row = (Vec<u8>, i64, Option<i64>, Vec<u8>, i64, Option<i64>, i64);
+    let (audio, provenance, first, stored, anchor, attempt, kind): Row = c
+        .query_row(
+            "SELECT r.audio,r.provenance,r.first_attempt,v.content,v.anchor,v.attempt,v.receipt_kind FROM binding_records r JOIN binding_versions v ON v.binding_id=r.id AND v.version=1 WHERE r.id=?1 AND r.track=?2 AND r.path=?3",
+            params![binding.as_i64(), content.track_pid.to_be_bytes(), content.path],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .context("bound insert target lost its binding")?;
+    ensure!(
+        audio == content.source.audio.sha256
+            && provenance == 2
+            && first.is_none()
+            && attempt.is_none()
+            && kind == 3
+            && stored == encode_content(content)?
+            && Some(u32::try_from(anchor)?) == record.verified_anchor,
+        "a bound insert target differs from its binding"
+    );
+    Ok(())
 }
 
 /// The verified compensating removal batch took `removed` locationless rows

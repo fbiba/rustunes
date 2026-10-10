@@ -148,3 +148,26 @@ pub(super) fn store_binding(
     }
     database_bound(c, 0)
 }
+
+pub(super) fn binding_at(
+    c: &Connection,
+    reference: BindingRef,
+    require_active: bool,
+) -> Result<Binding> {
+    ensure!(
+        reference.id.as_i64() > 0 && reference.version > 0,
+        "invalid binding reference"
+    );
+    if require_active {
+        ensure!(
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM active_bindings WHERE binding_id=?1 AND version=?2)",
+                params![reference.id.as_i64(), reference.version],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "binding reference is not current active version"
+        );
+    }
+    let raw=c.query_row("SELECT r.audio,v.content,v.receipt,v.anchor,r.track,r.path,v.receipt_kind FROM binding_records r JOIN binding_versions v ON v.binding_id=r.id WHERE r.id=?1 AND v.version=?2",params![reference.id.as_i64(),reference.version],read_binding).context("binding reference not found")?;
+    decode_binding(raw)
+}

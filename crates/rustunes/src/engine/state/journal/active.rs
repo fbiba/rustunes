@@ -47,6 +47,14 @@ impl Journal {
         self.ordinary_inspectable()?;
         active(&self.connection, audio)
     }
+    /// An outstanding removal batch, insert batch or metadata batch is
+    /// outstanding work too, but not an attempt: it refuses here
+    /// with its own message.
+    pub fn outstanding(&self) -> Result<Option<Attempt>> {
+        self.ordinary_inspectable()?;
+        coordination::ensure_no_outstanding_batch(&self.connection)?;
+        self.outstanding_attempt()
+    }
     /// The outstanding attempt alone, ignoring any outstanding batch. Status
     /// shows it beside them.
     pub(crate) fn outstanding_attempt(&self) -> Result<Option<Attempt>> {

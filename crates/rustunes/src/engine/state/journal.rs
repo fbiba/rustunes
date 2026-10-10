@@ -34,9 +34,21 @@ const SCHEMA: &str = include_str!("journal/schema.sql");
 
 mod active;
 
-mod insertion_batch;
-mod metadata_batch;
+mod coordination;
 mod rows;
+pub use coordination::{
+    BatchCounts, BatchId, BatchRecord, BatchState, CoordinationId, CoordinationKind,
+    CoordinationRecord, PlaylistTarget, RemovalIntent, RemovalTarget, StartedBatch,
+};
+mod insertion_batch;
+pub use insertion_batch::{
+    Conversion, InsertBatchId, InsertBatchRecord, InsertBatchState, InsertIntent, InsertTarget,
+    TargetOutcome,
+};
+mod metadata_batch;
+pub use metadata_batch::{
+    MetadataBatchId, MetadataBatchRecord, MetadataBatchState, MetadataIntent, StartedMetadataBatch,
+};
 
 mod bindings;
 pub use active::{BindingRef, JournalHistorySummary};
@@ -344,6 +356,30 @@ impl Journal {
         Ok(())
     }
 
+    /// Record the absolute source path a verified single insertion sent, so a
+    /// journal pulled later keeps it. A binding that records one keeps it.
+    pub fn record_source(&mut self, track_pid: u64, source: &Path) -> Result<()> {
+        self.ordinary_usable()?;
+        ensure!(
+            self._read_only_copy.is_none(),
+            "read-only journal cannot record a source"
+        );
+        let source = source.to_str().context("source path is not UTF-8")?;
+        ensure!(
+            source.starts_with('/') && (2..=4096).contains(&source.len()),
+            "source path must be absolute"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let bound = tx.execute(
+            "INSERT OR IGNORE INTO binding_sources SELECT r.id,?2 FROM active_bindings a JOIN binding_records r ON r.id=a.binding_id WHERE r.track=?1",
+            params![track_pid.to_be_bytes(), source],
+        )?;
+        ensure!(bound <= 1, "track is bound more than once");
+        durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
+    }
+
     pub fn attempt(&self, id: AttemptId) -> Result<Attempt> {
         self.ordinary_inspectable()?;
         load_attempt(&self.connection, id)
@@ -388,6 +424,95 @@ impl Journal {
             }
             _ => anyhow::bail!("stored start evidence disagrees with attempt state"),
         }
+    }
+
+    pub fn cancel_prepared(&mut self, id: AttemptId) -> Result<()> {
+        self.ordinary_usable()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(
+            transaction.execute(
+                "UPDATE attempts SET state=3 WHERE id=?1 AND state=0",
+                [id.0]
+            )? == 1,
+            "only an unstarted Prepared attempt may be cancelled"
+        );
+        durable_commit(
+            transaction,
+            &self.database,
+            &self.directory,
+            &mut self.poisoned,
+        )
+    }
+
+    pub fn mark_started(
+        &mut self,
+        id: AttemptId,
+        evidence: StartEvidence,
+    ) -> Result<StartedPermit> {
+        self.ordinary_usable()?;
+        nonzero_hash(&evidence.ready_receipt_sha256)?;
+        ensure!(
+            evidence.signature[0] == 1,
+            "unsupported metadata signature envelope"
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = load_attempt(&transaction, id)?;
+        attempt.prepared.content.source.require_alac()?;
+        ensure!(
+            attempt.state == AttemptState::Prepared,
+            "attempt already started or closed; reconcile instead of retrying"
+        );
+        ensure!(
+            evidence.ready_media_anchor == attempt.prepared.current_media_anchor,
+            "fresh Ready anchor differs from preparation"
+        );
+        transaction.execute(
+            "UPDATE attempts SET state=1,ready_receipt=?1,signature=?2 WHERE id=?3",
+            params![
+                evidence.ready_receipt_sha256,
+                evidence.signature.as_slice(),
+                id.0
+            ],
+        )?;
+        bindings::database_bound(&transaction, 4 * 1024 * 1024)?;
+        durable_commit(
+            transaction,
+            &self.database,
+            &self.directory,
+            &mut self.poisoned,
+        )?;
+        Ok(StartedPermit {
+            id,
+            nonce: self.nonce,
+            operation: attempt.prepared.operation,
+            signature: evidence.signature,
+        })
+    }
+
+    /// Consumes the only permit even if verification fails. A failed completion
+    /// must be investigated with fresh reconciliation, never retransmitted.
+    pub fn complete(&mut self, permit: StartedPermit, evidence: CompletionEvidence) -> Result<()> {
+        self.ordinary_usable()?;
+        ensure!(
+            permit.nonce == self.nonce,
+            "write permit belongs to another journal"
+        );
+        self.finish(permit.id, evidence, false)
+    }
+
+    /// The receipt must bind fresh identity/catalog and complete file readback.
+    /// For the exact prepared revision, recovery may use the original durable
+    /// Ready/signature/terminal proof with fresh SQL/prefs/CDB and preservation
+    /// checks; it need not open another ATC session. Later revisions require
+    /// separately established reconciliation. Absent or ambiguous content leaves
+    /// Started unresolved and blocks further attempts; this never issues a retry.
+    pub fn reconcile_completed(&mut self, id: AttemptId, fresh: CompletionEvidence) -> Result<()> {
+        self.ordinary_usable()?;
+        self.finish(id, fresh, true)
     }
 
     fn finish(
@@ -439,9 +564,64 @@ impl Journal {
         )
     }
 
+    /// Settle a Started Insert or Artwork the phone never applied. `receipt` is
+    /// the digest of the retained observation proving it; reservations stay
+    /// unconsumed and no binding changes. An Active coordination's attempt
+    /// needs its permit, as every other write does.
+    pub fn mark_not_applied(&mut self, id: AttemptId, receipt: [u8; 32]) -> Result<()> {
+        self.ordinary_usable()?;
+        nonzero_hash(&receipt)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(
+            transaction.execute(
+                "UPDATE attempts SET state=5,verified_receipt=?1 WHERE id=?2 AND state=1 AND kind IN(1,2)",
+                params![receipt, id.0],
+            )? == 1,
+            "only a Started Insert or Artwork may be settled not applied"
+        );
+        durable_commit(
+            transaction,
+            &self.database,
+            &self.directory,
+            &mut self.poisoned,
+        )
+    }
+
+    /// Settle a Started Artwork whose session the host abandoned after the
+    /// phone applied its metadata at `anchor`, with no cover arrived.
+    /// `receipt` is the digest of the retained observation proving it;
+    /// reservations stay unconsumed and no binding changes.
+    pub fn mark_abandoned(&mut self, id: AttemptId, receipt: [u8; 32], anchor: u32) -> Result<()> {
+        self.ordinary_usable()?;
+        nonzero_hash(&receipt)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(
+            transaction.execute(
+                "UPDATE attempts SET state=6,verified_receipt=?1,verified_anchor=?2 WHERE id=?3 AND state=1 AND kind=2 AND ?2>base_anchor",
+                params![receipt, anchor, id.0],
+            )? == 1,
+            "only a Started Artwork may be settled abandoned, at an anchor past its own"
+        );
+        durable_commit(
+            transaction,
+            &self.database,
+            &self.directory,
+            &mut self.poisoned,
+        )
+    }
+
     fn ordinary_inspectable(&self) -> Result<()> {
         self.usable()?;
         Ok(())
+    }
+
+    fn ordinary_usable(&self) -> Result<()> {
+        self.ordinary_inspectable()?;
+        coordination::ensure_no_route_owner(&self.connection)
     }
 
     fn usable(&self) -> Result<()> {
@@ -644,6 +824,18 @@ fn durable_commit(
     directory.sync_all()?;
     *poisoned = false;
     Ok(())
+}
+
+fn ensure_idle(connection: &Connection) -> Result<()> {
+    ensure!(
+        !connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE state IN (0,1))",
+            [],
+            |row| row.get::<_, bool>(0)
+        )?,
+        "an outstanding attempt requires completion, cancellation, or reconciliation"
+    );
+    coordination::ensure_no_outstanding_batch(connection)
 }
 
 fn reserve(
