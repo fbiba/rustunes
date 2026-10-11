@@ -13,6 +13,7 @@ music-protocol = { path = "../music-protocol" }
 anyhow.workspace = true
 idevice.workspace = true
 libc.workspace = true
+lofty.workspace = true
 plist.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

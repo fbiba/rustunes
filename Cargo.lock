@@ -1041,6 +1041,7 @@ dependencies = [
  "anyhow",
  "idevice",
  "libc",
+ "lofty",
  "music-protocol",
  "plist",
  "rusqlite",
