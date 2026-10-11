@@ -32,6 +32,8 @@ const APPLICATION_ID: i64 = 0x49534a31;
 /// The journal schema: every journal is created from it and must match it.
 const SCHEMA: &str = include_str!("journal/schema.sql");
 
+pub(crate) mod source_attribution;
+
 pub(crate) mod row_ancestry;
 
 mod active;
