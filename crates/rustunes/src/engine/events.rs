@@ -10,6 +10,7 @@ pub enum Event<'a> {
     /// operation.
     ReadingCurrentState,
     Observation(super::Observation<'a>),
+    Device(crate::engine::execution::device::Event),
     RunEvidence(&'a Path),
     ReadingDeviceSnapshot,
     ReadingSavedSnapshot,
