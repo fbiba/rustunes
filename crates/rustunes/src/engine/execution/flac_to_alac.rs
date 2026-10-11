@@ -244,6 +244,42 @@ pub(crate) fn remove_left(path: &Path) -> Result<()> {
     }
 }
 
+/// Remove the conversion directories earlier runs left behind, except one
+/// holding a file in `keep` (a source an unsettled insert batch still needs)
+/// and those of another run still going.
+pub(crate) fn sweep(keep: &[PathBuf]) -> Result<()> {
+    sweep_in(&std::env::temp_dir(), keep)
+}
+
+fn sweep_in(base: &Path, keep: &[PathBuf]) -> Result<()> {
+    let Ok(entries) = fs::read_dir(base) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let own = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.uid() == unsafe { libc::geteuid() }
+        };
+        if !name.starts_with(PREFIX) || !metadata.is_dir() || !own {
+            continue;
+        }
+        // Another process still running keeps its directory.
+        if process(name).is_some_and(|p| p != std::process::id() && running(p)) {
+            continue;
+        }
+        if keep.iter().any(|kept| kept.starts_with(&path)) {
+            continue;
+        }
+        fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// The process a conversion directory `PREFIX<process>-<nanos>` is named
 /// after.
 fn process(name: &str) -> Option<u32> {
@@ -269,6 +305,108 @@ pub(crate) struct Converted {
     pub(crate) metadata: Metadata,
     pub(crate) cover: Option<Cover>,
     pub(crate) conversion: Conversion,
+}
+
+/// Convert the FLAC at `flac` (read again as `prepared`) into `directory`,
+/// then check the result. Any failure refuses this FLAC only; the partial
+/// file is removed.
+pub(crate) fn convert(
+    ffmpeg: &Ffmpeg,
+    flac: &Path,
+    prepared: &PreparedSource,
+    directory: &Directory,
+) -> Result<Converted> {
+    convert_into(ffmpeg, flac, prepared, &directory.path, &|| false)
+}
+
+/// [`convert`] into the conversion directory at `directory`. Once
+/// `abandoned` holds, FFmpeg is killed and the conversion fails.
+pub(crate) fn convert_into(
+    ffmpeg: &Ffmpeg,
+    flac: &Path,
+    prepared: &PreparedSource,
+    directory: &Path,
+    abandoned: &dyn Fn() -> bool,
+) -> Result<Converted> {
+    let source = prepared.source();
+    convertible(source)?;
+    let flac = fs::canonicalize(flac)?;
+    let before = fs::symlink_metadata(&flac)?;
+    let identity = prepared.identity();
+    let name: String = identity.full_file_sha256[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let output = directory.join(format!("{name}.m4a"));
+    let result = (|| {
+        // A FLAC's only picture, a JPEG or PNG, is copied by FFmpeg; any
+        // other cover goes in as the JPEG sync sends for it.
+        let written = if copies_picture(source) {
+            None
+        } else {
+            crate::engine::planning::source_collection::mp3::artwork::batch_cover(&flac, source)?
+        };
+        run(conversion_command(&flac, source, &output)?, None, abandoned)?;
+        write_tags(&output, prepared, written.as_ref())?;
+        let (fingerprint, metadata, cover) =
+            check(prepared, &flac, &output, written.as_ref(), abandoned)?;
+        ensure!(
+            music_protocol::media::held_source::same_observed_file(
+                &before,
+                &fs::symlink_metadata(&flac)?
+            )?,
+            "the FLAC changed while it was converted"
+        );
+        Ok(Converted {
+            path: output.clone(),
+            fingerprint,
+            metadata,
+            cover,
+            conversion: Conversion {
+                source_path: flac.clone(),
+                source_bytes: identity.file_bytes,
+                source_sha256: identity.full_file_sha256,
+                source_audio: identity.audio.sha256,
+                ffmpeg: ffmpeg.version.clone(),
+            },
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&output);
+    }
+    result
+}
+
+/// Convert `conversion`'s FLAC again into `directory` for a batch whose
+/// conversion is gone: the FFmpeg and the FLAC must be the ones recorded, and
+/// the result the exact file the batch sent (`sent`).
+pub(crate) fn reconvert(
+    conversion: &Conversion,
+    sent: &music_protocol::media::fingerprint::TransferredSource,
+    directory: &Directory,
+) -> Result<PathBuf> {
+    let ffmpeg = require_ffmpeg()?;
+    ensure!(
+        ffmpeg.version == conversion.ffmpeg,
+        "FFmpeg is now {:?}, not the {:?} that converted it",
+        ffmpeg.version,
+        conversion.ffmpeg
+    );
+    let flac = &conversion.source_path;
+    let prepared = PreparedSource::read_expected(flac, &music_protocol::media::mpeg::read(flac)?)?;
+    let identity = prepared.identity();
+    ensure!(
+        identity.file_bytes == conversion.source_bytes
+            && identity.full_file_sha256 == conversion.source_sha256,
+        "the FLAC {} changed since it was converted",
+        flac.display()
+    );
+    let converted = convert(&ffmpeg, flac, &prepared, directory)?;
+    if converted.fingerprint.full_file_sha256 != sent.full_file_sha256 {
+        remove(&converted.path)?;
+        bail!("converting the FLAC again made another file than the one sent");
+    }
+    Ok(converted.path)
 }
 
 /// Whether FFmpeg copies the FLAC's picture as the M4A's cover: its only
@@ -425,3 +563,264 @@ fn write_tags(output: &Path, prepared: &PreparedSource, cover: Option<&Cover>) -
     file.sync_all()?;
     Ok(())
 }
+
+/// What a checked conversion sends: the ALAC's fingerprint, tags and cover.
+type Checked = (SourceFingerprint, Metadata, Option<Cover>);
+
+/// Read the converted file as an ALAC source and hold it to the FLAC: the
+/// transfer cap, the ALAC profile, the projected tags, the cover (the copied
+/// picture, or `written`) and the PCM.
+fn check(
+    prepared: &PreparedSource,
+    flac: &Path,
+    output: &Path,
+    written: Option<&Cover>,
+    abandoned: &dyn Fn() -> bool,
+) -> Result<Checked> {
+    let size = fs::symlink_metadata(output)?.len();
+    ensure!(
+        size <= music_protocol::protocol::transfer::MAX_AUDIO,
+        "its ALAC is {size} bytes, over the 64 MiB transfer limit"
+    );
+    let fingerprint = music_protocol::media::fingerprint::read(output)
+        .context("FFmpeg's ALAC cannot be read as an ALAC source")?;
+    let metadata = music_protocol::media::metadata::read(output)?;
+    let report = crate::engine::planning::source_validation::inspect(output, false);
+    ensure!(
+        report.supported_by_current_profile,
+        "its ALAC is outside the ALAC profile: {}",
+        report
+            .issues
+            .iter()
+            .filter(|i| i.severity == crate::engine::planning::source_validation::Severity::Error)
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let wanted = prepared.projected()?;
+    let got = ProjectedFields::from_source(&metadata)?;
+    // FFmpeg may widen the samples (a 20-bit FLAC becomes 24-bit ALAC); the
+    // PCM comparison below decides whether that lost anything.
+    let differing = differing(&wanted, &got);
+    ensure!(
+        differing.is_empty(),
+        "its ALAC's tags or timing differ from the FLAC's: {}",
+        differing.join(", ")
+    );
+    let artwork = music_protocol::media::artwork::read(output)?;
+    let held = artwork
+        .embedded
+        .as_ref()
+        .map(|image| image.sha256)
+        .or(artwork.cover.as_ref().map(|c| c.sha256))
+        .map(|digest| hex(&digest));
+    let wanted = if copies_picture(prepared.source()) {
+        prepared.source().artwork.first().map(|p| p.sha256.clone())
+    } else {
+        written.map(|cover| hex(&cover.sha256))
+    };
+    ensure!(held == wanted, "its ALAC's cover differs from the FLAC's");
+    let original = pcm(flac, abandoned)?;
+    ensure!(
+        original.0 > 0 && original == pcm(output, abandoned)?,
+        "its ALAC decodes to other PCM than the FLAC, so the conversion was not lossless"
+    );
+    Ok((fingerprint, metadata, artwork.cover))
+}
+
+/// The fields of the ALAC's projection that differ from the FLAC's, its bit
+/// depth aside.
+fn differing(flac: &ProjectedFields, alac: &ProjectedFields) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    let mut compare = |name, same: bool| {
+        if !same {
+            fields.push(name);
+        }
+    };
+    compare("title", flac.title == alac.title);
+    compare("sort title", flac.sort_name == alac.sort_name);
+    compare("comment", flac.comment == alac.comment);
+    compare("artist", flac.artist == alac.artist);
+    compare("album", flac.album == alac.album);
+    compare("album artist", flac.album_artist == alac.album_artist);
+    compare(
+        "grouping artist",
+        flac.grouping_artist == alac.grouping_artist,
+    );
+    compare("genre", flac.genre == alac.genre);
+    compare("composer", flac.composer == alac.composer);
+    compare("copyright", flac.copyright == alac.copyright);
+    compare("year", flac.year == alac.year);
+    compare("content rating", flac.content_rating == alac.content_rating);
+    compare("compilation", flac.compilation == alac.compilation);
+    compare("track", flac.track == alac.track);
+    compare("track total", flac.track_total == alac.track_total);
+    compare("disc", flac.disc == alac.disc);
+    compare("disc total", flac.disc_total == alac.disc_total);
+    compare("sample rate", flac.sample_rate == alac.sample_rate);
+    compare("channels", flac.channels == alac.channels);
+    compare("samples", flac.duration_ticks == alac.duration_ticks);
+    compare("total time", flac.total_time_ms == alac.total_time_ms);
+    fields
+}
+
+/// The length and SHA-256 of the file's first audio stream decoded to 32-bit
+/// little-endian PCM, the form in which a FLAC and an ALAC of the same audio
+/// are equal byte for byte.
+fn pcm(path: &Path, abandoned: &dyn Fn() -> bool) -> Result<(u64, [u8; 32])> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-xerror",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-i",
+        ])
+        .arg(path)
+        .args(["-map", "0:a:0", "-c:a", "pcm_s32le", "-f", "s32le", "-"]);
+    let mut digest = (0u64, Sha256::new());
+    run(command, Some(&mut digest), abandoned)?;
+    Ok((digest.0, digest.1.finalize().into()))
+}
+
+/// What FFmpeg says of a FLAC picture that declares no type, whichever streams
+/// it is asked for. It skips the picture and carries on; the cover is checked
+/// by [`check`] against the FLAC's own picture instead.
+const UNREADABLE_PICTURE: &str = "Could not read mimetype from an attached picture.";
+
+/// Run FFmpeg to completion within [`DEADLINE`], hashing its standard output
+/// into `output` if given (otherwise discarding it). Any diagnostic is a
+/// failure, bar [`UNREADABLE_PICTURE`], and so is `abandoned` holding, which
+/// kills FFmpeg.
+fn run(
+    mut command: Command,
+    output: Option<&mut (u64, Sha256)>,
+    abandoned: &dyn Fn() -> bool,
+) -> Result<()> {
+    // FFmpeg dies with this thread, which waits for it, so it never outlives
+    // a killed run.
+    let parent = std::process::id();
+    // SAFETY: the closure runs between fork and exec and makes only
+    // async-signal-safe system calls, allocating nothing.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // The run died before the request took hold.
+            if libc::getppid() as u32 != parent {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .env_remove("FFREPORT")
+        .stdin(Stdio::null())
+        .stdout(if output.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting ffmpeg")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capturing FFmpeg diagnostics")?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(bounded(stderr));
+    });
+    let started = Instant::now();
+    let read = match (output, child.stdout.take()) {
+        (Some(digest), Some(mut stdout)) => {
+            let mut buffer = vec![0; 256 * 1024];
+            loop {
+                if abandoned() {
+                    break Err(anyhow::anyhow!("FFmpeg was stopped"));
+                }
+                if started.elapsed() > DEADLINE {
+                    break Err(anyhow::anyhow!(
+                        "FFmpeg exceeded {} seconds",
+                        DEADLINE.as_secs()
+                    ));
+                }
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => {
+                        digest.0 += n as u64;
+                        digest.1.update(&buffer[..n]);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => break Err(error.into()),
+                }
+            }
+        }
+        _ => Ok(()),
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if read.is_ok() => break status,
+            Ok(None) if read.is_ok() && started.elapsed() < DEADLINE && !abandoned() => {
+                thread::sleep(Duration::from_millis(20))
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                result.context("waiting for FFmpeg")?;
+                read?;
+                ensure!(!abandoned(), "FFmpeg was stopped");
+                bail!("FFmpeg exceeded {} seconds", DEADLINE.as_secs());
+            }
+        }
+    };
+    let (log, truncated) = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .context("closing FFmpeg diagnostics")??;
+    let log = String::from_utf8_lossy(&log)
+        .lines()
+        .filter(|line| !line.ends_with(UNREADABLE_PICTURE))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+    ensure!(
+        status.success() && log.is_empty() && !truncated,
+        "FFmpeg did not complete cleanly (status {status}): {}{}",
+        String::from_utf8_lossy(&log).trim_end(),
+        if truncated {
+            " [diagnostics truncated]"
+        } else {
+            ""
+        }
+    );
+    Ok(())
+}
+
+fn bounded(mut reader: impl Read) -> io::Result<(Vec<u8>, bool)> {
+    let mut captured = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0; 4096];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let take = count.min(MAX_LOG - captured.len());
+        captured.extend_from_slice(&buffer[..take]);
+        truncated |= take < count;
+    }
+    Ok((captured, truncated))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests;
