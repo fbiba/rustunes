@@ -2,6 +2,7 @@
 //! connection). Selection is fixed before the first provider lookup; pairing
 //! records are read, never created or repaired by this module.
 mod lock;
+mod wifi;
 
 use anyhow::{Context, Result, ensure};
 use idevice::{
@@ -109,5 +110,14 @@ pub struct DeviceProvider {
 #[derive(Clone, Debug)]
 enum Route {
     Usb(UsbmuxdProvider),
+    Wifi(wifi::Phone),
+}
+impl DeviceProvider {
+    pub fn transport(&self) -> Transport {
+        match &self.route {
+            Route::Usb(_) => Transport::Usb,
+            Route::Wifi(phone) => Transport::Wifi(phone.address()),
+        }
+    }
 }
 type Connecting<T> = Pin<Box<dyn Future<Output = Result<T, IdeviceError>> + Send>>;
