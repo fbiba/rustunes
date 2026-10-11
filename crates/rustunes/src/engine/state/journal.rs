@@ -32,6 +32,8 @@ const APPLICATION_ID: i64 = 0x49534a31;
 /// The journal schema: every journal is created from it and must match it.
 const SCHEMA: &str = include_str!("journal/schema.sql");
 
+pub(crate) mod row_ancestry;
+
 mod active;
 
 mod coordination;
@@ -51,8 +53,12 @@ pub use metadata_batch::{
 };
 
 mod bindings;
+mod carry;
 pub use active::{BindingRef, JournalHistorySummary};
 pub use bindings::BindingId;
+pub use carry::{Prior, Pulled, read_prior, run_references};
+#[cfg(test)]
+pub use carry::{PriorBinding, Reserved};
 const MAX_OPERATION: usize = 4 * 1024 * 1024;
 const MAX_CONTENT: usize = 512;
 const DB_NAME: &str = "journal.sqlite";
