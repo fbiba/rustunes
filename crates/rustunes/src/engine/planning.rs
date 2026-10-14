@@ -1,6 +1,7 @@
 //! Saved-only planning. The returned serialized bytes are exactly the bytes
 //! persisted for later reconstruction; a plan never grants write authority.
 use super::{Engine, Event, SelectionOptions};
+use crate::{engine::state::journal, engine::state::snapshot};
 use anyhow::{Result, ensure};
 use music_protocol::catalogue::identity;
 use music_protocol::protocol::trace::private_write;
@@ -18,6 +19,7 @@ pub struct PlanRequest<'a> {
 }
 pub(crate) mod candidates;
 pub(crate) mod collections;
+pub(crate) mod saved_plan;
 pub(crate) mod source_collection;
 pub(crate) mod source_reads;
 pub(crate) mod source_validation;

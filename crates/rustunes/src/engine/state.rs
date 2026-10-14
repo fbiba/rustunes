@@ -6,3 +6,4 @@ pub(crate) mod cache_database;
 pub(crate) mod current;
 pub(crate) mod journal;
 pub(crate) mod layout;
+pub(crate) mod snapshot;

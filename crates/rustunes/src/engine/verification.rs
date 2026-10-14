@@ -1,6 +1,7 @@
 //! Read-only current-state and retained-audio verification. This report does
 //! not reconcile a Started attempt or reconstruct unretained source metadata.
 use super::{Engine, Event};
+use crate::{engine::execution::device, engine::state::current, engine::state::snapshot};
 use anyhow::{Context, Result, ensure};
 use music_protocol::catalogue::identity;
 use std::{fs, os::unix::fs::DirBuilderExt, path::Path, sync::Arc};
