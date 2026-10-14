@@ -1,12 +1,14 @@
 //! Read-only catalog capture and CSV export. AFC source bounds do not bound the
 //! pinned transport's allocation for a malformed frame. Stable attributes are
 //! checked across all three SQLite files; this is not an atomic device snapshot.
-use anyhow::{Context, Result, ensure};
-use idevice::afc::AfcClient;
 use music_protocol::protocol::afc::copy;
-use music_protocol::protocol::afc::stat::{self as afc_stat, regular_size, unchanged};
 use music_protocol::protocol::trace::private_write;
 use music_protocol::protocol::transfer::{CappedMetadata, CaptureControl, bounded_error};
+
+use crate::engine::execution::device::DeviceProvider;
+use anyhow::{Context, Result, ensure};
+use idevice::afc::AfcClient;
+use music_protocol::protocol::afc::stat::{self as afc_stat, regular_size, unchanged};
 use plist::{Dictionary, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -92,9 +94,272 @@ struct Captured {
     wal: Option<PathBuf>,
     hashes: Vec<(String, u64, [u8; 32])>,
 }
+
+/// Local output guards run before discovery. The injected connector also lets
+/// tests prove failures cannot access USB, without a simulated global daemon.
+/// With no output path, CSV streams to the supplied writer; the caller owns its
+/// destination. An explicit output path retains exclusive private-file creation.
+pub async fn export<F, Fut>(
+    output: Option<&Path>,
+    trace: Option<&Path>,
+    writer: &mut impl Write,
+    connect: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    let mut file = output
+        .map(|path| {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .context("catalog output must be a new writable file")
+        })
+        .transpose()?;
+    with_capture(
+        trace,
+        Instant::now() + Duration::from_secs(120),
+        connect,
+        |catalog| {
+            match &mut file {
+                Some(file) => {
+                    write_csv(file, &catalog)?;
+                    file.sync_all()?;
+                }
+                None => {
+                    write_csv(writer, &catalog)?;
+                    writer.flush()?;
+                }
+            }
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Obtain the same verified read-only capture as `catalog`, retaining evidence
+/// at an explicit trace path or cleaning only this call's own local scratch.
+pub async fn read<F, Fut>(
+    trace: Option<&Path>,
+    connect: F,
+) -> Result<music_protocol::catalogue::sqlite::Catalog>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    read_until(trace, Instant::now() + Duration::from_secs(120), connect).await
+}
+
+/// Share an enclosing capture's original deadline; this call never renews it.
+pub(crate) async fn read_until<F, Fut>(
+    trace: Option<&Path>,
+    deadline: Instant,
+    connect: F,
+) -> Result<music_protocol::catalogue::sqlite::Catalog>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    with_capture(trace, deadline, connect, Ok).await
+}
+
+/// Capture into `trace` inside an enclosing capture, sharing its original
+/// deadline. The enclosing capture names where it is kept, so this one is not
+/// announced: `trace` may be a held descriptor's path, valid only while
+/// rustunes runs.
+pub(crate) async fn read_within<F, Fut>(
+    trace: &Path,
+    deadline: Instant,
+    connect: F,
+) -> Result<music_protocol::catalogue::sqlite::Catalog>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    with_capture_options(Some(trace), deadline, None, true, connect, Ok).await
+}
+
+/// `read_within` under an enclosing capture's control.
+pub(crate) async fn read_until_controlled<F, Fut>(
+    trace: &Path,
+    control: &CaptureControl,
+    connect: F,
+) -> Result<music_protocol::catalogue::sqlite::Catalog>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    with_capture_options(
+        Some(trace),
+        control.deadline,
+        Some(control),
+        true,
+        connect,
+        Ok,
+    )
+    .await
+}
 fn check_control(control: Option<&CaptureControl>) -> Result<()> {
     if let Some(control) = control {
         control.check()?;
+    }
+    Ok(())
+}
+
+async fn with_capture<F, Fut, T>(
+    trace: Option<&Path>,
+    deadline: Instant,
+    connect: F,
+    consume: impl FnOnce(music_protocol::catalogue::sqlite::Catalog) -> Result<T>,
+) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    with_capture_options(trace, deadline, None, false, connect, consume).await
+}
+
+async fn with_capture_options<F, Fut, T>(
+    trace: Option<&Path>,
+    deadline: Instant,
+    control: Option<&CaptureControl>,
+    nested: bool,
+    connect: F,
+    consume: impl FnOnce(music_protocol::catalogue::sqlite::Catalog) -> Result<T>,
+) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    check_control(control)?;
+    let capture = CaptureDirectory::create(trace)?;
+    check_control(control)?;
+    crate::engine::observe(crate::engine::Event::Observation(
+        crate::engine::Observation::CapturingCatalogue,
+    ))?;
+    let result = async {
+        ensure!(
+            Instant::now() < deadline,
+            "catalog capture deadline expired before discovery"
+        );
+        let provider = if let Some(control) = control {
+            control
+                .run(
+                    Duration::from_secs(15),
+                    "catalog USB discovery deadline",
+                    connect(),
+                )
+                .await?
+        } else {
+            timeout_at(
+                deadline.min(Instant::now() + Duration::from_secs(15)),
+                connect(),
+            )
+            .await
+            .context("catalog USB discovery deadline")??
+        };
+        ensure!(
+            Instant::now() < deadline,
+            "catalog capture deadline expired before AFC connection"
+        );
+        let afc = if let Some(control) = control {
+            control
+                .run(
+                    Duration::from_secs(20),
+                    "catalog AFC connection deadline",
+                    async {
+                        music_protocol::protocol::afc::connect_checked(&provider)
+                            .await
+                            .map_err(anyhow::Error::from)
+                    },
+                )
+                .await?
+        } else {
+            timeout_at(
+                deadline.min(Instant::now() + Duration::from_secs(20)),
+                music_protocol::protocol::afc::connect_checked(&provider),
+            )
+            .await
+            .context("catalog AFC connection deadline")??
+        };
+        let snapshot = capture_client(afc, &capture.path, deadline, control).await?;
+        let catalog =
+            parse_copied_snapshot_options(&snapshot.database, snapshot.wal.as_deref(), control)?;
+        let verified = catalog.source_hashes();
+        ensure!(
+            verified.database == snapshot.hashes[0].2
+                && verified.database_bytes == snapshot.hashes[0].1,
+            "local catalog database changed during parsing"
+        );
+        let wal = snapshot.hashes.get(1);
+        ensure!(
+            verified.wal == wal.map(|entry| entry.2)
+                && verified.wal_bytes == wal.map(|entry| entry.1),
+            "local catalog WAL changed during parsing"
+        );
+        check_control(control)?;
+        let untested = (!catalog.user_version_tested()).then(|| catalog.user_version());
+        if let Some(version) = untested
+            && WARNED_VERSION.swap(version, Ordering::Relaxed) != version
+        {
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::UntestedCatalogueVersion(version),
+            ))?;
+        }
+        let value = consume(catalog)?;
+        check_control(control)?;
+        Ok((value, untested))
+    }
+    .await;
+    match result {
+        Ok((value, untested)) => {
+            check_control(control)?;
+            keep(&capture, untested, nested)?;
+            check_control(control)?;
+            Ok(value)
+        }
+        Err(error) => {
+            private_write(
+                &capture.path.join("error.txt"),
+                (if control.is_some() {
+                    format!("{}\n", bounded_error(&error))
+                } else {
+                    format!("{error:#}\n")
+                })
+                .as_bytes(),
+            )?;
+            Err(if nested {
+                error.context("catalog capture failed; evidence retained in the enclosing capture")
+            } else {
+                error.context(format!(
+                    "catalog capture retained at {}",
+                    capture.path.display()
+                ))
+            })
+        }
+    }
+}
+
+/// Keep a completed capture at its trace, announcing it unless an enclosing
+/// capture names where it is kept, or remove this command's own scratch.
+fn keep(capture: &CaptureDirectory, untested: Option<i64>, nested: bool) -> Result<()> {
+    if capture.retain {
+        let mut outcome = b"Catalog parsed from a bounded read-only capture with stable cross-file attributes. No atomic snapshot claim.\n".to_vec();
+        if let Some(version) = untested {
+            outcome.extend(format!("MediaLibrary user_version {version} is untested; every table and column read is present.\n").bytes());
+        }
+        private_write(&capture.path.join("outcome.txt"), &outcome)?;
+        if !nested {
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::CatalogueCaptureRetained(&capture.path),
+            ))?;
+        }
+    } else {
+        std::fs::remove_dir_all(&capture.path)
+            .context("removing this command's private temporary catalog capture")?;
     }
     Ok(())
 }
@@ -527,6 +792,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn existing_output_or_trace_stops_before_connector_and_preserves_content() {
+        let temp = Temp::new();
+        let output = temp.0.join("existing.csv");
+        std::fs::write(&output, b"preserve").unwrap();
+        let connected = AtomicBool::new(false);
+        for (output, trace) in [
+            (Some(output.as_path()), None),
+            (None, Some(temp.0.as_path())),
+        ] {
+            assert!(
+                export(output, trace, &mut Vec::new(), || async {
+                    connected.store(true, Ordering::SeqCst);
+                    anyhow::bail!("connector must not be reached")
+                })
+                .await
+                .is_err()
+            );
+            assert!(!connected.load(Ordering::SeqCst));
+        }
+        assert_eq!(std::fs::read(output).unwrap(), b"preserve");
+    }
+
     fn attrs(size: u64) -> Attributes {
         Attributes::from([
             ("st_ifmt".into(), "S_IFREG".into()),
@@ -619,6 +907,70 @@ mod tests {
             .unwrap()
             .insert("st_atime".into(), "456".into());
         check_capture_stability(&before, &accessed).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_enclosing_deadline_does_not_poll_connector() {
+        let temp = Temp::new();
+        let connected = AtomicBool::new(false);
+        let result = read_until(Some(&temp.0.join("capture")), Instant::now(), || async {
+            connected.store(true, Ordering::SeqCst);
+            anyhow::bail!("connector must not be reached")
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!connected.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_nested_capture_failure_leaves_its_path_to_the_enclosing_capture() {
+        let temp = Temp::new();
+        let nested = temp.0.join("nested");
+        let error = read_within(&nested, Instant::now(), || async {
+            anyhow::bail!("connector must not be reached")
+        })
+        .await
+        .err()
+        .unwrap();
+        assert!(!format!("{error:#}").contains(&*nested.to_string_lossy()));
+        assert!(nested.join("error.txt").is_file());
+        let explicit = temp.0.join("explicit");
+        let error = read_until(Some(&explicit), Instant::now(), || async {
+            anyhow::bail!("connector must not be reached")
+        })
+        .await
+        .err()
+        .unwrap();
+        assert!(format!("{error:#}").contains(&*explicit.to_string_lossy()));
+    }
+
+    #[test]
+    fn a_kept_capture_is_announced_only_when_no_enclosing_capture_names_it() {
+        for nested in [false, true] {
+            let temp = Temp::new();
+            let announced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = std::sync::Arc::clone(&announced);
+            let engine =
+                crate::engine::Engine::new(crate::engine::test_engine().config, move |event| {
+                    if let crate::engine::Event::Observation(
+                        crate::engine::Observation::CatalogueCaptureRetained(path),
+                    ) = event
+                    {
+                        sink.lock().unwrap().push(path.to_owned());
+                    }
+                    Ok(())
+                });
+            let capture = CaptureDirectory {
+                path: temp.0.clone(),
+                retain: true,
+            };
+            engine
+                .with_observer(|| keep(&capture, None, nested))
+                .unwrap();
+            assert!(temp.0.join("outcome.txt").is_file());
+            let expected = if nested { vec![] } else { vec![temp.0.clone()] };
+            assert_eq!(*announced.lock().unwrap(), expected);
+        }
     }
 
     fn pair() -> (AfcClient, Idevice) {

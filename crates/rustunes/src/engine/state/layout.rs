@@ -266,6 +266,15 @@ fn files(
     Ok(())
 }
 
+pub fn journal_path(state: &Path, device: &[u8; 32], library: &[u8; 32]) -> Result<PathBuf> {
+    let parent = state
+        .join("devices")
+        .join(crate::engine::state::current::hex(device))
+        .join(crate::engine::state::current::hex(library));
+    private_directory(&parent)?;
+    Ok(fs::canonicalize(parent)?.join("journal"))
+}
+
 fn parent(path: &Path) -> &Path {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())

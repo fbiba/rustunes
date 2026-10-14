@@ -18,9 +18,19 @@ pub use observation::Observation;
 pub(crate) mod planning;
 pub(crate) mod state;
 pub(crate) mod verification;
+pub use crate::engine::execution::device::{Config as DeviceConfig, Event as DeviceEvent};
 pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use events::Event;
 pub use verification::VerificationRequest;
+
+/// Explicit execution dependencies. `None` retains each operation's existing
+/// phase deadline; a supplied deadline may only shorten those bounds.
+#[derive(Clone)]
+pub struct Config {
+    pub device: DeviceConfig,
+    pub deadline: Option<Instant>,
+    pub cancelled: Arc<AtomicBool>,
+}
 
 type Observer = Arc<dyn for<'a> Fn(Event<'a>) -> Result<()> + Send + Sync>;
 tokio::task_local! { static CURRENT_OBSERVER: Observer; }
@@ -42,6 +52,74 @@ pub(crate) fn warn(event: Event<'_>, fallback: impl FnOnce() -> String) {
         .is_err()
     {
         eprintln!("{}", fallback());
+    }
+}
+
+/// A concrete engine with caller-owned cancellation and an observation sink.
+/// It never resolves CLI configuration, writes terminal output, or selects an
+/// exit status. Observer callbacks must return normally; they convey no authority.
+#[derive(Clone)]
+pub struct Engine {
+    config: Config,
+    observer: Observer,
+}
+
+impl Engine {
+    pub fn new(
+        config: Config,
+        observer: impl for<'a> Fn(Event<'a>) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            config,
+            observer: Arc::new(observer),
+        }
+    }
+    pub fn quiet(config: Config) -> Self {
+        Self::new(config, |_| Ok(()))
+    }
+    pub(crate) fn selected_device(&self) -> Option<&str> {
+        self.config.device.selected_device()
+    }
+    /// The connection options a printed follow-up command needs
+    /// (`DeviceConfig::command_options`).
+    pub(crate) fn command_options(&self) -> String {
+        self.config.device.command_options()
+    }
+    /// Scope an engine operation or CLI command to this explicit device
+    /// configuration. Nested engines remain isolated from one another.
+    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
+        let observer = Arc::clone(&self.observer);
+        CURRENT_OBSERVER
+            .scope(
+                Arc::clone(&self.observer),
+                crate::engine::execution::device::scope_with_observer(
+                    self.config.device.clone(),
+                    move |event| observer(Event::Device(event)),
+                    future,
+                ),
+            )
+            .await
+    }
+    /// Install this observer for synchronous work, including an explicitly
+    /// cloned engine moved into a blocking task. The guard restores outer scope.
+    pub(crate) fn with_observer<T>(&self, work: impl FnOnce() -> T) -> T {
+        CURRENT_OBSERVER.sync_scope(Arc::clone(&self.observer), work)
+    }
+    pub(crate) fn emit(&self, event: Event<'_>) -> Result<()> {
+        (self.observer)(event)
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        ensure!(
+            !self.config.cancelled.load(Ordering::Relaxed),
+            "insertion cancelled; reconcile any Started attempt"
+        );
+        ensure!(
+            self.config
+                .deadline
+                .is_none_or(|deadline| Instant::now() < deadline),
+            "original insertion deadline expired"
+        );
+        Ok(())
     }
 }
 
@@ -171,6 +249,26 @@ pub struct Hold {
     pub path: Option<String>,
     pub code: String,
     pub reason: String,
+}
+
+#[cfg(test)]
+pub(crate) fn test_engine() -> Engine {
+    Engine::quiet(Config {
+        device: DeviceConfig::default(),
+        deadline: None,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    })
+}
+/// A test engine whose USB connections go to `socket`, where nothing
+/// listens: a run that reaches for the phone fails there, whatever phone is
+/// attached to the machine.
+#[cfg(test)]
+pub(crate) fn offline_test_engine(socket: &Path) -> Engine {
+    Engine::quiet(Config {
+        device: DeviceConfig::new(None, Some(socket.as_os_str().to_owned())).unwrap(),
+        deadline: None,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 pub(crate) mod execution;
