@@ -19,5 +19,6 @@ pub(crate) use music_protocol::catalogue::sqlite::tables::values as sql_values;
 
 pub(crate) mod artwork;
 pub(crate) mod catalogue_capture;
+pub(crate) mod journal;
 pub(crate) mod removal_sql;
 pub(crate) mod sql_tables;

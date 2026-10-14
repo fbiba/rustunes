@@ -20,6 +20,7 @@ pub(crate) mod state;
 pub(crate) mod verification;
 pub use crate::engine::execution::device::{Config as DeviceConfig, Event as DeviceEvent};
 pub use crate::engine::planning::source_collection::SelectionOptions;
+pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
 pub use events::Event;
 pub use verification::VerificationRequest;
 
