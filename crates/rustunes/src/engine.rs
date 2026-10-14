@@ -121,6 +121,16 @@ impl Engine {
         );
         Ok(())
     }
+    pub(crate) fn control(&self, seconds: u64) -> crate::engine::execution::native_insert::Control {
+        let deadline = Instant::now() + std::time::Duration::from_secs(seconds);
+        crate::engine::execution::native_insert::Control {
+            deadline: self
+                .config
+                .deadline
+                .map_or(deadline, |outer| deadline.min(outer)),
+            cancelled: Arc::clone(&self.config.cancelled),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,6 +280,8 @@ pub(crate) fn offline_test_engine(socket: &Path) -> Engine {
         cancelled: Arc::new(AtomicBool::new(false)),
     })
 }
+#[cfg(test)]
+mod tests;
 
 pub(crate) mod execution;
 

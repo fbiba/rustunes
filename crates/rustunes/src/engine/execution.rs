@@ -2,3 +2,4 @@
 pub(crate) mod device;
 pub(crate) mod flac_to_alac;
 pub(crate) mod insert;
+pub(crate) mod native_insert;

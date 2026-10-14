@@ -27,6 +27,117 @@ pub struct Snapshot {
     pub plist_preferences: Vec<u8>,
 }
 
+pub fn open(directory: &Path) -> Result<Snapshot> {
+    open_inner(directory, None, Absent::NONE)
+}
+
+/// `open` for a capture that allowed rows without audio (`Absent`): rows an
+/// interrupted insertion left (its own targets) are accepted when the capture
+/// recorded exactly those, and, when allowed, rows whose file is gone.
+/// `index.unfilled()` and `index.gone()` name them.
+pub(crate) fn open_allowing(directory: &Path, absent: Absent<'_>) -> Result<Snapshot> {
+    open_inner(directory, None, absent)
+}
+
+/// Same saved-evidence validation under the caller's original clock, with
+/// memory-only SQLite temporary storage and unchanged historical input caps.
+pub(crate) fn open_with_control(
+    directory: &Path,
+    control: &crate::engine::execution::native_insert::Control,
+) -> Result<Snapshot> {
+    open_allowing_with_control(directory, Absent::NONE, control)
+}
+
+/// `open_allowing` under the caller's clock, as `open_with_control`.
+pub(crate) fn open_allowing_with_control(
+    directory: &Path,
+    absent: Absent<'_>,
+    control: &crate::engine::execution::native_insert::Control,
+) -> Result<Snapshot> {
+    control.check()?;
+    let result = open_inner(directory, Some(control), absent)?;
+    control.check()?;
+    Ok(result)
+}
+
+fn open_inner(
+    directory: &Path,
+    control: Option<&crate::engine::execution::native_insert::Control>,
+    absent: Absent<'_>,
+) -> Result<Snapshot> {
+    private_directory(directory)?;
+    private_directory(&directory.join("catalog"))?;
+    let receipt_path = directory.join("complete-index.json");
+    let bytes = read_stable(&receipt_path, 128 * 1024 * 1024).context(
+        "a complete device snapshot is required; incomplete progress cannot prove absence",
+    )?;
+    let receipt_sha: [u8; 32] = Sha256::digest(&bytes).into();
+    let descriptor: Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        descriptor["complete"] == true,
+        "device snapshot is incomplete"
+    );
+    let identity = IndexIdentity {
+        device_identifier_sha256: digest(&descriptor["identity"]["device_identifier_sha256"])?,
+        library_identity_sha256: digest(&descriptor["identity"]["library_identity_sha256"])?,
+    };
+    let before_raw = read_stable(&directory.join("before-iTunesPrefs"), 1024 * 1024)?;
+    let before_plist = read_stable(&directory.join("before-iTunesPrefs.plist"), 1024 * 1024)?;
+    let raw_preferences = read_stable(&directory.join("after-iTunesPrefs"), 1024 * 1024)?;
+    let plist_preferences = read_stable(&directory.join("after-iTunesPrefs.plist"), 1024 * 1024)?;
+    let library = identity::parse(&before_raw)?;
+    for prefs in [&before_plist, &raw_preferences, &plist_preferences] {
+        library.ensure_matches(&identity::parse(prefs)?)?;
+    }
+    ensure!(
+        library.binding_sha256() == identity.library_identity_sha256,
+        "snapshot preferences and index library bindings differ"
+    );
+    let progress = read_stable(&directory.join("progress.jsonl"), 128 * 1024 * 1024)?;
+    ensure!(
+        <[u8; 32]>::from(Sha256::digest(&progress)) == digest(&descriptor["progress_sha256"])?,
+        "snapshot completion and durable progress hashes differ"
+    );
+    let wal = directory.join("catalog/MediaLibrary.sqlitedb-wal");
+    let has_wal = !descriptor["catalog"]["wal_sha256"].is_null();
+    ensure!(
+        has_wal == wal.try_exists()?,
+        "snapshot WAL presence differs from index"
+    );
+    let database = directory.join("catalog/MediaLibrary.sqlitedb");
+    let catalog = match control {
+        Some(control) => sqlite::read_snapshot_memory_with_control(
+            &database,
+            has_wal.then_some(wal.as_path()),
+            &std::env::temp_dir(),
+            control.deadline.into_std(),
+            control.cancelled.clone(),
+        )?,
+        None => sqlite::read_snapshot(
+            &database,
+            has_wal.then_some(wal.as_path()),
+            &std::env::temp_dir(),
+        )?,
+    };
+    let index = DeviceAudioIndex::load_complete_allowing(
+        &receipt_path,
+        receipt_sha,
+        &catalog,
+        &identity,
+        absent,
+    )?;
+    Ok(Snapshot {
+        catalog_database: directory.join("catalog/MediaLibrary.sqlitedb"),
+        catalog_wal: has_wal.then_some(wal),
+        catalog,
+        index,
+        identity,
+        index_receipt_sha256: receipt_sha,
+        raw_preferences,
+        plist_preferences,
+    })
+}
+
 fn private_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
@@ -88,10 +199,46 @@ fn digest(value: &Value) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejects_missing_completion_and_noncanonical_hashes() {
+        assert!(open(Path::new("/tmp/nonexistent-rustunes-snapshot")).is_err());
+        for text in ["", "abc", &"G".repeat(64), &"0".repeat(64)] {
+            assert!(digest(&Value::String(text.into())).is_err());
+        }
+        assert_eq!(digest(&Value::String("ab".repeat(32))).unwrap(), [0xab; 32]);
+    }
 }
 
 #[cfg(test)]
 mod controlled_open_tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
+    #[test]
+    fn saved_snapshot_original_cancellation_refuses_before_filesystem_access() {
+        let control = crate::engine::execution::native_insert::Control {
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            cancelled: Arc::new(AtomicBool::new(true)),
+        };
+        let error = open_with_control(
+            Path::new("/nonexistent-controlled-saved-snapshot"),
+            &control,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("cancel"), "{error:#}");
+    }
+    #[test]
+    fn saved_snapshot_expired_original_deadline_is_not_renewed() {
+        let control = crate::engine::execution::native_insert::Control {
+            deadline: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let error = open_with_control(
+            Path::new("/nonexistent-controlled-saved-snapshot"),
+            &control,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("deadline"), "{error:#}");
+    }
 }
