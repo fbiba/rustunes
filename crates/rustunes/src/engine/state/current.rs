@@ -42,6 +42,60 @@ pub struct Current {
     pub artwork_db: Option<Vec<u8>>,
     pub receipt_sha256: [u8; 32],
 }
+
+/// A stricter enclosing deadline is retained across both complete attempts.
+pub async fn capture_until(
+    trace: &Path,
+    expected: &Identity,
+    deadline: Instant,
+) -> Result<Current> {
+    capture_options(trace, expected, false, deadline).await
+}
+
+pub async fn capture_controlled(
+    trace: &Path,
+    expected: &Identity,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Current> {
+    capture_options_controlled(trace, expected, false, deadline, cancelled).await
+}
+pub async fn capture_with_artwork_controlled(
+    trace: &Path,
+    expected: &Identity,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Current> {
+    capture_options_controlled(trace, expected, true, deadline, cancelled).await
+}
+async fn capture_options_controlled(
+    trace: &Path,
+    expected: &Identity,
+    artwork: bool,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Current> {
+    let control = CaptureControl {
+        deadline: deadline.min(Instant::now() + Duration::from_secs(120)),
+        cancelled,
+    };
+    control.check()?;
+    let result =
+        capture_attempts_options(trace, control.deadline, Some(&control), |path, deadline| {
+            let control = control.clone();
+            async move {
+                let current =
+                    capture_inner_options(&path, expected, deadline, artwork, Some(&control))
+                        .await?;
+                let receipt = current.receipt_sha256;
+                Ok((current, receipt))
+            }
+        })
+        .await;
+    // Original typed errors govern the private retry loop. Public diagnostics
+    // never carry an unbounded transport/provider error body.
+    finish_controlled(&control, result)
+}
 // The same original control fences the public successful return after the
 // awaited attempt loop; the generic value provides no Current authority.
 fn finish_controlled<T>(control: &CaptureControl, result: Result<T>) -> Result<T> {
@@ -71,6 +125,22 @@ fn write_capture_receipt(
         private_write(path, &serde_json::to_vec_pretty(record)?)?;
     }
     check_capture(control)
+}
+
+async fn capture_options(
+    trace: &Path,
+    expected: &Identity,
+    artwork: bool,
+    deadline: Instant,
+) -> Result<Current> {
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(120));
+    capture_attempts(trace, deadline, |path, deadline| async move {
+        let current = capture_inner(&path, expected, deadline, artwork).await?;
+        let receipt = current.receipt_sha256;
+        // Current/Catalog contain owned data and digests, never staging paths.
+        Ok((current, receipt))
+    })
+    .await
 }
 
 /// This loop can only rerun the read-only complete-state closure. Native ATC,
@@ -439,6 +509,176 @@ fn same_directory(held: &File, current: &File) -> Result<()> {
         "capture directory identity changed"
     );
     Ok(())
+}
+
+async fn capture_inner(
+    trace: &Path,
+    expected: &Identity,
+    deadline: Instant,
+    include_artwork: bool,
+) -> Result<Current> {
+    capture_inner_options(trace, expected, deadline, include_artwork, None).await
+}
+
+async fn capture_inner_options(
+    trace: &Path,
+    expected: &Identity,
+    deadline: Instant,
+    include_artwork: bool,
+    control: Option<&CaptureControl>,
+) -> Result<Current> {
+    ensure!(
+        Instant::now() < deadline,
+        "fresh state capture deadline expired before discovery"
+    );
+    check_capture(control)?;
+    let provider = if let Some(control) = control {
+        control
+            .run(
+                Duration::from_secs(15),
+                "state USB discovery deadline",
+                device::provider(),
+            )
+            .await?
+    } else {
+        timeout_at(
+            deadline.min(Instant::now() + Duration::from_secs(15)),
+            device::provider(),
+        )
+        .await
+        .context("state USB discovery deadline")??
+    };
+    let device = provider.udid.clone();
+    let transfer_path = trace.join("afc");
+    check_capture(control)?;
+    fs::DirBuilder::new().mode(0o700).create(&transfer_path)?;
+    check_capture(control)?;
+    let mut afc = if let Some(control) = control {
+        Transfer::connect_current_summary(&provider, &transfer_path, control).await?
+    } else {
+        Transfer::connect(&provider, &transfer_path, deadline).await?
+    };
+    let mut names = vec![
+        "iTunes_Control/iTunes/iTunesPrefs",
+        "iTunes_Control/iTunes/iTunesPrefs.plist",
+        "iTunes_Control/iTunes/iTunesCDB",
+    ];
+    let mut caps = vec![
+        1024 * 1024,
+        1024 * 1024,
+        music_protocol::catalogue::anchor::MAX_INPUT_BYTES as u64,
+    ];
+    if include_artwork {
+        names.push("iTunes_Control/Artwork/ArtworkDB");
+        caps.push(32 * 1024 * 1024);
+    }
+    let mut attrs = Vec::new();
+    let mut copies = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        check_capture(control)?;
+        let observed = afc
+            .stat(name)
+            .await?
+            .context("required device library input missing")?;
+        let size: u64 = observed
+            .get("st_size")
+            .context("device file size missing")?
+            .parse()?;
+        regular_size(&observed, size)?;
+        ensure!(
+            size > 0 && size <= caps[index],
+            "device library input exceeds bound"
+        );
+        let mut bytes = Vec::new();
+        afc.read_exact(name, size, caps[index], &mut bytes).await?;
+        check_capture(control)?;
+        let path = trace.join(name.rsplit('/').next().unwrap());
+        private_write(&path, &bytes)?;
+        check_capture(control)?;
+        attrs.push(observed);
+        copies.push(bytes);
+    }
+    check_capture(control)?;
+    let library = identity::parse(&copies[0])?;
+    library.ensure_matches(&identity::parse(&copies[1])?)?;
+    let identity = Identity::new(&device, &library)?;
+    ensure!(
+        identity.device_digest() == expected.device_digest()
+            && identity.library_digest() == expected.library_digest(),
+        "fresh device or library differs from saved plan"
+    );
+    let catalog = if let Some(control) = control {
+        catalogue_capture::read_until_controlled(&trace.join("catalog"), control, || async {
+            Ok(provider)
+        })
+        .await?
+    } else {
+        catalogue_capture::read_within(&trace.join("catalog"), deadline, || async { Ok(provider) })
+            .await?
+    };
+    for (index, name) in names.iter().enumerate() {
+        let mut after = afc
+            .stat(name)
+            .await?
+            .context("device library input disappeared")?;
+        let mut before = attrs[index].clone();
+        before.remove("st_atime");
+        after.remove("st_atime");
+        ensure!(
+            after == before,
+            "device library input attributes changed during capture"
+        );
+        ensure!(
+            afc.read_hash(name, copies[index].len() as u64, caps[index])
+                .await?
+                == <[u8; 32]>::from(Sha256::digest(&copies[index])),
+            "device library input bytes changed during capture"
+        );
+    }
+    drop(afc);
+    let artwork_db = if include_artwork { copies.pop() } else { None };
+    let cdb = copies.pop().unwrap();
+    let plist_preferences = copies.pop().unwrap();
+    let raw_preferences = copies.pop().unwrap();
+    check_capture(control)?;
+    let anchors = music_protocol::catalogue::anchor::parse(&cdb)?;
+    check_capture(control)?;
+    ensure!(
+        anchors.database_pid() == catalog.database_pid(),
+        "copied CDB and SQL catalogue identities differ"
+    );
+    let receipt = serde_json::json!({
+        "schema":"rustunes.current-state", "device_sha256":hex(&identity.device_digest()),
+        "library_sha256":hex(&identity.library_digest()), "database_sha256":hex(&catalog.source_hashes().database),
+        "wal_sha256":catalog.source_hashes().wal.map(|h|hex(&h)), "media_anchor":catalog.persisted_media_anchor(),
+        "track_count":catalog.tracks().len(), "raw_preferences_sha256":hex(&Sha256::digest(&raw_preferences)),
+        "plist_preferences_sha256":hex(&Sha256::digest(&plist_preferences)), "cdb_sha256":hex(&Sha256::digest(&cdb)),
+        "artwork_database_sha256":artwork_db.as_ref().map(|bytes|hex(&Sha256::digest(bytes))),
+        "saved_cdb_media_anchor":anchors.saved_media_anchor(), "saved_cdb_voice_memo_anchor":anchors.saved_voice_memo_anchor(),
+        "atomic_snapshot_claimed":false, "phone_writes":0
+    });
+    check_capture(control)?;
+    let bytes = if control.is_some() {
+        current_json_bytes(&receipt)?
+    } else {
+        serde_json::to_vec_pretty(&receipt)?
+    };
+    check_capture(control)?;
+    private_write(&trace.join("state-receipt.json"), &bytes)?;
+    check_capture(control)?;
+    File::open(trace)?.sync_all()?;
+    check_capture(control)?;
+    Ok(Current {
+        device,
+        identity,
+        library,
+        catalog,
+        raw_preferences,
+        plist_preferences,
+        cdb,
+        artwork_db,
+        receipt_sha256: Sha256::digest(&bytes).into(),
+    })
 }
 
 pub fn hex(bytes: &[u8]) -> String {

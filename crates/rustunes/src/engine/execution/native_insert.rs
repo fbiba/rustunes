@@ -91,6 +91,9 @@ impl FreshState {
     pub(crate) fn ensure_catalog(&self, catalog: &Catalog) -> Result<()> {
         self.ancillary.ensure_current(catalog, &self.identity)
     }
+    pub(crate) async fn verify_state(&self, afc: &mut Transfer) -> Result<()> {
+        state_guard(afc, self).await
+    }
     pub(crate) fn state_read_chunks(&self) -> Result<u64> {
         self.files
             .iter()
@@ -305,6 +308,53 @@ pub struct PendingVerification {
     pub evidence: TransferEvidence,
 }
 
+/// New ordinary insert only. No attempt/reservation is created until the first
+/// read-only guards succeed. The exact final input is published before prepare.
+pub(crate) async fn execute_new_native_insert<F, Fut>(
+    journal: &mut Journal,
+    insertion: Insertion<'_>,
+    input_path: &Path,
+    input_bytes: &[u8],
+    control: &Control,
+    connect: F,
+) -> Result<PendingVerification>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    ensure!(
+        insertion.state.copied_cdb.is_some(),
+        "production insertion requires bound copied CDB evidence"
+    );
+    ensure!(
+        journal.outstanding()?.is_none(),
+        "new insertion requires an idle journal"
+    );
+    ensure!(
+        insertion.attempt.kind == AttemptKind::Insert,
+        "deferred preparation is insertion-only"
+    );
+    ensure!(
+        input_bytes.len() as u64 <= SMALL
+            && <[u8; 32]>::from(Sha256::digest(input_bytes))
+                == insertion.attempt.input_receipt_sha256,
+        "deferred input differs from immutable insertion intent"
+    );
+    ensure!(
+        !input_path.try_exists()?,
+        "final insertion input already exists"
+    );
+    execute_insert_inner(
+        journal,
+        insertion,
+        input_path,
+        input_bytes,
+        control,
+        connect,
+    )
+    .await
+}
+
 #[derive(Debug)]
 struct StateReadDrift {
     file: &'static str,
@@ -383,6 +433,242 @@ fn finish_read_only_preflight(
     )?;
     control.check()?;
     journal.prepare(copy_intent(prepared))
+}
+
+async fn execute_insert_inner<F, Fut>(
+    journal: &mut Journal,
+    insertion: Insertion<'_>,
+    input_path: &Path,
+    input_bytes: &[u8],
+    control: &Control,
+    connect: F,
+) -> Result<PendingVerification>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    control.check()?;
+    ensure!(
+        control.deadline.duration_since(Instant::now()) <= MAX_DURATION,
+        "insertion deadline exceeds 180-second bound"
+    );
+    let prepared = copy_intent(insertion.attempt);
+    validate_preparation(&prepared, insertion.state)?;
+    journal.ensure_identity(&Identity::new(
+        &insertion.state.device,
+        &insertion.state.identity,
+    )?)?;
+    let mut source = BoundSource::open(insertion.source, &prepared.content.source.require_alac()?)?;
+    let asset_id = (prepared.content.track_pid as i64).to_string();
+    let catalog_policy = insertion.state.ancillary.audio(&asset_id)?;
+    catalog_policy.ensure_session(
+        insertion.state.identity.library_id(),
+        insertion.state.anchor,
+    )?;
+    let session_prepared = session::prepare(
+        insertion.templates.request,
+        &insertion.templates.finished,
+        insertion.state.identity.library_id(),
+        insertion.state.anchor,
+    )?;
+    let operations = operation_budget(insertion.state, prepared.content.source.file_bytes)?;
+    create_trace(insertion.trace)?;
+    durable_write(insertion.trace, "operation.plist", &prepared.operation)?;
+    let cdb = insertion
+        .state
+        .copied_cdb
+        .as_ref()
+        .context("production profile lacks CDB binding")?;
+    let policy = Value::Dictionary(
+        [
+            ("Format".to_owned(), "snapshot-bound-audio-ancillary".into()),
+            (
+                "BindingSHA256".to_owned(),
+                Value::Data(insertion.state.ancillary.binding_sha256().to_vec()),
+            ),
+            (
+                "MediaAnchor".to_owned(),
+                u64::from(insertion.state.anchor).into(),
+            ),
+            ("OwnAssetID".to_owned(), asset_id.clone().into()),
+            ("ForeignArtworkProvider".to_owned(), "Unavailable".into()),
+            ("GeniusProvider".to_owned(), "Disabled".into()),
+            (
+                "CopiedCDBSHA256".to_owned(),
+                Value::Data(cdb.sha256.to_vec()),
+            ),
+            ("CopiedCDBBytes".to_owned(), cdb.bytes.into()),
+            (
+                "SavedVoiceMemoAnchor".to_owned(),
+                u64::from(music_protocol::protocol::templates::QUALIFIED_VOICE_MEMO_ANCHOR).into(),
+            ),
+            (
+                "MaximumManifestAssets".to_owned(),
+                (music_protocol::protocol::ancillary::MAX_MANIFEST_ASSETS as u64).into(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let mut bytes = Vec::new();
+    policy.to_writer_binary(&mut bytes)?;
+    durable_write(insertion.trace, "ancillary-policy.plist", &bytes)?;
+    let result = async {
+        control.check()?;
+        let provider = timeout_at(
+            control
+                .deadline
+                .min(Instant::now() + Duration::from_secs(15)),
+            connect(),
+        )
+        .await
+        .context("insertion discovery deadline")??;
+        ensure!(
+            provider.udid == insertion.state.device,
+            "discovered device differs from prepared state"
+        );
+        let mut afc = Transfer::connect_bounded(
+            &provider,
+            insertion.trace,
+            control.deadline,
+            operations,
+            Arc::clone(&control.cancelled),
+        )
+        .await?;
+        let stage = format!("Airlock/Media/{asset_id}.m4a");
+        let bare = format!("Airlock/Media/{asset_id}");
+        let destination = &prepared.content.path;
+        let guarded = async {
+            namespace_guard(&mut afc, destination, &stage, &bare).await?;
+            state_guard(&mut afc, insertion.state).await?;
+            source.check()?;
+            control.check()
+        }
+        .await;
+        if guarded.is_err() {
+            // Drop the only connected transport before returning refresh authority.
+            drop(afc);
+            return finish_read_only_preflight(
+                journal,
+                &prepared,
+                input_path,
+                input_bytes,
+                control,
+                guarded,
+            )
+            .map(|_| unreachable!());
+        }
+        let attempt = finish_read_only_preflight(
+            journal,
+            &prepared,
+            input_path,
+            input_bytes,
+            control,
+            guarded,
+        )?;
+        control.check()?;
+        let mut session = Session::connect(
+            &provider,
+            session_prepared,
+            insertion.trace,
+            control.deadline,
+        )
+        .await?;
+        // Every mutable prerequisite is checked again in this exact Ready
+        // session, before recording Started and before the first AFC write.
+        state_guard(&mut afc, insertion.state).await?;
+        namespace_guard(&mut afc, destination, &stage, &bare).await?;
+        source.check()?;
+        control.check()?;
+        let signature = session.sign_metadata(&prepared.operation)?;
+        durable_write(insertion.trace, "operation.cig", &signature)?;
+        sync_trace(insertion.trace)?;
+        let ready_sha256 = session.ready_receipt_sha256();
+        let start = StartEvidence {
+            ready_media_anchor: insertion.state.anchor,
+            ready_receipt_sha256: ready_sha256,
+            signature,
+        };
+        let permit = journal.mark_started(attempt, start)?;
+        // No mutating AFC call is reachable above this durable transition.
+        let operation_sha256: [u8; 32] = Sha256::digest(permit.operation()).into();
+        session.stage_metadata(&mut afc, &permit).await?;
+        control.check()?;
+        session.finish_metadata().await?;
+        session.wait_for_audio_with_policy(&catalog_policy).await?;
+        source.check()?;
+        source.file().rewind()?;
+        let source_bytes = source.file_bytes();
+        staging_folders(&mut afc, false).await?;
+        let mut upload = ObservedUpload::new(
+            source.file(),
+            None,
+            prepared.content.track_pid,
+            source_bytes,
+        );
+        let uploaded = afc
+            .write_audio_new(&stage, &mut upload, source_bytes)
+            .await?;
+        upload.finish()?;
+        ensure!(
+            uploaded == prepared.content.source.full_file_sha256,
+            "uploaded source hash differs; partial stage retained"
+        );
+        source.check()?;
+        afc.require_absent(destination).await?;
+        // The write checked the stored size; the permanent file must be this same file.
+        let staged = afc
+            .rename_absent(&stage, &bare, source.file_bytes())
+            .await?;
+        crate::engine::state::audio_index::cache::uploaded(
+            &Identity::new(&insertion.state.device, &insertion.state.identity)?.device_digest(),
+            destination,
+            &staged,
+            &prepared.content.source,
+        );
+        afc.require_absent(destination).await?;
+        control.check()?;
+        session.complete_audio(&asset_id, destination).await?;
+        session.wait_finished().await?;
+        let terminal_sha256 = session.terminal_receipt_sha256()?;
+        drop(session);
+        let permanent = afc
+            .stat(destination)
+            .await?
+            .context("permanent audio disappeared")?;
+        ensure!(
+            same_file(&staged, &permanent),
+            "permanent audio differs from the upload"
+        );
+        source.check()?;
+        control.check()?;
+        drop(afc);
+        let mut evidence = TransferEvidence {
+            content: prepared.content.clone(),
+            operation_sha256,
+            ready_receipt_sha256: ready_sha256,
+            terminal_receipt_sha256: terminal_sha256,
+            // The permanent file is the stage these bytes were written to.
+            permanent_audio_sha256: uploaded,
+            media_anchor: insertion
+                .state
+                .anchor
+                .checked_add(1)
+                .context("Media anchor exhausted")?,
+            receipt_sha256: [0; 32],
+        };
+        let receipt = evidence_plist(&evidence)?;
+        evidence.receipt_sha256 = Sha256::digest(&receipt).into();
+        durable_write(insertion.trace, "pending-verification.plist", &receipt)?;
+        sync_trace(insertion.trace)?;
+        Ok(PendingVerification { permit, evidence })
+    }
+    .await;
+    if let Err(error) = &result {
+        // A logging failure never changes the original transport/journal outcome.
+        let _ = durable_write(insertion.trace, "error.txt", format!("{error:#}\nNo retry or cleanup was attempted. Inspect the journal and reconcile Started state.\n").as_bytes());
+    }
+    result
 }
 
 fn validate_preparation(prepared: &PreparedAttempt, state: &FreshState) -> Result<()> {
@@ -599,6 +885,36 @@ async fn namespace_guard(
     }
     Ok(())
 }
+
+/// Both guards of a single insert for a whole batch: unchanged state files,
+/// an empty metadata namespace, and no stage, bare name or permanent file for
+/// any member. `members` holds (stage, bare, destination) per member.
+pub(crate) async fn batch_guard(
+    afc: &mut Transfer,
+    state: &FreshState,
+    members: &[(String, String, String)],
+) -> Result<()> {
+    // The checks every member shared (folders, the empty metadata namespace,
+    // no metadata or signature file) bracket the per-member names instead of
+    // repeating for each of them.
+    let folders = members
+        .iter()
+        .map(|(_, _, destination)| {
+            Ok(destination
+                .rsplit_once('/')
+                .context("missing destination folder")?
+                .0)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    shared_namespace_guard(afc, &folders).await?;
+    for (stage, bare, destination) in members {
+        for path in [stage, bare, destination] {
+            afc.require_absent(path).await?;
+        }
+    }
+    shared_namespace_guard(afc, &folders).await?;
+    state_guard(afc, state).await
+}
 async fn shared_namespace_guard(afc: &mut Transfer, folders: &BTreeSet<&str>) -> Result<()> {
     afc.require_directory("iTunes_Control/Sync/Media").await?;
     for folder in folders {
@@ -705,6 +1021,61 @@ pub(crate) fn upload_budget(source_bytes: u64) -> Result<usize> {
         "audio upload allowance exceeds bound"
     );
     Ok(operations)
+}
+
+async fn state_guard(afc: &mut Transfer, state: &FreshState) -> Result<()> {
+    let cdb = state
+        .copied_cdb
+        .as_ref()
+        .context("state has no bound copied CDB")?;
+    let mut before = Vec::new();
+    for name in STATE_NAMES {
+        before.push(afc.stat(&format!("iTunes_Control/iTunes/{name}")).await?);
+    }
+    for (index, expected) in state.files.iter().enumerate() {
+        let path = format!("iTunes_Control/iTunes/{}", STATE_NAMES[index]);
+        if let Some(expected) = expected {
+            guard_size(
+                before[index]
+                    .as_ref()
+                    .context("required state file is absent")?,
+                expected,
+                STATE_NAMES[index],
+                if index < 2 { SMALL } else { MAX_CATALOG },
+            )?;
+            let hash = afc
+                .read_hash(
+                    &path,
+                    expected.bytes,
+                    if index < 2 { SMALL } else { MAX_CATALOG },
+                )
+                .await?;
+            guard_hash(hash, expected, STATE_NAMES[index])?;
+        } else {
+            ensure!(
+                before[index].is_none(),
+                "live WAL presence differs from prepared state"
+            );
+        }
+    }
+    guard_size(
+        before[5].as_ref().context("bound CDB is absent")?,
+        cdb,
+        STATE_NAMES[5],
+        MAX_CATALOG,
+    )?;
+    let hash = afc
+        .read_hash("iTunes_Control/iTunes/iTunesCDB", cdb.bytes, MAX_CATALOG)
+        .await?;
+    guard_hash(hash, cdb, STATE_NAMES[5])?;
+    for (index, name) in STATE_NAMES.iter().enumerate() {
+        let after = afc.stat(&format!("iTunes_Control/iTunes/{name}")).await?;
+        ensure!(
+            stable_attrs(&before[index]) == stable_attrs(&after),
+            "state file attributes changed across readback"
+        );
+    }
+    Ok(())
 }
 
 fn guard_size(
