@@ -358,6 +358,142 @@ fn copy_intent(p: &PreparedAttempt) -> PreparedAttempt {
     }
 }
 
+fn finish_read_only_preflight(
+    journal: &mut Journal,
+    prepared: &PreparedAttempt,
+    input_path: &Path,
+    input_bytes: &[u8],
+    control: &Control,
+    guarded: Result<()>,
+) -> Result<AttemptId> {
+    control.check()?;
+    if let Err(error) = guarded {
+        return Err(match error.downcast::<StateReadDrift>() {
+            Ok(drift) => PreSessionStateDrift { drift }.into(),
+            Err(other) => other,
+        });
+    }
+    durable_write(
+        input_path.parent().context("input parent missing")?,
+        input_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("invalid input name")?,
+        input_bytes,
+    )?;
+    control.check()?;
+    journal.prepare(copy_intent(prepared))
+}
+
+fn validate_preparation(prepared: &PreparedAttempt, state: &FreshState) -> Result<()> {
+    let content = &prepared.content;
+    ensure!(
+        content.artwork.is_none(),
+        "insertion engine does not combine artwork transfer"
+    );
+    ensure!(
+        content.source.file_bytes > 0 && content.source.file_bytes <= MAX_AUDIO,
+        "source exceeds bounded audio profile"
+    );
+    ensure!(
+        prepared.current_media_anchor == state.anchor
+            && prepared.input_receipt_sha256 == state.input_receipt_sha256,
+        "preparation and fresh-state evidence differ"
+    );
+    for id in [
+        Some(content.track_pid),
+        prepared.new_album_pid,
+        prepared.new_artist_pid,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ensure!(
+            !state.occupied.contains(&id),
+            "new identity collides with current catalog"
+        );
+    }
+    session::validate_music_path(&content.path)?;
+    ensure!(
+        !state
+            .paths
+            .iter()
+            .any(|path| path.eq_ignore_ascii_case(&content.path)),
+        "destination is already referenced by current catalog"
+    );
+    check_database_prefix(&prepared.operation, state)
+}
+
+/// The single-insert preparation checks for every member of an insert batch:
+/// bounded ALAC or MP3 sources, identities and destinations free in this exact state
+/// and distinct within the batch, and the operation's database identities.
+/// Each `insert_track` names exactly its member's cover, or none.
+pub(crate) fn validate_batch<'a>(
+    state: &FreshState,
+    operation: &[u8],
+    members: impl IntoIterator<Item = (&'a Content, [Option<u64>; 2])>,
+) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut caches = BTreeSet::new();
+    let inserts = batch_inserts(operation)?;
+    for (content, new) in members {
+        let item = inserts
+            .get(&content.track_pid)
+            .context("insert batch operation does not insert a member")?;
+        let (cache, checksum) = (
+            item.get("artwork_cache_id")
+                .map(|v| v.as_unsigned_integer().context("invalid artwork cache ID"))
+                .transpose()?,
+            item.get("artwork_checksum")
+                .and_then(Value::as_unsigned_integer)
+                .context("insert has no artwork checksum")?,
+        );
+        // The native checksum counts the picture and its container bytes: an
+        // MP4 cover's whole `data` atom (16 header bytes and the image), an
+        // ID3 or FLAC cover's image payload alone.
+        let header = if content.source.format().mp4() { 16 } else { 0 };
+        match &content.artwork {
+            Some(art) => ensure!(
+                cache == Some(u64::from(art.cache_id))
+                    && art.cache_id >= 100
+                    && caches.insert(art.cache_id)
+                    && Some(checksum) == art.bytes.checked_add(header + 1),
+                "insert batch cover differs from its operation"
+            ),
+            None => ensure!(
+                cache.is_none() && checksum == 0,
+                "insert batch operation names a cover its member lacks"
+            ),
+        }
+        ensure!(
+            content.source.file_bytes > 0 && content.source.file_bytes <= MAX_AUDIO,
+            "source exceeds bounded audio profile"
+        );
+        for id in std::iter::once(content.track_pid).chain(new.into_iter().flatten()) {
+            ensure!(
+                !state.occupied.contains(&id) && ids.insert(id),
+                "new identity collides with the current catalog or another batch member"
+            );
+        }
+        session::validate_format_music_path(&content.path, content.source.format())?;
+        ensure!(
+            !state
+                .paths
+                .iter()
+                .any(|path| path.eq_ignore_ascii_case(&content.path))
+                && paths.insert(content.path.to_ascii_lowercase()),
+            "destination is already referenced by the current catalog or another batch member"
+        );
+    }
+    ensure!(!ids.is_empty(), "insert batch has no members");
+    ensure!(
+        inserts.len() == paths.len(),
+        "insert batch operation inserts a track outside its members"
+    );
+    check_database_prefix(operation, state)
+}
+
 /// Each `insert_track` item of a batch operation by its track PID.
 fn batch_inserts(operation: &[u8]) -> Result<BTreeMap<u64, Dictionary>> {
     let operation = Value::from_reader(Cursor::new(operation))?;
@@ -387,3 +523,312 @@ fn batch_inserts(operation: &[u8]) -> Result<BTreeMap<u64, Dictionary>> {
     }
     Ok(inserts)
 }
+
+fn check_database_prefix(operation: &[u8], state: &FreshState) -> Result<()> {
+    let operation = Value::from_reader(Cursor::new(operation))?;
+    let db = operation
+        .as_dictionary()
+        .and_then(|d| d.get("operations"))
+        .and_then(Value::as_array)
+        .and_then(|ops| ops.first())
+        .and_then(Value::as_dictionary)
+        .context("missing prepared database prefix")?;
+    ensure!(
+        db.get("pid")
+            .and_then(Value::as_signed_integer)
+            .map(|v| v as u64)
+            == Some(state.database_pid)
+            && db
+                .get("db_info")
+                .and_then(Value::as_dictionary)
+                .and_then(|d| d.get("primary_container_pid"))
+                .and_then(Value::as_signed_integer)
+                .map(|v| v as u64)
+                == Some(state.container_pid),
+        "prepared database identities differ from current catalog"
+    );
+    Ok(())
+}
+
+fn operation_budget(state: &FreshState, source_bytes: u64) -> Result<usize> {
+    ensure!(
+        source_bytes <= MAX_AUDIO,
+        "audio operation budget exceeds bound"
+    );
+    let state_chunks = state.state_read_chunks()?;
+    // Two full state guards + audio writes (counted three times, from when
+    // uploads were read back twice) + fixed metadata, attributes, opens/closes,
+    // namespace and rename allowance.
+    let operations = 512_u64
+        .checked_add(
+            state_chunks
+                .checked_mul(2)
+                .context("state budget overflow")?,
+        )
+        .and_then(|n| n.checked_add(source_bytes.div_ceil(CHUNK) * 3))
+        .context("AFC operation budget overflow")?;
+    let operations = usize::try_from(operations)?;
+    ensure!(
+        operations <= MAX_BOUNDED_OPS,
+        "derived AFC operation allowance exceeds bound"
+    );
+    Ok(operations)
+}
+
+async fn namespace_guard(
+    afc: &mut Transfer,
+    destination: &str,
+    stage: &str,
+    bare: &str,
+) -> Result<()> {
+    let folder = destination
+        .rsplit_once('/')
+        .context("missing destination folder")?
+        .0;
+    for directory in ["iTunes_Control/Sync/Media", folder] {
+        afc.require_directory(directory).await?;
+    }
+    afc.require_directory_or_absent(STAGING_MEDIA).await?;
+    let names = afc.names("iTunes_Control/Sync/Media").await?;
+    ensure!(
+        names.iter().all(|name| name == "." || name == ".."),
+        "metadata namespace contains leftovers; nothing removed or overwritten"
+    );
+    for path in [METADATA, SIGNATURE, stage, bare, destination] {
+        afc.require_absent(path).await?;
+    }
+    Ok(())
+}
+async fn shared_namespace_guard(afc: &mut Transfer, folders: &BTreeSet<&str>) -> Result<()> {
+    afc.require_directory("iTunes_Control/Sync/Media").await?;
+    for folder in folders {
+        afc.require_directory(folder).await?;
+    }
+    afc.require_directory_or_absent(STAGING_MEDIA).await?;
+    let names = afc.names("iTunes_Control/Sync/Media").await?;
+    ensure!(
+        names.iter().all(|name| name == "." || name == ".."),
+        "metadata namespace contains leftovers; nothing removed or overwritten"
+    );
+    for path in [METADATA, SIGNATURE] {
+        afc.require_absent(path).await?;
+    }
+    Ok(())
+}
+
+/// One connection's allowance for two batch guards plus the metadata and
+/// signature writes and readbacks.
+pub(crate) fn batch_guard_budget(
+    state: &FreshState,
+    members: usize,
+    operation_bytes: usize,
+) -> Result<usize> {
+    ensure!(
+        operation_bytes > 0
+            && operation_bytes <= music_protocol::protocol::signing::MAX_OPERATION_BYTES,
+        "insert batch operation exceeds bound"
+    );
+    // Per member and guard: three directories, one listing, five stats.
+    let operations = state
+        .state_read_chunks()?
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(u64::try_from(members).ok()?.checked_mul(2 * 16)?))
+        .and_then(|n| n.checked_add((operation_bytes as u64).div_ceil(CHUNK) * 4 + 512))
+        .context("insert batch guard budget overflow")?;
+    let operations = usize::try_from(operations)?;
+    ensure!(
+        operations <= MAX_SESSION_OPS,
+        "insert batch guard allowance exceeds bound"
+    );
+    Ok(operations)
+}
+
+/// One member's upload connection: write, stage readback, rename.
+/// A new track's audio as an upload reads it, reported as
+/// `Event::Uploading` before each read: the upload sends what it read before
+/// it reads more.
+pub(crate) struct ObservedUpload<'a> {
+    file: &'a mut File,
+    source: Option<&'a str>,
+    track: u64,
+    file_bytes: u64,
+    read: u64,
+}
+
+impl<'a> ObservedUpload<'a> {
+    pub(crate) fn new(
+        file: &'a mut File,
+        source: Option<&'a str>,
+        track: u64,
+        file_bytes: u64,
+    ) -> Self {
+        Self {
+            file,
+            source,
+            track,
+            file_bytes,
+            read: 0,
+        }
+    }
+    fn report(&self, sent: u64) -> Result<()> {
+        crate::engine::observe(crate::engine::Event::Uploading {
+            source: self.source,
+            track: self.track,
+            sent,
+            file_bytes: self.file_bytes,
+        })
+    }
+    /// The upload returned: all of the audio is on the phone.
+    pub(crate) fn finish(self) -> Result<()> {
+        self.report(self.file_bytes)
+    }
+}
+
+impl std::io::Read for ObservedUpload<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        // A report that fails stops nothing: the upload is under way.
+        let _ = self.report(self.read);
+        let read = std::io::Read::read(self.file, buffer)?;
+        self.read += read as u64;
+        Ok(read)
+    }
+}
+
+pub(crate) fn upload_budget(source_bytes: u64) -> Result<usize> {
+    ensure!(
+        source_bytes > 0 && source_bytes <= MAX_AUDIO,
+        "audio upload exceeds bound"
+    );
+    let operations = usize::try_from(source_bytes.div_ceil(CHUNK) * 2 + 64)?;
+    ensure!(
+        operations <= MAX_BOUNDED_OPS,
+        "audio upload allowance exceeds bound"
+    );
+    Ok(operations)
+}
+
+fn guard_size(
+    attrs: &Attributes,
+    expected: &ExpectedFile,
+    file: &'static str,
+    cap: u64,
+) -> Result<()> {
+    // Validate the full supported stat shape BEFORE classifying a mismatch.
+    // Absence, nonregular objects, malformed/oversized attributes stay ordinary
+    // refusal errors and can never be mistaken for refreshable drift.
+    let actual: u64 = attrs
+        .get("st_size")
+        .context("missing state size")?
+        .parse()?;
+    regular_size(attrs, actual)?;
+    let _: u64 = attrs
+        .get("st_mtime")
+        .context("missing state modification time")?
+        .parse()?;
+    ensure!(actual <= cap, "observed state file exceeds bound");
+    if actual != expected.bytes {
+        return Err(StateReadDrift {
+            file,
+            reason: "regular file size changed",
+        }
+        .into());
+    }
+    Ok(())
+}
+fn guard_hash(actual: [u8; 32], expected: &ExpectedFile, file: &'static str) -> Result<()> {
+    if actual != expected.sha256 {
+        return Err(StateReadDrift {
+            file,
+            reason: "complete file digest changed",
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn stable_attrs(attrs: &Option<Attributes>) -> Option<BTreeMap<&str, &str>> {
+    attrs.as_ref().map(|attrs| {
+        attrs
+            .iter()
+            .filter(|(key, _)| key.as_str() != "st_atime")
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    })
+}
+
+pub(crate) use music_protocol::media::held_source::BoundSource;
+pub(crate) use music_protocol::protocol::transfer::{
+    STAGING_ARTWORK, STAGING_MEDIA, staging_folders,
+};
+
+pub(crate) fn create_trace(path: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .context("insertion trace must be a new private directory")?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()?;
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+pub(crate) fn durable_write(trace: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(trace.join(name))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    File::open(trace)?.sync_all()?;
+    Ok(())
+}
+pub(crate) fn sync_trace(trace: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(trace)?;
+    ensure!(
+        metadata.is_dir() && metadata.permissions().mode() & 0o777 == 0o700,
+        "trace directory changed"
+    );
+    for entry in fs::read_dir(trace)? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(metadata.is_file(), "unexpected nonregular trace entry");
+        File::open(path)?.sync_all()?;
+    }
+    File::open(trace)?.sync_all()?;
+    Ok(())
+}
+fn evidence_plist(evidence: &TransferEvidence) -> Result<Vec<u8>> {
+    let mut value = Dictionary::new();
+    value.insert(
+        "Status".into(),
+        "PendingIndependentCatalogVerification".into(),
+    );
+    value.insert(
+        "TrackPID".into(),
+        (evidence.content.track_pid as i64).into(),
+    );
+    value.insert("PermanentPath".into(), evidence.content.path.clone().into());
+    value.insert(
+        "AudioBytes".into(),
+        evidence.content.source.file_bytes.into(),
+    );
+    value.insert("MediaAnchor".into(), evidence.media_anchor.into());
+    for (name, hash) in [
+        ("OperationSHA256", evidence.operation_sha256),
+        ("ReadyFrameSHA256", evidence.ready_receipt_sha256),
+        ("TerminalFrameSHA256", evidence.terminal_receipt_sha256),
+        ("PermanentAudioSHA256", evidence.permanent_audio_sha256),
+        ("EncodedAudioSHA256", evidence.content.source.audio.sha256),
+    ] {
+        value.insert(name.into(), hex(&hash).into());
+    }
+    let mut bytes = Vec::new();
+    Value::Dictionary(value).to_writer_binary(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+use std::path::PathBuf;

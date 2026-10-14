@@ -27,3 +27,6 @@ pub(crate) fn batch_cover(
     )
     .map(Some)
 }
+
+#[cfg(test)]
+mod tests;
