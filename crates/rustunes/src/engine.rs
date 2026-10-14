@@ -86,6 +86,10 @@ impl Engine {
     pub(crate) fn command_options(&self) -> String {
         self.config.device.command_options()
     }
+    pub async fn verify(&self, request: VerificationRequest<'_>) -> Result<VerificationResult> {
+        self.check()?;
+        self.scope(Box::pin(verification::run(request, self))).await
+    }
     /// Scope an engine operation or CLI command to this explicit device
     /// configuration. Nested engines remain isolated from one another.
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {

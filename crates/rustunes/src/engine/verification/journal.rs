@@ -168,6 +168,296 @@ struct Prepared {
     report: Report,
 }
 
+/// A new private trace is required. Every provider must identify the same
+/// device. Identity/preparation failures create no output. After those gates,
+/// failure returns Err and preserves an explicitly incomplete report; earlier
+/// per-file evidence never becomes overall success or reconciliation.
+pub async fn verify<F, Fut>(
+    journal: &Journal,
+    current: &Current,
+    selection: Selection,
+    trace: &Path,
+    control: &ReadControl,
+    mut connect: F,
+) -> Result<Report>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    control.check()?;
+    ensure!(
+        control.deadline.saturating_duration_since(Instant::now()) <= MAX_DURATION,
+        "verification deadline exceeds 1800-second bound"
+    );
+    // Namespace checks precede even local report creation or binding output.
+    let mut prepared = prepare(journal, current, selection)?;
+    let mut first_provider = if prepared.batches.is_empty() {
+        None
+    } else {
+        control.check()?;
+        let provider = timeout_at(
+            control
+                .deadline
+                .min(Instant::now() + Duration::from_secs(15)),
+            connect(),
+        )
+        .await
+        .context("verification discovery deadline")??;
+        ensure!(
+            provider.udid == current.device,
+            "discovered device differs from verification identity"
+        );
+        Some(provider)
+    };
+    create_trace(trace)?;
+    let mut progress = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(trace.join("progress.jsonl"))?;
+    report(trace, "intent.json", &prepared.report)?;
+    let result: Result<()> = async {
+        for (number, batch) in prepared.batches.iter().enumerate() {
+            control.check()?;
+            let batch_bytes: u64 = batch
+                .indices
+                .iter()
+                .map(|&i| prepared.bindings[i].content.source.file_bytes)
+                .sum();
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::VerifyingAudioBatch {
+                    number: number + 1,
+                    total: prepared.batches.len(),
+                    tracks: batch.indices.len(),
+                    bytes: batch_bytes,
+                },
+            ))?;
+            let provider = if let Some(provider) = first_provider.take() {
+                provider
+            } else {
+                timeout_at(
+                    control
+                        .deadline
+                        .min(Instant::now() + Duration::from_secs(15)),
+                    connect(),
+                )
+                .await
+                .context("verification discovery deadline")??
+            };
+            ensure!(
+                provider.udid == current.device,
+                "discovered device differs from verification identity"
+            );
+            let batch_trace = trace.join(format!("batch-{number:04}"));
+            create_trace(&batch_trace)?;
+            let mut afc = Transfer::connect_bounded_readonly_summary(
+                &provider,
+                &batch_trace,
+                control.deadline,
+                batch.operations,
+                Arc::clone(&control.cancelled),
+            )
+            .await?;
+            read_batch(
+                &mut afc,
+                &prepared.state,
+                &prepared.device,
+                &prepared.bindings,
+                &mut prepared.report.tracks,
+                batch,
+                number,
+                control,
+            )
+            .await?;
+            drop(afc);
+            for &index in &batch.indices {
+                serde_json::to_writer(&mut progress, &prepared.report.tracks[index])?;
+                writeln!(progress)?;
+            }
+            progress.sync_all()?;
+            prepared.report.completed_batches += 1;
+            let matched = batch
+                .indices
+                .iter()
+                .filter(|&&i| {
+                    prepared.report.tracks[i].audio_status
+                        == AudioStatus::VerifiedTransferredContainer
+                })
+                .count();
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::AudioBatchChecked {
+                    number: number + 1,
+                    total: prepared.batches.len(),
+                    matched,
+                    findings: batch.indices.len() - matched,
+                },
+            ))?;
+        }
+        // Covers whose audio verified, checked in groups that share one
+        // connection and one pair of state guards.
+        let mut indices = Vec::new();
+        let mut checks = Vec::new();
+        for &index in &prepared.artwork_indices {
+            if prepared.report.tracks[index].audio_status
+                != AudioStatus::VerifiedTransferredContainer
+            {
+                continue;
+            }
+            let binding = &prepared.bindings[index];
+            let art = binding
+                .content
+                .artwork
+                .as_ref()
+                .context("planned artwork binding absent")?;
+            indices.push(index);
+            checks.push(artwork::TrackCheck {
+                target: binding.content.track_pid,
+                expected: TrackArtworkExpectation {
+                    cache_id: art.cache_id,
+                    bytes: art.bytes,
+                    sha256: art.sha256,
+                },
+                trace: trace.join(format!("artwork-{index:04}")),
+            });
+        }
+        let total = prepared.artwork_indices.len();
+        // Covers whose files keep the stats of a verified readback reuse its
+        // proof, many per connection; the rest are read below.
+        let mut reused = 0;
+        let mut tried = 0;
+        let mut unread = Vec::new();
+        while tried < checks.len() {
+            control.check()?;
+            let art_control = crate::engine::execution::native_insert::Control {
+                deadline: control
+                    .deadline
+                    .min(Instant::now() + Duration::from_secs(120)),
+                cancelled: Arc::clone(&control.cancelled),
+            };
+            let proofs = artwork::reuse_track_group(
+                current,
+                &checks[tried..],
+                &trace.join(format!("artwork-reuse-{tried:04}")),
+                &art_control,
+                &mut connect,
+            )
+            .await;
+            let proofs = match proofs {
+                Ok(proofs) => proofs,
+                Err((position, error)) => {
+                    let index = indices[tried + position];
+                    let status = &mut prepared.report.tracks[index].artwork;
+                    status.permanent_cache_verification = "failed";
+                    status.permanent_cache_failure =
+                        Some(format!("{error:#}").chars().take(2048).collect());
+                    serde_json::to_writer(&mut progress, &prepared.report.tracks[index])?;
+                    writeln!(progress)?;
+                    progress.sync_all()?;
+                    return Err(error);
+                }
+            };
+            for proof in proofs {
+                let index = indices[tried];
+                match proof {
+                    Some(proof) => {
+                        let status = &mut prepared.report.tracks[index].artwork;
+                        status.permanent_cache_verification = verification(&proof);
+                        status.permanent_cache_proof = Some(proof);
+                        prepared.report.completed_artwork_tracks += 1;
+                        serde_json::to_writer(&mut progress, &prepared.report.tracks[index])?;
+                        writeln!(progress)?;
+                        reused += 1;
+                    }
+                    None => unread.push(tried),
+                }
+                tried += 1;
+            }
+        }
+        if reused > 0 {
+            progress.sync_all()?;
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::ReusedArtworkProofs { reused, total },
+            ))?;
+        }
+        let indices: Vec<usize> = unread.iter().map(|&i| indices[i]).collect();
+        let checks: Vec<_> = {
+            let mut checks: Vec<_> = checks.into_iter().map(Some).collect();
+            unread
+                .iter()
+                .map(|&i| checks[i].take().expect("each check once"))
+                .collect()
+        };
+        let mut done = 0;
+        while done < checks.len() {
+            control.check()?;
+            let group_trace = trace.join(format!("artwork-group-{done:04}"));
+            let art_control = crate::engine::execution::native_insert::Control {
+                deadline: control
+                    .deadline
+                    .min(Instant::now() + Duration::from_secs(120)),
+                cancelled: Arc::clone(&control.cancelled),
+            };
+            let completed = prepared.report.completed_artwork_tracks;
+            let result = artwork::verify_track_group(
+                current,
+                &checks[done..],
+                &group_trace,
+                &art_control,
+                &std::collections::BTreeSet::new(),
+                &mut connect,
+                |position| {
+                    crate::engine::observe(crate::engine::Event::Observation(
+                        crate::engine::Observation::VerifyingArtwork {
+                            number: completed + position + 1,
+                            total,
+                        },
+                    ))
+                },
+            )
+            .await;
+            let (proofs, failure) = match result {
+                Ok(proofs) => (proofs, None),
+                Err(failure) => (Vec::new(), Some(failure)),
+            };
+            for proof in proofs {
+                let status = &mut prepared.report.tracks[indices[done]].artwork;
+                status.permanent_cache_verification = verification(&proof);
+                status.permanent_cache_proof = Some(proof);
+                prepared.report.completed_artwork_tracks += 1;
+                serde_json::to_writer(&mut progress, &prepared.report.tracks[indices[done]])?;
+                writeln!(progress)?;
+                done += 1;
+            }
+            if let Some((position, error)) = failure {
+                let index = indices[done + position];
+                let status = &mut prepared.report.tracks[index].artwork;
+                status.permanent_cache_verification = "failed";
+                status.permanent_cache_failure =
+                    Some(format!("{error:#}").chars().take(2048).collect());
+                serde_json::to_writer(&mut progress, &prepared.report.tracks[index])?;
+                writeln!(progress)?;
+                progress.sync_all()?;
+                return Err(error);
+            }
+            progress.sync_all()?;
+        }
+        control.check()?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        prepared.report.failure = Some(format!("{error:#}").chars().take(2048).collect());
+        // ReadPendingStateGuard records remain provisional on any batch failure.
+        let _ = progress.sync_all();
+        let _ = report(trace, "report.json", &prepared.report);
+        return Err(error);
+    }
+    finish_report(&mut prepared.report);
+    progress.sync_all()?;
+    report(trace, "report.json", &prepared.report)?;
+    Ok(prepared.report)
+}
+
 fn report(trace: &Path, name: &str, value: &impl Serialize) -> Result<()> {
     durable_write(trace, name, &serde_json::to_vec_pretty(value)?)
 }
@@ -573,6 +863,132 @@ impl ReadBatch for Transfer {
         Ok(bytes)
     }
 }
+async fn read_batch(
+    reader: &mut impl ReadBatch,
+    state: &FreshState,
+    device: &[u8; 32],
+    bindings: &[Binding],
+    reports: &mut [TrackReport],
+    batch: &Batch,
+    number: usize,
+    control: &ReadControl,
+) -> Result<()> {
+    control.check()?;
+    reader.state_guard(state).await?;
+    // Every file is stat before any is read, and again after the last read.
+    let paths: Vec<&str> = batch
+        .indices
+        .iter()
+        .map(|&index| bindings[index].content.path.as_str())
+        .collect();
+    let befores = reader.attributes_all(&paths).await?;
+    ensure!(befores.len() == paths.len(), "audio attributes missing");
+    for (&index, before) in batch.indices.iter().zip(befores) {
+        control.check()?;
+        let content = &bindings[index].content;
+        let report = &mut reports[index];
+        report.batch = Some(number);
+        let Some(before) = before else {
+            report.audio_status = AudioStatus::MissingFile;
+            report.finding = Some("permanent_audio_missing");
+            continue;
+        };
+        bounded_attributes(&before)?;
+        report.audio_attributes = Some(before.clone());
+        if regular_size(&before, content.source.file_bytes).is_err() {
+            report.audio_status = AudioStatus::AttributesMismatch;
+            report.finding = Some("permanent_audio_type_or_size_differs");
+            continue;
+        }
+        let copy =
+            crate::engine::state::audio_index::cache::FileKey::new(device, &content.path, &before)
+                .and_then(|key| crate::engine::state::audio_index::cache::verified_copy(&key))
+                // An MPEG-1 proof needs frame facts measured on the copied bytes;
+                // every other format's identity follows from the whole file's.
+                .filter(|copy| content.source.audio.mpeg().is_none() || copy.mpeg.is_some());
+        let hash = if let Some(copy) = copy {
+            // The file keeps the stat it had when a verified copy or this
+            // host's upload measured its bytes, so nothing is copied.
+            report.audio_proof = Some("stat_of_verified_copy");
+            if let (Some(_), Some((codec, frames))) = (content.source.audio.mpeg(), &copy.mpeg) {
+                report.mpeg_frame_readback = Some(mpeg::report(
+                    content.source.file_bytes,
+                    copy.full_file_sha256,
+                    codec,
+                    *frames,
+                )?);
+            }
+            copy.full_file_sha256
+        } else if content.source.audio.mpeg().is_none() {
+            reader
+                .audio_hash(&content.path, content.source.file_bytes)
+                .await?
+        } else {
+            let bytes = reader
+                .mpeg_bytes(&content.path, content.source.file_bytes)
+                .await?;
+            ensure!(
+                bytes.len() as u64 == content.source.file_bytes,
+                "MPEG readback size differs"
+            );
+            let (hash, frames) = mpeg::inspect(&bytes, control)?;
+            report.mpeg_frame_readback = Some(frames);
+            hash
+        };
+        report.audio_observed_sha256 = Some(hex(&hash));
+        report.audio_status = AudioStatus::ReadPendingStateGuard;
+    }
+    control.check()?;
+    let read: Vec<usize> = batch
+        .indices
+        .iter()
+        .copied()
+        .filter(|&index| reports[index].audio_status == AudioStatus::ReadPendingStateGuard)
+        .collect();
+    let paths: Vec<&str> = read
+        .iter()
+        .map(|&index| bindings[index].content.path.as_str())
+        .collect();
+    let afters = reader.attributes_all(&paths).await?;
+    ensure!(afters.len() == read.len(), "audio attributes missing");
+    for (&index, after) in read.iter().zip(afters) {
+        if let Some(attrs) = &after {
+            bounded_attributes(attrs)?;
+        }
+        ensure!(
+            stable_attrs(reports[index].audio_attributes.clone()) == stable_attrs(after),
+            "audio attributes changed across verification readback"
+        );
+    }
+    control.check()?;
+    reader.state_guard(state).await?;
+    control.check()?;
+    for &index in &batch.indices {
+        let report = &mut reports[index];
+        if report.audio_status == AudioStatus::ReadPendingStateGuard {
+            if report.audio_observed_sha256.as_deref()
+                != Some(report.expected_audio_sha256.as_str())
+            {
+                report.audio_status = AudioStatus::HashMismatch;
+                report.finding = Some("permanent_audio_hash_differs");
+            } else if bindings[index].content.source.audio.mpeg().is_some()
+                && !report
+                    .mpeg_frame_readback
+                    .as_ref()
+                    .is_some_and(|p| p.matches(&bindings[index].content.source))
+            {
+                report.audio_status = AudioStatus::EncodedIdentityMismatch;
+                report.finding = Some("permanent_mpeg_frame_identity_differs");
+            } else {
+                if let Some(frames) = &mut report.mpeg_frame_readback {
+                    frames.encoded_identity_verified = true;
+                }
+                report.audio_status = AudioStatus::VerifiedTransferredContainer;
+            }
+        }
+    }
+    Ok(())
+}
 fn stable_attrs(attrs: Option<Attributes>) -> Option<Attributes> {
     attrs.map(|mut a| {
         a.remove("st_atime");
@@ -624,3 +1040,6 @@ fn finish_report(report: &mut Report) {
         "complete_with_findings"
     };
 }
+
+#[cfg(test)]
+mod tests;
