@@ -1,5 +1,11 @@
 //! Ephemeral candidate allocation for a reviewable plan. Nothing is reserved
 //! until execution records immutable intent in the journal.
+use crate::{
+    engine::planning::additive::Candidate, engine::planning::collections::CandidateIds,
+    engine::planning::source_collection::SourceCollection,
+    engine::planning::source_collection::mp3::preparation::PreparedSource,
+    engine::state::journal::Journal,
+};
 use anyhow::{Context, Result, ensure};
 use music_protocol::catalogue::sqlite::Catalog;
 use music_protocol::media::format::Format;
@@ -8,7 +14,95 @@ use std::{
     fs::File,
     io::Read,
 };
+
+pub fn generate(
+    sources: &SourceCollection,
+    catalog: &Catalog,
+    journal: Option<&Journal>,
+) -> Result<BTreeMap<String, Candidate>> {
+    let (mut random, mut occupied, mut paths, folders) = allocation_context(catalog, journal)?;
+    let mut candidates = BTreeMap::new();
+    for source in &sources.tracks {
+        let ids = CandidateIds {
+            track: next_id(&mut random, &mut occupied)?,
+            album: Some(next_id(&mut random, &mut occupied)?),
+            artist: Some(next_id(&mut random, &mut occupied)?),
+        };
+        let path = next_path(&mut random, &folders, &mut paths, ".m4a")?;
+        ensure!(
+            candidates
+                .insert(source.relative_path.clone(), Candidate { ids, path })
+                .is_none(),
+            "source path repeated during allocation"
+        );
+    }
+    if let Some(journal) = journal
+        && journal.outstanding()?.is_none()
+    {
+        for source in &sources.mp3_tracks {
+            let prepared = PreparedSource::read_expected(
+                &sources.base_directory.join(&source.relative_path),
+                &source.source,
+            )?;
+            if prepared.ensure_batch_insertion_allowed().is_err() {
+                continue;
+            }
+            // Uses the same in-memory occupied sets, including earlier ALAC
+            // candidates. Nothing is reserved and Keep rows ignore proposals.
+            let ids = CandidateIds {
+                track: next_id(&mut random, &mut occupied)?,
+                album: Some(next_id(&mut random, &mut occupied)?),
+                artist: Some(next_id(&mut random, &mut occupied)?),
+            };
+            // A FLAC converted to ALAC lands as an M4A.
+            let format = match prepared.source().format() {
+                Format::Flac if sources.flac_to_alac => Format::Alac,
+                format => format,
+            };
+            let path = next_path(&mut random, &folders, &mut paths, format.extension())?;
+            ensure!(
+                candidates
+                    .insert(source.relative_path.clone(), Candidate { ids, path })
+                    .is_none(),
+                "source path repeated during allocation"
+            );
+        }
+    }
+    Ok(candidates)
+}
 type AllocationContext = (File, BTreeSet<u64>, BTreeSet<String>, Vec<String>);
+fn allocation_context(catalog: &Catalog, journal: Option<&Journal>) -> Result<AllocationContext> {
+    let mut occupied = catalog.represented_sync_ids().clone();
+    let mut paths: BTreeSet<_> = catalog
+        .music_paths()?
+        .into_iter()
+        .map(|p| p.to_ascii_lowercase())
+        .collect();
+    if let Some(journal) = journal {
+        occupied.extend(journal.reserved_pids()?);
+        paths.extend(journal.reserved_paths()?);
+    }
+    let folders: Vec<_> = catalog
+        .music_paths()?
+        .iter()
+        .map(|p| {
+            p.rsplit_once('/')
+                .map(|(folder, _)| folder.to_owned())
+                .context("catalogue path lacks a music folder")
+        })
+        .collect::<Result<BTreeSet<_>>>()?
+        .into_iter()
+        .chain(catalog.music_folders().iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    ensure!(
+        !folders.is_empty(),
+        "the phone registers no Music folders; directory discovery is required before allocating destinations"
+    );
+    let random = File::open("/dev/urandom")?;
+    Ok((random, occupied, paths, folders))
+}
 
 fn word(random: &mut impl Read) -> Result<u64> {
     let mut bytes = [0; 8];

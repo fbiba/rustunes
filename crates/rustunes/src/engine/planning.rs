@@ -17,8 +17,11 @@ pub struct PlanRequest<'a> {
     /// `--flac-to-alac`: plan FLAC additions as ALACs converted from them.
     pub flac_to_alac: bool,
 }
+
+pub(crate) mod additive;
 pub(crate) mod candidates;
 pub(crate) mod collections;
+pub(crate) mod removal;
 pub(crate) mod saved_plan;
 pub(crate) mod source_collection;
 pub(crate) mod source_reads;
