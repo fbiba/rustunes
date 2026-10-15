@@ -9,14 +9,57 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use music_protocol::catalogue::identity;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::{
+    engine::planning::additive::{self, Candidate, Decision, Plan},
+    engine::planning::collections::CandidateIds,
+    engine::planning::source_collection::{self, SelectionOptions, SourceCollection},
+    engine::state::journal::{Identity, Journal},
+    engine::state::snapshot,
+};
+use music_protocol::catalogue::identity;
 
 mod unique_json;
 
 pub(super) fn unique_value(bytes: &[u8]) -> Result<Value> {
     Ok(serde_json::from_slice::<unique_json::UniqueJson>(bytes)?.0)
+}
+
+pub struct Validated {
+    pub plan: Plan,
+    pub plan_sha256: [u8; 32],
+    pub snapshot: snapshot::Snapshot,
+    pub sources: SourceCollection,
+    pub identity: Identity,
+    pub journal: Option<Journal>,
+}
+
+/// Exact reconstruction is separate from permission to apply a described action.
+pub(crate) fn ensure_description_recomputed(plan: &additive::Plan, saved: &Value) -> Result<()> {
+    ensure!(
+        serde_json::to_value(plan)? == *saved,
+        "saved plan differs from current sources, snapshot, journal or planner; generate a new plan"
+    );
+    Ok(())
+}
+
+// The exact-description and independent execution gates run before any connector.
+pub(crate) fn ensure_recomputed(plan: &additive::Plan, saved: &Value) -> Result<()> {
+    ensure_description_recomputed(plan, saved)?;
+    ensure!(
+        !plan.has_conflicts(),
+        "saved plan contains conflicts; resolve them or select a smaller scope"
+    );
+    ensure!(
+        plan.sources.iter().all(|row| matches!(
+            row.decision,
+            Decision::Add { .. } | Decision::Update { .. } | Decision::Keep | Decision::Skip { .. }
+        )),
+        "saved plan contains an unsupported operation"
+    );
+    Ok(())
 }
 
 fn strings(value: &Value) -> Result<BTreeSet<String>> {

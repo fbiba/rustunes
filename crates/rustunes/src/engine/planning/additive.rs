@@ -32,6 +32,43 @@ pub struct JournalEvidence<'a> {
 }
 
 #[derive(Serialize)]
+pub struct Plan {
+    pub schema: &'static str,
+    pub mode: &'static str,
+    #[serde(skip_serializing_if = "is_false")]
+    pub preserve_existing_tracks: bool,
+    /// `--flac-to-alac`: a FLAC addition goes as an ALAC converted from it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub flac_to_alac: bool,
+    pub source_root: String,
+    pub selection: SelectionScope,
+    pub exclusions: Vec<ExcludedSource>,
+    pub metadata_comparison_scope: MetadataComparisonScope,
+    pub device_sha256: String,
+    pub library_sha256: String,
+    pub database_sha256: String,
+    pub wal_sha256: Option<String>,
+    pub media_anchor: u32,
+    pub device_track_count: usize,
+    pub journal_blockers: Vec<String>,
+    /// Potential receiver-side import effect; never an instruction to edit
+    /// counters. Omitted for plans that propose no artwork write or no reset.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artwork_import_recent_play_resets: Vec<Value>,
+    /// When present, both recent counters follow the complete paired reset rule.
+    /// Omitted when no proposed artwork write resets a skip counter.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artwork_import_recent_skip_resets: Vec<Value>,
+    pub sources: Vec<SourceDecision>,
+    /// Includes unmatched other-codec rows. No omission is a removal request.
+    pub preserved_unmatched_device_tracks: Vec<String>,
+    /// Always 0: an additive plan removes nothing.
+    pub phone_deletions: u32,
+    /// Always false: a plan alone authorizes no write.
+    pub execution_authorized_by_plan: bool,
+}
+
+#[derive(Serialize)]
 pub struct SelectionScope {
     pub base_directory: String,
     pub recursive: bool,
@@ -48,6 +85,54 @@ pub struct ExcludedSource {
     pub descendants_unscanned: bool,
 }
 
+#[derive(Serialize)]
+pub struct MetadataComparisonScope {
+    pub compared_fields: Vec<&'static str>,
+    /// Raw rating/compilation values may be compared while their receiver
+    /// interpretation and source-driven update behavior remain unqualified.
+    pub unverified_fields: Vec<&'static str>,
+    pub ascii_case_equivalent_group_fields: Vec<&'static str>,
+    pub container_byte_drift_reported_separately: bool,
+}
+
+impl Plan {
+    /// Existing execution-blocker predicate, including blocked descriptive
+    /// Updates. Actual Conflict and Update counts are reported independently.
+    /// Every addition still needs per-step fresh state, journal and guards.
+    pub fn has_conflicts(&self) -> bool {
+        !self.journal_blockers.is_empty()
+            || self
+                .sources
+                .iter()
+                .any(|s| matches!(s.decision, Decision::Conflict { .. }))
+    }
+}
+
+impl SourceDecision {
+    /// The cover bytes a sync sends again for this kept or updated ALAC it
+    /// manages when no binding proves the phone's cover (each in a phone
+    /// session of its own): what sync's cover phase selects. Add-only sends
+    /// none but pending ones, which a plan names apart.
+    pub fn cover_resent(&self, add_only: bool) -> Option<usize> {
+        let managed = matches!(&self.matches[..], [m] if m.ownership == "inserted_by_us");
+        if add_only
+            || self.mp3.is_some()
+            || !managed
+            || !matches!(self.decision, Decision::Keep | Decision::Update { .. })
+        {
+            return None;
+        }
+        match self.artwork {
+            ArtworkDecision::ExistingNeedsVerification { bytes, .. }
+            | ArtworkDecision::SeparateUpdateNeeded { bytes, .. } => Some(bytes),
+            ArtworkDecision::PreservedExistingTrack {
+                source_cover_bytes, ..
+            } => source_cover_bytes,
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct DecisionCounts {
     pub additions: usize,
@@ -55,6 +140,57 @@ pub struct DecisionCounts {
     pub updates: usize,
     pub conflicts: usize,
     pub skipped: usize,
+}
+impl Plan {
+    pub fn decision_counts(&self) -> DecisionCounts {
+        let mut result = DecisionCounts::default();
+        for row in &self.sources {
+            match row.decision {
+                Decision::Add { .. } => result.additions += 1,
+                Decision::Keep => result.matched += 1,
+                Decision::Update { .. } => result.updates += 1,
+                Decision::Conflict { .. } => result.conflicts += 1,
+                Decision::Skip { .. } => result.skipped += 1,
+            }
+        }
+        result
+    }
+}
+
+mod managed_source;
+pub(crate) mod source_metadata;
+
+pub(crate) fn metadata_catalogue_fields(catalog: &Catalog, track: &Track) -> serde_json::Value {
+    source_metadata::current_fields(catalog, track)
+}
+
+mod managed_audio;
+pub use managed_audio::ManagedAudioReplacement;
+
+#[derive(Serialize)]
+pub struct SourceDecision {
+    pub relative_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_audio_replacement: Option<ManagedAudioReplacement>,
+    pub source_file_bytes: Option<u64>,
+    pub source_file_sha256: Option<String>,
+    pub encoded_audio_sha256: Option<String>,
+    pub projected: Option<ProjectedFields>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mp3: Option<music_protocol::media::mpeg::Source>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mp3_insertion:
+        Option<crate::engine::planning::source_collection::mp3::preparation::Assessment>,
+    /// This FLAC's addition sends an ALAC converted from it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub flac_to_alac: bool,
+    pub validation_issues: Vec<source_validation::Issue>,
+    pub matches: Vec<ExistingMatch>,
+    pub artwork: ArtworkDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_composer: Option<NativeComposer>,
+    #[serde(flatten)]
+    pub decision: Decision,
 }
 
 #[derive(Serialize)]
@@ -220,6 +356,60 @@ fn converted_flac_audio<'a>(
         .collect()
 }
 
+fn artwork_recent_reset_disclosure(
+    rows: &[SourceDecision],
+    catalog: &Catalog,
+) -> (Vec<Value>, Vec<Value>) {
+    let proposed = rows.iter().any(|row| {
+        !matches!(
+            row.decision,
+            Decision::Conflict { .. } | Decision::Skip { .. }
+        ) && matches!(
+            row.artwork,
+            ArtworkDecision::PendingOwnedCover { .. }
+                | ArtworkDecision::SeparateUpdateNeeded { .. }
+        )
+    });
+    if !proposed {
+        return (Vec::new(), Vec::new());
+    }
+    let mut tracks: Vec<_> = catalog.tracks().iter().collect();
+    tracks.sort_by_key(|track| track.sync_id);
+    let has_recent_skips = tracks
+        .iter()
+        .any(|track| track.playback.skip_count_recent > 0);
+    let row = |track: &music_protocol::catalogue::sqlite::Track, before: u32| {
+        if has_recent_skips {
+            json!({
+                "track_id":pid(track.sync_id),"before":before,"after":0,
+                "condition":"artwork_import_may_reset_all_positive_recent_play_and_skip_counts",
+                "all_statistics_except_recent_play_and_skip_must_be_preserved":true,
+                "fresh_counts_rechecked_before_each_import":true
+            })
+        } else {
+            // With no recent skips, only recent play counts can reset, so the
+            // row can promise every other statistic is kept.
+            json!({
+                "track_id":pid(track.sync_id),"before":before,"after":0,
+                "condition":"artwork_import_may_reset_all_positive_recent_play_counts",
+                "lifetime_counts_and_all_other_statistics_must_be_preserved":true,
+                "fresh_counts_rechecked_before_each_import":true
+            })
+        }
+    };
+    let plays = tracks
+        .iter()
+        .filter(|t| t.playback.play_count_recent > 0)
+        .map(|t| row(t, t.playback.play_count_recent))
+        .collect();
+    let skips = tracks
+        .iter()
+        .filter(|t| t.playback.skip_count_recent > 0)
+        .map(|t| row(t, t.playback.skip_count_recent))
+        .collect();
+    (plays, skips)
+}
+
 fn is_false(value: &bool) -> bool {
     !value
 }
@@ -245,6 +435,25 @@ fn native_composer(catalog: &Catalog, name: Option<&str>) -> Result<Option<Nativ
         wire_sort: sort.to_owned(),
         existing_lookup_id: existing.internal_id,
     }))
+}
+
+fn source_row(source: &SourceTrack) -> SourceDecision {
+    SourceDecision {
+        relative_path: source.relative_path.clone(),
+        managed_audio_replacement: None,
+        source_file_bytes: Some(source.fingerprint.file_bytes),
+        source_file_sha256: Some(hex(&source.fingerprint.full_file_sha256)),
+        encoded_audio_sha256: Some(hex(&source.fingerprint.audio.sha256)),
+        projected: None,
+        mp3: None,
+        mp3_insertion: None,
+        flac_to_alac: false,
+        validation_issues: Vec::new(),
+        matches: Vec::new(),
+        artwork: ArtworkDecision::UnavailableUntilSourceValidated,
+        native_composer: None,
+        decision: conflict("unvalidated", "Source has not been validated".into()),
+    }
 }
 
 /// Selected sources no plan could add, whatever the phone holds, with why:
@@ -435,6 +644,45 @@ impl JournalView {
         }
         Ok(result)
     }
+}
+
+/// The catalogue fields of `track` that differ from the source projection,
+/// and those that agree only once the phone's composer lookup canonicalizes
+/// the source's spelling.
+fn compared_fields(
+    projected: &ProjectedFields,
+    catalog: &Catalog,
+    track: &Track,
+) -> (Vec<FieldDifference>, Vec<FieldDifference>) {
+    let mut catalog_differences = differences(projected, track);
+    catalog_differences.extend(source_metadata::additional_differences(
+        projected, catalog, track,
+    ));
+    let mut canonicalized_fields = Vec::new();
+    if let Some(name) = projected.composer.as_deref()
+        && let Ok(Some(lookup)) = catalog.composer_for_label(name)
+        && catalog
+            .track_composers()
+            .get(&track.sync_id)
+            .and_then(|r| r.lookup_id)
+            == Some(lookup.internal_id)
+        && track.metadata.composer.as_deref() == Some(lookup.name.as_str())
+        && let Some(index) = catalog_differences
+            .iter()
+            .position(|d| d.field == "composer")
+    {
+        canonicalized_fields.push(catalog_differences.remove(index));
+    }
+    (catalog_differences, canonicalized_fields)
+}
+
+/// The catalogue fields of `track` a source-driven Update would change.
+pub(crate) fn catalogue_differences(
+    projected: &ProjectedFields,
+    catalog: &Catalog,
+    track: &Track,
+) -> Vec<FieldDifference> {
+    compared_fields(projected, catalog, track).0
 }
 
 fn differences(s: &ProjectedFields, track: &Track) -> Vec<FieldDifference> {

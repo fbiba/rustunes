@@ -22,6 +22,7 @@ pub use crate::engine::execution::device::{Config as DeviceConfig, Event as Devi
 pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
 pub use events::Event;
+pub use planning::{PlanRequest, PlanResult};
 pub use verification::VerificationRequest;
 
 /// Explicit execution dependencies. `None` retains each operation's existing
@@ -247,6 +248,29 @@ pub enum SkipStage {
     Plan,
     /// It was dropped while being sent: its FLAC's conversion failed.
     Send,
+}
+
+impl Skipped {
+    /// The plan's skipped sources.
+    pub(crate) fn planned(plan: &crate::engine::planning::additive::Plan) -> Vec<Self> {
+        plan.sources
+            .iter()
+            .filter_map(|row| match &row.decision {
+                crate::engine::planning::additive::Decision::Skip {
+                    code,
+                    reason,
+                    message,
+                } => Some(Self {
+                    path: row.relative_path.clone(),
+                    code,
+                    reason: reason.clone(),
+                    detail: message.clone(),
+                    stage: SkipStage::Plan,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// What holds a sync before anything is sent.

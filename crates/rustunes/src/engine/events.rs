@@ -1,4 +1,5 @@
 //! Observations for frontends. Events never grant execution authority.
+use super::{ApplyResult, CoverResult, PlanResult, SyncHolds, SyncResult};
 use std::path::Path;
 
 /// Observations never authorize a write. An observer error is propagated at
@@ -20,10 +21,15 @@ pub enum Event<'a> {
     },
     ComparingSources,
     PlanSaved(&'a Path),
+    PlanReady(&'a PlanResult),
+    /// Nothing was sent: these refusals hold the sync.
+    SyncBlocked(&'a SyncHolds),
+    SyncFinished(&'a SyncResult),
     CheckingCover {
         number: usize,
         total: usize,
     },
+    ApplyFinished(ApplyResult),
     AdditionStarted {
         number: usize,
         total: usize,
@@ -119,6 +125,7 @@ pub enum Event<'a> {
     ArtworkStarted {
         track_id: u64,
     },
+    CoverFinished(CoverResult),
     /// The journal was superseded or missing, and the earlier journal was
     /// carried forward from a fresh capture (`rustunes pull`, run first).
     JournalCarried {

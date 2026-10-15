@@ -17,6 +17,24 @@ pub struct PlanRequest<'a> {
     /// `--flac-to-alac`: plan FLAC additions as ALACs converted from them.
     pub flac_to_alac: bool,
 }
+pub struct PlanResult {
+    pub add_only: bool,
+    pub plan: additive::Plan,
+    pub serialized: Vec<u8>,
+    pub additions: usize,
+    pub matched: usize,
+    pub updates: usize,
+    pub conflicts: usize,
+    /// Sources the plan leaves out (`additive::skip`); the rest goes on
+    /// without them.
+    pub skipped: usize,
+    pub source_exclusions: usize,
+}
+impl PlanResult {
+    pub fn ready(&self) -> bool {
+        !self.plan.has_conflicts()
+    }
+}
 
 pub(crate) mod additive;
 pub(crate) mod candidates;
