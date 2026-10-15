@@ -158,7 +158,9 @@ impl Plan {
 }
 
 mod managed_source;
+pub(crate) mod skip;
 pub(crate) mod source_metadata;
+pub(crate) mod update;
 
 pub(crate) fn metadata_catalogue_fields(catalog: &Catalog, track: &Track) -> serde_json::Value {
     source_metadata::current_fields(catalog, track)
@@ -354,6 +356,21 @@ fn converted_flac_audio<'a>(
                 )
         })
         .collect()
+}
+
+/// Why an owned track's changed tags are not sent as an edit. A field only a
+/// replacement clears is offered to `sync --replace-changed`, which collects
+/// these rows with the tracks whose audio changed.
+fn update_refused(error: &anyhow::Error) -> Decision {
+    match error.downcast_ref::<update::NeedsReplacement>() {
+        Some(reason) => conflict(
+            "metadata_update_needs_replacement",
+            format!(
+                "{reason}; sync with --replace-changed replaces the track (removes it, then adds the source again; its play and skip counts, ratings and playlist memberships are lost)"
+            ),
+        ),
+        None => conflict("metadata_update_unsupported", format!("{error:#}")),
+    }
 }
 
 fn artwork_recent_reset_disclosure(
