@@ -39,6 +39,7 @@ impl PlanResult {
 pub(crate) mod additive;
 pub(crate) mod candidates;
 pub(crate) mod collections;
+pub(crate) mod metadata_edit;
 pub(crate) mod removal;
 pub(crate) mod saved_plan;
 pub(crate) mod source_collection;
