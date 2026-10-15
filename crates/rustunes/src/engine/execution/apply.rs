@@ -29,6 +29,8 @@ use music_protocol::catalogue::insert_verification::{self, ExpectedInsert};
 use music_protocol::protocol::templates;
 use music_protocol::protocol::trace::private_write;
 
+mod refresh;
+
 mod sequence;
 
 pub struct Options<'a> {
@@ -293,6 +295,98 @@ struct OrdinaryInsert<'a> {
     selected: &'a crate::engine::planning::collections::PlannedTrack,
     timestamp: SystemTime,
     host_name: &'a str,
+}
+
+async fn ordinary_insert(
+    journal: &mut Journal,
+    current: &mut current::Current,
+    mut i: OrdinaryInsert<'_>,
+    control: &Control,
+) -> Result<native_insert::PendingVerification> {
+    let frozen = refresh::FrozenIntent::new(i.prepared, i.selected, i.timestamp);
+    for attempt in 1..=2u8 {
+        control.check()?;
+        let preflight = i.step.join(format!("preflight-{attempt:04}"));
+        fs::DirBuilder::new().mode(0o700).create(&preflight)?;
+        let before = preflight.join("before");
+        if attempt == 1 {
+            refresh::copy_before(i.current_directory, &before, current, control)?;
+        } else {
+            let fresh = refresh::controlled(
+                current::capture_until(&before, &current.identity, control.deadline),
+                control,
+            )
+            .await?;
+            refresh::ensure_current(current, &fresh)?;
+            refresh::ensure_sources(i.sources, control)?;
+            let rebuilt = frozen.revalidate(
+                i.prepared,
+                i.source,
+                &fresh.catalog,
+                &journal.reserved_pids()?,
+                control,
+            )?;
+            verify_planned_composer(&rebuilt, i.row, &i.source.metadata)?;
+            *current = fresh;
+        }
+        control.check()?;
+        i.input["pre_session_attempt"] = attempt.into();
+        i.input["current_state_receipt_sha256"] = hex(&current.receipt_sha256).into();
+        let input_bytes = serde_json::to_vec_pretty(&i.input)?;
+        private_write(&preflight.join("input.json"), &input_bytes)?;
+        File::open(&preflight)?.sync_all()?;
+        File::open(i.step)?.sync_all()?;
+        File::open(i.step.parent().context("insertion trace parent missing")?)?.sync_all()?;
+        i.prepared.input_receipt_sha256 = Sha256::digest(&input_bytes).into();
+        let state = insertion_state(current, i.prepared.input_receipt_sha256)?;
+        let templates = templates::build_from_copied_cdb(
+            &current.cdb,
+            &current.catalog,
+            &current.library,
+            i.host_name,
+        )?;
+        let result = native_insert::execute_new_native_insert(
+            journal,
+            Insertion {
+                attempt: i.prepared,
+                source: i.source_path,
+                state: &state,
+                templates,
+                trace: &preflight.join("transfer"),
+            },
+            &i.step.join("input.json"),
+            &input_bytes,
+            control,
+            device::provider,
+        )
+        .await;
+        match result {
+            Ok(pending) => return Ok(pending),
+            Err(error) => {
+                let refresh = refresh::may_refresh(&error, attempt, control)?;
+                private_write(
+                    &preflight.join("failure.json"),
+                    &serde_json::to_vec_pretty(
+                        &serde_json::json!({"schema":"rustunes.insertion-pre-session-failure",
+                    "input_receipt_sha256":hex(&i.prepared.input_receipt_sha256),
+                    "before_receipt_sha256":hex(&current.receipt_sha256),
+                    "failure":format!("{error:#}"), "read_only_refresh_selected":refresh,
+                    "deadline_renewed":false}),
+                    )?,
+                )?;
+                File::open(&preflight)?.sync_all()?;
+                if !refresh {
+                    return Err(error);
+                }
+                ensure!(
+                    journal.outstanding()?.is_none() && !i.step.join("input.json").try_exists()?,
+                    "pre-session refresh cannot follow a journal attempt or published input"
+                );
+                i.engine.emit(Event::RefreshingBeforeSession)?;
+            }
+        }
+    }
+    anyhow::bail!("pre-session refresh limit exhausted")
 }
 
 #[cfg(test)]
