@@ -36,6 +36,73 @@ impl PlanResult {
     }
 }
 
+pub(super) fn run(request: PlanRequest<'_>, engine: &Engine) -> Result<PlanResult> {
+    engine.check()?;
+    if let Some(output) = request.output {
+        ensure!(
+            !output.try_exists()?,
+            "plan output already exists; choose a new file"
+        );
+    }
+    engine.emit(Event::ReadingSavedSnapshot)?;
+    let snapshot = snapshot::open(request.snapshot)?;
+    let library = identity::parse(&snapshot.raw_preferences)?;
+    let identity =
+        journal::Identity::for_saved_device(snapshot.identity.device_identifier_sha256, &library)?;
+    let journal = request
+        .journal
+        .map(|p| journal::Journal::open_read_only(p, &identity))
+        .transpose()?;
+    let selection = source_collection::select(request.source, request.selection)?;
+    let mut last = Instant::now();
+    let mut sources = source_collection::inspect_with_progress(&selection, |done, total| {
+        engine.check()?;
+        if done == 0 || done == total || last.elapsed().as_secs() >= 5 {
+            engine.emit(Event::InspectingSources { done, total })?;
+            last = Instant::now();
+        }
+        Ok(())
+    })?;
+    sources.flac_to_alac = request.flac_to_alac;
+    let candidates = candidates::generate(&sources, &snapshot.catalog, journal.as_ref())?;
+    engine.emit(Event::ComparingSources)?;
+    let plan = additive::build_from_snapshot(
+        &sources,
+        &snapshot,
+        journal.as_ref().map(|journal| additive::JournalEvidence {
+            journal,
+            identity: &identity,
+        }),
+        &candidates,
+        request.add_only,
+    )?;
+    let counts = plan.decision_counts();
+    let mut serialized = serde_json::to_vec_pretty(&plan)?;
+    serialized.push(b'\n');
+    engine.check()?;
+    if let Some(path) = request.output {
+        private_write(path, &serialized)?;
+        File::open(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?
+        .sync_all()?;
+        engine.emit(Event::PlanSaved(path))?;
+    }
+    Ok(PlanResult {
+        add_only: request.add_only,
+        plan,
+        serialized,
+        additions: counts.additions,
+        matched: counts.matched,
+        updates: counts.updates,
+        conflicts: counts.conflicts,
+        skipped: counts.skipped,
+        source_exclusions: sources.exclusions.len(),
+    })
+}
+
 pub(crate) mod additive;
 pub(crate) mod candidates;
 pub(crate) mod collections;

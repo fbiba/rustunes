@@ -79,6 +79,9 @@ impl Engine {
     pub fn quiet(config: Config) -> Self {
         Self::new(config, |_| Ok(()))
     }
+    pub fn plan(&self, request: PlanRequest<'_>) -> Result<PlanResult> {
+        self.with_observer(|| planning::run(request, self))
+    }
     pub(crate) fn selected_device(&self) -> Option<&str> {
         self.config.device.selected_device()
     }

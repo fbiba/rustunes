@@ -42,6 +42,142 @@ pub struct Options<'a> {
     pub dry_run: bool,
 }
 
+pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<ApplyResult> {
+    engine.check()?;
+    ensure!(
+        !options.trace.try_exists()?,
+        "apply trace directory must be new"
+    );
+    let long_control = engine.control(1800);
+    let mut validated = saved_plan::load_read_only_with_control(
+        options.plan,
+        options.snapshot,
+        options.journal,
+        &long_control,
+    )?;
+    // Exact description eligibility is still separate from physical/native authority.
+    ensure_supported_additions(&validated.plan.sources, &validated.sources, options.dry_run)?;
+    let additions = validated
+        .plan
+        .sources
+        .iter()
+        .filter(|r| matches!(r.decision, Decision::Add { .. }))
+        .count();
+    // Sent afterwards in metadata batches by `sync`.
+    let metadata_updates = validated
+        .plan
+        .sources
+        .iter()
+        .filter(|r| matches!(r.decision, Decision::Update { .. }))
+        .count();
+    fs::DirBuilder::new().mode(0o700).create(options.trace)?;
+    let canonical_trace = fs::canonicalize(options.trace)?;
+    let options = Options {
+        trace: &canonical_trace,
+        ..options
+    };
+    File::open(
+        options
+            .trace
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?
+    .sync_all()?;
+    let current_directory = options.trace.join("before");
+    let current = current::capture_controlled(
+        &current_directory,
+        &validated.identity,
+        engine.control(120).deadline,
+        Arc::clone(&long_control.cancelled),
+    )
+    .await?;
+    ensure!(
+        current.catalog.source_hashes().database
+            == validated.snapshot.catalog.source_hashes().database
+            && current.catalog.source_hashes().wal
+                == validated.snapshot.catalog.source_hashes().wal
+            && current.catalog.persisted_media_anchor() == validated.plan.media_anchor
+            && current.raw_preferences == validated.snapshot.raw_preferences
+            && current.plist_preferences == validated.snapshot.plist_preferences,
+        "the phone's library or preferences changed after planning (playing music changes it, and the phone also renumbers its library on its own a few minutes after a sync); no transfer started, take a fresh snapshot and plan again"
+    );
+    // Qualify all runtime template fields before creating a journal or reservation.
+    templates::build_from_copied_cdb(
+        &current.cdb,
+        &current.catalog,
+        &current.library,
+        options.host_name,
+    )?;
+    if options.dry_run {
+        let receipt = serde_json::json!({"schema":"rustunes.apply-preflight",
+            "plan_sha256":hex(&validated.plan_sha256),"current_state_receipt_sha256":hex(&current.receipt_sha256),
+            "additions":additions,"phone_writes":0,"journal_created":false,"saved_plan_matches_current_catalogue":true});
+        private_write(
+            &options.trace.join("preflight.json"),
+            &serde_json::to_vec_pretty(&receipt)?,
+        )?;
+        File::open(options.trace)?.sync_all()?;
+        let result = if metadata_updates > 0 {
+            ApplyResult::PreflightSourceChanges {
+                additions,
+                metadata_updates,
+            }
+        } else {
+            ApplyResult::Preflight { additions }
+        };
+        engine.emit(Event::ApplyFinished(result))?;
+        return Ok(result);
+    }
+    if additions == 0 {
+        engine.emit(Event::ApplyFinished(ApplyResult::Unchanged))?;
+        return Ok(ApplyResult::Unchanged);
+    }
+    let journal = match validated.journal.take() {
+        Some(reader) => {
+            drop(reader);
+            Journal::open(options.journal, &current.identity)?
+        }
+        None => Journal::create(options.journal, &current.identity)?,
+    };
+    journal.ensure_identity(&current.identity)?;
+    ensure!(
+        journal.outstanding()?.is_none(),
+        "journal has an unfinished operation; reconcile it before applying"
+    );
+    let scope = crate::engine::planning::removal::collection_scope_sha256(&validated.sources)?;
+    let context = StepContext {
+        engine,
+        validated: &validated,
+        options: &options,
+        scope,
+        additions,
+        long_control: &long_control,
+    };
+    let state = ApplyState {
+        journal,
+        current,
+        current_directory,
+    };
+    sequence::run(
+        &validated.plan.sources,
+        state,
+        options.trace,
+        validated.plan_sha256,
+        |state, row, number| apply_step(state, row, number, &context),
+        |state| {
+            (
+                state.current.catalog.persisted_media_anchor(),
+                state.current.catalog.tracks().len(),
+            )
+        },
+    )
+    .await?;
+    let result = ApplyResult::Completed { additions };
+    engine.emit(Event::ApplyFinished(result))?;
+    Ok(result)
+}
+
 struct ApplyState {
     journal: Journal,
     current: current::Current,
@@ -54,6 +190,192 @@ struct StepContext<'a> {
     scope: [u8; 32],
     additions: usize,
     long_control: &'a Control,
+}
+async fn apply_step(
+    state: ApplyState,
+    row: &crate::engine::planning::additive::SourceDecision,
+    number: usize,
+    context: &StepContext<'_>,
+) -> Result<sequence::StepResult<ApplyState>> {
+    let ApplyState {
+        mut journal,
+        mut current,
+        mut current_directory,
+    } = state;
+    let StepContext {
+        engine,
+        validated,
+        options,
+        scope,
+        additions,
+        long_control,
+    } = *context;
+    engine.check()?;
+    let plan_sha256 = validated.plan_sha256;
+    let index_sha256 = validated.snapshot.index_receipt_sha256;
+    let Decision::Add {
+        track_id,
+        album,
+        artist,
+        path,
+        ..
+    } = &row.decision
+    else {
+        anyhow::bail!("apply step requires an Add row");
+    };
+    let step_name = sequence::step_name(number);
+    let step = options.trace.join(&step_name);
+    let track_id = u64::from_str_radix(track_id, 16)?;
+    let album_id = u64::from_str_radix(&album.id, 16)?;
+    let artist_id = u64::from_str_radix(&artist.id, 16)?;
+    let source = validated
+        .sources
+        .tracks
+        .iter()
+        .find(|s| s.relative_path == row.relative_path)
+        .context("planned source inspection missing")?;
+    let source_path = validated.sources.base_directory.join(&source.relative_path);
+    ensure!(
+        music_protocol::media::fingerprint::read(&source_path)? == source.fingerprint,
+        "source changed after saved-plan validation"
+    );
+    fs::DirBuilder::new().mode(0o700).create(&step)?;
+    let candidates = CandidateIds {
+        track: track_id,
+        album: Some(album_id),
+        artist: Some(artist_id),
+    };
+    let operation_timestamp = SystemTime::now();
+    let mut planner = Planner::new(&current.catalog, &journal.reserved_pids()?);
+    let selected = planner.plan(&source.metadata, candidates)?;
+    let operation = insert::prepare_live(
+        &source.metadata,
+        &selected,
+        &current.catalog,
+        operation_timestamp,
+    )?;
+    ensure!(
+        selected.album_pid() == album_id
+            && selected.artist_pid() == artist_id
+            && selected.pending_collection_ids().is_empty(),
+        "fresh grouping differs from saved plan; no alternate IDs will be substituted"
+    );
+    verify_planned_composer(&operation, row, &source.metadata)?;
+    // Keep a durable exact source for recovery if the caller later changes
+    // the source directory while this operation is awaiting verification.
+    let control = engine.control(180);
+    retain_alac_source(&source_path, &source.fingerprint, &step, &control)?;
+    let input = serde_json::json!({"schema":"rustunes.insertion-input",
+        "plan_sha256":hex(&plan_sha256),"complete_index_sha256":hex(&index_sha256),
+        "current_state_receipt_sha256":hex(&current.receipt_sha256),"source":row.relative_path,
+        "full_source_sha256":hex(&source.fingerprint.full_file_sha256),"encoded_audio_sha256":hex(&source.fingerprint.audio.sha256),
+        "track_id":format!("{track_id:016x}"),"album_id":format!("{album_id:016x}"),"artist_id":format!("{artist_id:016x}"),
+        "path":path,"operation_sha256":hex(&Sha256::digest(&operation)),"phone_deletions":0});
+    let mut prepared = PreparedAttempt {
+        kind: AttemptKind::Insert,
+        content: Content {
+            source: (source.fingerprint.clone()).into(),
+            track_pid: track_id,
+            path: path.clone(),
+            artwork: None,
+            collection: Some(scope),
+        },
+        new_album_pid: selected
+            .new_collection_ids()
+            .contains(&album_id)
+            .then_some(album_id),
+        new_artist_pid: selected
+            .new_collection_ids()
+            .contains(&artist_id)
+            .then_some(artist_id),
+        current_media_anchor: current.catalog.persisted_media_anchor(),
+        operation,
+        input_receipt_sha256: [0; 32],
+    };
+    engine.emit(Event::AdditionStarted {
+        number,
+        total: additions,
+        source: &row.relative_path,
+    })?;
+    let pending = ordinary_insert(
+        &mut journal,
+        &mut current,
+        OrdinaryInsert {
+            engine,
+            current_directory: &current_directory,
+            step: &step,
+            sources: &validated.sources,
+            source,
+            source_path: &source_path,
+            prepared: &mut prepared,
+            input,
+            row,
+            selected: &selected,
+            timestamp: operation_timestamp,
+            host_name: options.host_name,
+        },
+        &control,
+    )
+    .await
+    .context(
+        "insertion did not reach independent verification; inspect the journal before any retry",
+    )?;
+    let after_directory = step.join("after");
+    let after = current::capture_controlled(
+        &after_directory,
+        &current.identity,
+        engine.control(120).deadline,
+        Arc::clone(&long_control.cancelled),
+    )
+    .await
+    .context("transfer returned but poststate capture failed; journal requires reconciliation")?;
+    let checked = insert_verification::verify_insert(
+        &current.catalog,
+        &after.catalog,
+        &ExpectedInsert {
+            track_id,
+            album_id,
+            artist_id,
+            path,
+            file_bytes: source.fingerprint.file_bytes,
+            metadata: (&source.metadata).into(),
+            presented: true,
+        },
+    );
+    let checked = checked
+        .context("post-transfer catalogue verification failed; journal requires reconciliation")?;
+    let receipt = serde_json::json!({"schema":"rustunes.verified-insertion","catalogue":checked,
+        "plan_sha256":hex(&plan_sha256),"transfer_receipt_sha256":hex(&pending.evidence.receipt_sha256),
+        "after_state_receipt_sha256":hex(&after.receipt_sha256),"permanent_audio_sha256":hex(&pending.evidence.permanent_audio_sha256),
+        "source":row.relative_path,"audio_verified":true,"artwork_verified":false,"phone_deletions":0});
+    let bytes = serde_json::to_vec_pretty(&receipt)?;
+    private_write(&step.join("verified.json"), &bytes)?;
+    File::open(&step)?.sync_all()?;
+    journal.complete(
+        pending.permit,
+        CompletionEvidence {
+            track_pid: track_id,
+            path: path.clone(),
+            audio_bytes: source.fingerprint.file_bytes,
+            audio_file_sha256: pending.evidence.permanent_audio_sha256,
+            artwork_sha256: None,
+            media_anchor: after.catalog.persisted_media_anchor(),
+            receipt_sha256: Sha256::digest(&bytes).into(),
+        },
+    )?;
+    journal.record_source(track_id, &source_path)?;
+    let receipt = serde_json::json!({"source":row.relative_path,"track_id":format!("{track_id:016x}"),"receipt_sha256":hex(&Sha256::digest(&bytes))});
+    current = after;
+    current_directory = after_directory;
+    engine.emit(Event::AudioInsertionVerified)?;
+    Ok(sequence::StepResult {
+        state: ApplyState {
+            journal,
+            current,
+            current_directory,
+        },
+        receipt,
+    })
 }
 
 // Retain exact transferred tag/container bytes once before input, intent or

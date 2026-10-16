@@ -36,6 +36,186 @@ pub struct Validated {
     pub journal: Option<Journal>,
 }
 
+/// Validate a plan without journal recovery or journal-mode changes. Only a
+/// later real apply may reopen the journal for transitions and durable writes.
+pub fn load_read_only(
+    plan_path: &Path,
+    snapshot_path: &Path,
+    journal_path: &Path,
+) -> Result<Validated> {
+    load_with_access(plan_path, snapshot_path, journal_path, None, false)
+}
+
+/// Controlled mixed execution keeps the original deadline through source
+/// inspection, managed context derivation and exact saved equality.
+pub(crate) fn load_read_only_with_control(
+    plan_path: &Path,
+    snapshot_path: &Path,
+    journal_path: &Path,
+    control: &crate::engine::execution::native_insert::Control,
+) -> Result<Validated> {
+    control.check()?;
+    load_with_access(plan_path, snapshot_path, journal_path, Some(control), false)
+}
+
+/// Sync's initial cover/source expectations are inspection only. The later
+/// actual Apply loader still independently reconstructs and gates execution.
+pub(crate) fn load_sync_expectations(
+    plan_path: &Path,
+    snapshot_path: &Path,
+    journal_path: &Path,
+) -> Result<Validated> {
+    load_with_access(plan_path, snapshot_path, journal_path, None, true)
+}
+
+fn load_with_access(
+    plan_path: &Path,
+    snapshot_path: &Path,
+    journal_path: &Path,
+    control: Option<&crate::engine::execution::native_insert::Control>,
+    description_only: bool,
+) -> Result<Validated> {
+    if let Some(control) = control {
+        control.check()?;
+    }
+    let bytes = read_stable(plan_path)?;
+    let saved = serde_json::from_slice::<unique_json::UniqueJson>(&bytes)
+        .context("reading saved JSON plan with unique object keys")?
+        .0;
+    ensure!(
+        saved["schema"] == "rustunes.additive-plan"
+            && saved["mode"] == "additive_dry_run"
+            && saved["phone_deletions"] == 0
+            && saved["execution_authorized_by_plan"] == false,
+        "unsupported saved plan schema or mode"
+    );
+    let snapshot = match control {
+        Some(control) => snapshot::open_with_control(snapshot_path, control)?,
+        None => snapshot::open(snapshot_path)?,
+    };
+    let library = identity::parse(&snapshot.raw_preferences)?;
+    let identity =
+        Identity::for_saved_device(snapshot.identity.device_identifier_sha256, &library)?;
+    let journal = if journal_path.try_exists()? {
+        // Recompute and gate the entire description before any writable open.
+        Some(Journal::open_read_only(journal_path, &identity)?)
+    } else {
+        None
+    };
+    let scope = &saved["selection"];
+    let options = SelectionOptions {
+        recursive: scope["recursive"]
+            .as_bool()
+            .context("missing recursive selection")?,
+        include: strings(&scope["include"])?,
+        exclude: strings(&scope["exclude"])?,
+    };
+    let root = Path::new(
+        saved["source_root"]
+            .as_str()
+            .context("missing source root")?,
+    );
+    ensure!(root.is_absolute(), "saved source root must be absolute");
+    let selection = source_collection::select(root, &options)?;
+    let mut last = std::time::Instant::now();
+    let mut sources = source_collection::inspect_with_progress(&selection, |done, total| {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        if done == 0 || done == total || last.elapsed().as_secs() >= 5 {
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::RevalidatingSources { done, total },
+            ))?;
+            last = std::time::Instant::now();
+        }
+        Ok(())
+    })?;
+    let mut candidates = BTreeMap::new();
+    let rows = saved["sources"]
+        .as_array()
+        .context("missing source decisions")?;
+    ensure!(rows.len() <= 4096, "saved plan exceeds source bound");
+    for row in rows {
+        if row["decision"] != "add" {
+            continue;
+        }
+        let name = row["relative_path"]
+            .as_str()
+            .context("missing source path")?;
+        ensure!(
+            candidates
+                .insert(
+                    name.to_owned(),
+                    Candidate {
+                        ids: CandidateIds {
+                            track: pid(&row["track_id"])?,
+                            album: Some(pid(&row["album"]["id"])?),
+                            artist: Some(pid(&row["artist"]["id"])?),
+                        },
+                        path: row["path"]
+                            .as_str()
+                            .context("missing destination")?
+                            .to_owned(),
+                    }
+                )
+                .is_none(),
+            "duplicate addition source"
+        );
+    }
+    sources.flac_to_alac = match saved.get("flac_to_alac") {
+        None => false,
+        Some(value) => value.as_bool().context("invalid FLAC conversion policy")?,
+    };
+    let preserve_existing = match saved.get("preserve_existing_tracks") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .context("invalid existing-track preservation policy")?,
+    };
+    let evidence = || {
+        journal.as_ref().map(|journal| additive::JournalEvidence {
+            journal,
+            identity: &identity,
+        })
+    };
+    let plan = match control {
+        Some(control) => additive::build_from_snapshot_with_control(
+            &sources,
+            &snapshot,
+            evidence(),
+            &candidates,
+            preserve_existing,
+            control,
+        )?,
+        None => additive::build_from_snapshot(
+            &sources,
+            &snapshot,
+            evidence(),
+            &candidates,
+            preserve_existing,
+        )?,
+    };
+    if let Some(control) = control {
+        control.check()?;
+    }
+    if description_only {
+        ensure_description_recomputed(&plan, &saved)?;
+    } else {
+        ensure_recomputed(&plan, &saved)?;
+    }
+    if let Some(control) = control {
+        control.check()?;
+    }
+    Ok(Validated {
+        plan,
+        plan_sha256: Sha256::digest(&bytes).into(),
+        snapshot,
+        sources,
+        identity,
+        journal,
+    })
+}
+
 /// Exact reconstruction is separate from permission to apply a described action.
 pub(crate) fn ensure_description_recomputed(plan: &additive::Plan, saved: &Value) -> Result<()> {
     ensure!(

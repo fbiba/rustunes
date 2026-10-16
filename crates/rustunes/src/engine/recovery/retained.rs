@@ -292,6 +292,17 @@ fn ordinary_preflight_number(input: &Json) -> Result<u8> {
     }
 }
 
+/// The directory in `run_dir` holding a Started attempt's operation pair and
+/// session transcript.
+pub(crate) fn transcript_directory(run_dir: &Path, attempt: &Attempt) -> Result<PathBuf> {
+    let (step, _, input) = locate_step(run_dir, attempt.prepared.input_receipt_sha256)?;
+    Ok(if attempt.prepared.kind == AttemptKind::Insert {
+        ordinary_preflight_directory(&step, &serde_json::from_slice(&input)?)?.join("transfer")
+    } else {
+        step.join("transfer")
+    })
+}
+
 fn ordinary_preflight_directory(step: &Path, input: &Json) -> Result<PathBuf> {
     ensure!(
         step.file_name()
@@ -438,6 +449,219 @@ pub struct RetainedRun {
     source: Option<PathBuf>,
 }
 
+pub fn load_run(
+    journal: &Journal,
+    current: &Current,
+    run_dir: &Path,
+    scratch: &Path,
+) -> Result<RetainedRun> {
+    ensure_identity(journal, current)?;
+    let attempt = journal.outstanding()?.context("no outstanding attempt")?;
+    ensure!(
+        attempt.state == AttemptState::ReconciliationRequired,
+        "retained completion requires Started state"
+    );
+    let start = journal
+        .start_evidence(attempt.id)?
+        .context("durable start evidence missing")?;
+    directory(scratch)?;
+    let (step, before_dir, input) = locate_step(run_dir, attempt.prepared.input_receipt_sha256)?;
+    directory(&before_dir)?;
+    let catalog_dir = before_dir.join("catalog");
+    directory(&catalog_dir)?;
+    let input: Json = serde_json::from_slice(&input)?;
+    check_pre_session(&input, attempt.prepared.kind)?;
+    validate_input_schema(&input, attempt.prepared.kind)?;
+    ensure!(
+        json_hash(&input, "operation_sha256")?
+            == <[u8; 32]>::from(Sha256::digest(&attempt.prepared.operation)),
+        "retained input operation digest differs"
+    );
+    let state_bytes = read_bounded(&before_dir.join("state-receipt.json"), SMALL)?;
+    ensure!(
+        json_hash(&input, "current_state_receipt_sha256")?
+            == Sha256::digest(&state_bytes).as_slice(),
+        "retained before-state receipt is not bound to intent"
+    );
+    let state: Json = serde_json::from_slice(&state_bytes)?;
+    ensure!(
+        state["schema"] == "rustunes.current-state"
+            && state["media_anchor"].as_u64()
+                == Some(u64::from(attempt.prepared.current_media_anchor)),
+        "unsupported retained state revision"
+    );
+    ensure!(
+        json_hash(&state, "device_sha256")? == current.identity.device_digest()
+            && json_hash(&state, "library_sha256")? == current.identity.library_digest(),
+        "retained before-state namespace differs"
+    );
+    for (name, key) in [
+        ("iTunesPrefs", "raw_preferences_sha256"),
+        ("iTunesPrefs.plist", "plist_preferences_sha256"),
+        ("iTunesCDB", "cdb_sha256"),
+    ] {
+        let bytes = read_bounded(
+            &before_dir.join(name),
+            if name == "iTunesCDB" {
+                MAX_AUDIO
+            } else {
+                SMALL
+            },
+        )?;
+        ensure!(
+            json_hash(&state, key)? == Sha256::digest(&bytes).as_slice(),
+            "retained state file digest differs"
+        );
+        if name != "iTunesCDB" {
+            current.library.ensure_matches(&identity::parse(&bytes)?)?;
+        }
+    }
+    let database = catalog_dir.join("MediaLibrary.sqlitedb");
+    bounded_file(&database, MAX_AUDIO)?;
+    let wal = catalog_dir.join("MediaLibrary.sqlitedb-wal");
+    let wal = if state["wal_sha256"].is_null() {
+        ensure!(!wal.try_exists()?, "unbound retained WAL exists");
+        None
+    } else {
+        bounded_file(&wal, MAX_AUDIO)?;
+        Some(wal)
+    };
+    let before = sqlite::read_snapshot(&database, wal.as_deref(), scratch)?;
+    ensure!(
+        before.source_hashes().database == json_hash(&state, "database_sha256")?
+            && before.source_hashes().wal
+                == if state["wal_sha256"].is_null() {
+                    None
+                } else {
+                    Some(json_hash(&state, "wal_sha256")?)
+                },
+        "retained catalog hashes differ from state receipt"
+    );
+    ensure!(
+        before.persisted_media_anchor() == attempt.prepared.current_media_anchor
+            && before.database_pid() == current.catalog.database_pid()
+            && before.primary_container_pid() == current.catalog.primary_container_pid(),
+        "retained catalog identity or anchor differs"
+    );
+    let saved = music_protocol::catalogue::anchor::parse(&read_bounded(
+        &before_dir.join("iTunesCDB"),
+        MAX_AUDIO,
+    )?)?;
+    ensure!(
+        saved.database_pid() == before.database_pid()
+            && saved.saved_voice_memo_anchor() == templates::QUALIFIED_VOICE_MEMO_ANCHOR,
+        "retained CDB profile differs from before catalog"
+    );
+    let transfer = if attempt.prepared.kind == AttemptKind::Insert {
+        ordinary_preflight_directory(&step, &input)?.join("transfer")
+    } else {
+        step.join("transfer")
+    };
+    directory(&transfer)?;
+    ensure!(
+        read_bounded(
+            &transfer.join("operation.plist"),
+            signing::MAX_OPERATION_BYTES as u64
+        )? == attempt.prepared.operation,
+        "retained operation differs from journal"
+    );
+    ensure!(
+        read_bounded(&transfer.join("operation.cig"), 21)? == start.signature,
+        "retained signature differs from Started evidence"
+    );
+    // A run killed after the phone's SyncFinished but before this receipt was
+    // written leaves none. The transcript, which must then end in that
+    // SyncFinished, gives the terminal; the host-side hashes the receipt
+    // would hold are read back fresh below (permanent audio, cover).
+    let pending_path = transfer.join("pending-verification.plist");
+    let pending_bytes = match fs::symlink_metadata(&pending_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        _ => Some(read_bounded(&pending_path, SMALL)?),
+    };
+    let pending = pending_bytes
+        .as_deref()
+        .map(plist::from_bytes::<Value>)
+        .transpose()?;
+    let pending = pending.as_ref().map(dict).transpose()?;
+    let terminal = pending
+        .map(|pending| pending_terminal(pending, &attempt, &start))
+        .transpose()?;
+    let cover = if let Some(art) = &attempt.prepared.content.artwork {
+        if let Some(pending) = pending {
+            ensure!(
+                uint(pending, "TransferredAudioBytes")?
+                    == attempt.prepared.content.source.file_bytes
+                    && uint(pending, "CacheID")? == u64::from(art.cache_id)
+                    && uint(pending, "CoverBytes")? == art.bytes
+                    && plist_hash(pending, "StagedCoverSHA256")? == art.sha256,
+                "retained artwork completion differs"
+            );
+        }
+        let bytes = read_bounded(&transfer.join("source-cover.jpg"), 32 * SMALL)?;
+        ensure!(
+            bytes.len() as u64 == art.bytes
+                && <[u8; 32]>::from(Sha256::digest(&bytes)) == art.sha256,
+            "retained cover differs from reserved JPEG"
+        );
+        Some(Cover {
+            checksum: u32::try_from(bytes.len())?
+                .checked_add(17)
+                .context("cover checksum overflow")?,
+            sha256: art.sha256,
+            bytes,
+        })
+    } else {
+        if let Some(pending) = pending {
+            ensure!(
+                uint(pending, "AudioBytes")? == attempt.prepared.content.source.file_bytes
+                    && plist_hash(pending, "EncodedAudioSHA256")?
+                        == attempt.prepared.content.source.audio.sha256,
+                "retained audio completion differs"
+            );
+        }
+        None
+    };
+    let artwork_policy = artwork_policy(&input, &attempt, &before)?;
+    let terminal = verify_transcript(&transfer, &attempt, &start, terminal, &before, current)?;
+    Ok(RetainedRun {
+        step,
+        before,
+        before_database: database,
+        before_wal: wal,
+        cover,
+        ready_sha256: start.ready_receipt_sha256,
+        terminal_sha256: terminal,
+        pending_sha256: pending_bytes.map(|bytes| Sha256::digest(&bytes).into()),
+        artwork_policy,
+        source: planned_source(run_dir, &input)?,
+    })
+}
+
+/// The absolute path of the source the run's retained plan (bound by the
+/// input's plan digest) gave the insertion, as the insertion itself records
+/// it with the binding. None when the run no longer holds that plan.
+fn planned_source(run_dir: &Path, input: &Json) -> Result<Option<PathBuf>> {
+    let path = run_dir.join("plan.json");
+    if input.get("plan_sha256").is_none() || !path.try_exists()? {
+        return Ok(None);
+    }
+    let bytes = read_bounded(&path, MAX_PLAN)?;
+    if Sha256::digest(&bytes).as_slice() != json_hash(input, "plan_sha256")? {
+        return Ok(None);
+    }
+    let plan: Json = serde_json::from_slice(&bytes)?;
+    let root = Path::new(
+        plan["source_root"]
+            .as_str()
+            .context("plan source root absent")?,
+    );
+    let relative = input["source"]
+        .as_str()
+        .context("insertion source absent")?;
+    ensure!(root.is_absolute(), "plan source root is relative");
+    Ok(Some(root.join(relative)))
+}
+
 /// Check a run's pending-verification receipt against the attempt and return
 /// the terminal frame digest it recorded.
 fn pending_terminal(
@@ -466,12 +690,356 @@ fn pending_terminal(
     );
     plist_hash(pending, "TerminalFrameSHA256")
 }
+
+/// Only fixed immediate children of a normal run are visited. Descriptor paths
+/// are never followed; their presence only identifies the supported wrapper.
+pub(crate) fn locate_step(
+    run_dir: &Path,
+    input_hash: [u8; 32],
+) -> Result<(PathBuf, PathBuf, Vec<u8>)> {
+    directory(run_dir)?;
+    let mut roots = vec![run_dir.to_path_buf()];
+    if run_dir.join("run.json").try_exists()? {
+        let descriptor: Json =
+            serde_json::from_slice(&read_bounded(&run_dir.join("run.json"), SMALL)?)?;
+        ensure!(
+            descriptor["schema"] == "rustunes.run",
+            "unsupported outer run descriptor"
+        );
+        if run_dir.join("audio").try_exists()? {
+            directory(&run_dir.join("audio"))?;
+            roots.push(run_dir.join("audio"));
+        }
+        for path in bounded_entries(run_dir, 8192)? {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| numbered(n, "cover-").is_some())
+            {
+                directory(&path)?;
+                roots.push(path);
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    let mut entry_count = 0usize;
+    for root in roots {
+        if root.join("input.json").try_exists()? {
+            candidates.push((root.clone(), root.join("before")));
+        }
+        let entries = bounded_entries(&root, 8192)?;
+        entry_count = entry_count
+            .checked_add(entries.len())
+            .context("retained entry count overflow")?;
+        ensure!(
+            entry_count <= 25000,
+            "retained run entry aggregate exceeds bound"
+        );
+        for entry in entries {
+            let Some(number) = entry
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| numbered(s, "step-"))
+            else {
+                continue;
+            };
+            directory(&entry)?;
+            if entry.join("input.json").try_exists()? {
+                candidates.push((
+                    entry,
+                    if number == 1 {
+                        root.join("before")
+                    } else {
+                        root.join(format!("step-{:04}/after", number - 1))
+                    },
+                ));
+            }
+            ensure!(
+                candidates.len() <= 4096,
+                "retained candidate count exceeds bound"
+            );
+        }
+    }
+    let mut selected = None;
+    let mut total = 0u64;
+    for (step, before) in candidates {
+        let input = read_bounded(&step.join("input.json"), SMALL)?;
+        total = total
+            .checked_add(input.len() as u64)
+            .context("retained input size overflow")?;
+        ensure!(
+            total <= 16 * SMALL,
+            "retained input aggregate exceeds bound"
+        );
+        if <[u8; 32]>::from(Sha256::digest(&input)) == input_hash {
+            ensure!(
+                selected.is_none(),
+                "multiple retained steps match the outstanding intent"
+            );
+            // This locator also serves byte-only discovery tests. Full input
+            // parsing remains mandatory in each consumer before any device I/O.
+            let parsed: Json = serde_json::from_slice(&input).unwrap_or(Json::Null);
+            let before = if parsed.get("pre_session_attempt").is_some() {
+                let phase = ordinary_preflight_directory(&step, &parsed)?;
+                ensure!(
+                    read_bounded(&phase.join("input.json"), SMALL)? == input,
+                    "published insertion input differs from retained pre-session input"
+                );
+                phase.join("before")
+            } else {
+                before
+            };
+            selected = Some((step, before, input));
+        }
+    }
+    selected.context("no retained step matches immutable journal input digest")
+}
 fn numbered(name: &str, prefix: &str) -> Option<usize> {
     let n = name.strip_prefix(prefix)?;
     if n.len() != 4 || !n.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     n.parse().ok().filter(|n| (1..=4096).contains(n))
+}
+
+/// Check the retained session and return its terminal frame's digest, which
+/// must equal `terminal` when the run's receipt recorded one.
+pub(crate) fn verify_transcript(
+    directory_path: &Path,
+    attempt: &Attempt,
+    start: &StartEvidence,
+    terminal: Option<[u8; 32]>,
+    before: &Catalog,
+    current: &Current,
+) -> Result<[u8; 32]> {
+    let mut frames = BTreeMap::new();
+    let mut total = 0u64;
+    for path in bounded_entries(directory_path, 25000)? {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        ensure!(
+            !name.ends_with("-partial.atc"),
+            "retained partial frame leaves session outcome uncertain"
+        );
+        let Some((sequence, suffix)) = name.split_once('-') else {
+            continue;
+        };
+        let outgoing = match suffix {
+            "outgoing.atc" => true,
+            "received.atc" => false,
+            _ => continue,
+        };
+        ensure!(
+            (3..=4).contains(&sequence.len()) && sequence.bytes().all(|b| b.is_ascii_digit()),
+            "unsupported frame sequence name"
+        );
+        let sequence: usize = sequence.parse()?;
+        ensure!(sequence < 1024, "retained frame count exceeds bound");
+        let bytes = read_bounded(&path, FRAME_CAP)?;
+        total = total
+            .checked_add(bytes.len() as u64)
+            .context("frame byte overflow")?;
+        ensure!(total <= FRAME_CAP, "retained session bytes exceed bound");
+        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+        let value = frame(&bytes)?;
+        ensure!(
+            frames.insert(sequence, (outgoing, hash, value)).is_none(),
+            "ambiguous retained frame sequence"
+        );
+    }
+    ensure!(
+        !frames.is_empty() && frames.keys().copied().eq(0..frames.len()),
+        "retained session frames are missing"
+    );
+    let own = (attempt.prepared.content.track_pid as i64).to_string();
+    let eligible = EligibleSnapshot::new(before, &current.library);
+    let mut request = false;
+    let mut ready = false;
+    let mut finished = false;
+    let mut complete = false;
+    let mut ended = None;
+    let mut ancillary = None::<BTreeSet<String>>;
+    let mut declined = BTreeSet::new();
+    let mut templates = None;
+    for (number, (outgoing, hash, value)) in &frames {
+        ensure!(ended.is_none(), "frames follow retained terminal");
+        let root = dict(value)?;
+        let command = text(root, "Command")?;
+        if *outgoing {
+            if command == "Ping" {
+                ensure!(
+                    *number == 0 && root.len() == 2 && uint(root, "Session")? == 1,
+                    "unsupported retained Ping"
+                );
+                continue;
+            }
+            ensure!(
+                uint(root, "Session")? == 2,
+                "retained outgoing session differs"
+            );
+            match command {
+                "RequestingSync" => {
+                    ensure!(!request && !ready, "duplicate retained request");
+                    let host = child(child(root, "Params")?, "HostInfo")?;
+                    let built = templates::build(
+                        &current.library,
+                        text(host, "SyncHostName")?,
+                        attempt.prepared.current_media_anchor,
+                        1,
+                    )?;
+                    ensure!(
+                        built.request == *value,
+                        "retained request differs from qualified runtime profile"
+                    );
+                    templates = Some(built);
+                    request = true;
+                }
+                "FinishedSyncingMetadata" => {
+                    ensure!(
+                        ready && !finished && !complete,
+                        "metadata completion order differs"
+                    );
+                    let mut expected = templates
+                        .as_ref()
+                        .context("retained request absent")?
+                        .finished
+                        .clone();
+                    expected
+                        .as_dictionary_mut()
+                        .unwrap()
+                        .get_mut("Params")
+                        .unwrap()
+                        .as_dictionary_mut()
+                        .unwrap()
+                        .get_mut("DataclassAnchors")
+                        .unwrap()
+                        .as_dictionary_mut()
+                        .unwrap()
+                        .insert(
+                            "Media".into(),
+                            (attempt.prepared.current_media_anchor + 1)
+                                .to_string()
+                                .into(),
+                        );
+                    ensure!(expected == *value, "retained metadata completion differs");
+                    finished = true;
+                }
+                "FileComplete" => {
+                    ensure!(
+                        finished && ancillary.is_some() && !complete && root.len() == 3,
+                        "own completion order differs"
+                    );
+                    let params = child(root, "Params")?;
+                    ensure!(
+                        params.len() == 3
+                            && text(params, "AssetID")? == own
+                            && text(params, "Dataclass")? == "Media"
+                            && text(params, "AssetPath")?
+                                == match attempt.prepared.kind {
+                                    AttemptKind::Insert => attempt.prepared.content.path.as_str(),
+                                    AttemptKind::Artwork => "",
+                                },
+                        "retained FileComplete targets another asset"
+                    );
+                    complete = true;
+                }
+                "FileError" => {
+                    ensure!(complete && root.len() == 3, "ancillary error order differs");
+                    let params = child(root, "Params")?;
+                    let id = text(params, "AssetID")?;
+                    ensure!(
+                        params.len() == 4
+                            && text(params, "Dataclass")? == "Media"
+                            && params.get("ErrorCode").and_then(Value::as_signed_integer)
+                                == Some(16)
+                            && params.get("ErrorIsVisible").and_then(Value::as_boolean)
+                                == Some(false)
+                            && ancillary.as_ref().is_some_and(|set| set.contains(id))
+                            && declined.insert(id.to_owned()),
+                        "unsupported retained asset error"
+                    );
+                }
+                _ => anyhow::bail!("unsupported retained outgoing command"),
+            }
+        } else {
+            ensure!(
+                uint(root, "Type")? == 0
+                    && root
+                        .get("Id")
+                        .and_then(Value::as_unsigned_integer)
+                        .is_some()
+                    && root.len() == if root.contains_key("Params") { 5 } else { 4 },
+                "unsupported retained incoming envelope"
+            );
+            if ready {
+                ensure!(
+                    uint(root, "Session")? == 2,
+                    "retained post-Ready session differs"
+                );
+            }
+            match command {
+                "ReadyForSync" => {
+                    ensure!(
+                        request
+                            && !ready
+                            && *hash == start.ready_receipt_sha256
+                            && uint(root, "Session")? == 2,
+                        "retained Ready is not journal-bound"
+                    );
+                    let params = child(root, "Params")?;
+                    let anchors = child(params, "DataclassAnchors")?;
+                    ensure!(
+                        text(anchors, "Media")?
+                            == attempt.prepared.current_media_anchor.to_string(),
+                        "retained Ready anchor differs"
+                    );
+                    let reply = child(params, "DeviceInfo")?
+                        .get("Grappa")
+                        .and_then(Value::as_data)
+                        .context("retained Grappa missing")?;
+                    ensure!(
+                        signing::FixedHostSession::from_reply(&signing::HOST_REQUEST, reply)?
+                            .sign(&attempt.prepared.operation)?
+                            == start.signature,
+                        "stored signature does not verify against retained Ready and operation"
+                    );
+                    ready = true;
+                }
+                "AssetManifest" => {
+                    ensure!(
+                        finished && !complete && ancillary.is_none(),
+                        "unexpected retained manifest"
+                    );
+                    let declined = match attempt.prepared.kind {
+                        AttemptKind::Insert => eligible.audio(&own)?.validate_manifest(value, 2)?,
+                        AttemptKind::Artwork => {
+                            eligible.artwork(&own)?.validate_manifest(value, 2)?
+                        }
+                    };
+                    ancillary = Some(declined.into_iter().collect());
+                }
+                "SyncFinished" => {
+                    if root.contains_key("Params") {
+                        child(root, "Params")?;
+                    }
+                    ensure!(
+                        complete
+                            && terminal.is_none_or(|t| *hash == t)
+                            && ancillary.as_ref() == Some(&declined),
+                        "retained terminal lacks exact completed asset evidence"
+                    );
+                    ended = Some(*hash);
+                }
+                "Pong" | "Capabilities" => ensure!(!ready, "unexpected late handshake message"),
+                "SyncAllowed" | "InstalledAssets" | "AssetMetrics" | "Progress" => {
+                    music_protocol::protocol::session::check_telemetry(root)?
+                }
+                _ => anyhow::bail!("retained fault or unsupported incoming command"),
+            }
+        }
+    }
+    ended.context("retained successful terminal missing")
 }
 
 fn insert_groups(operation: &[u8]) -> Result<(u64, u64)> {
@@ -572,4 +1140,33 @@ fn bounded_file(path: &Path, cap: u64) -> Result<fs::Metadata> {
         "retained artifact type or size exceeds bound"
     );
     Ok(meta)
+}
+fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
+    let before = bounded_file(path, cap)?;
+    let mut file = File::open(path)?;
+    let held = file.metadata()?;
+    ensure!(
+        before.dev() == held.dev() && before.ino() == held.ino(),
+        "retained artifact changed before open"
+    );
+    let mut bytes = Vec::new();
+    file.by_ref().take(cap + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 == before.len(),
+        "retained artifact changed size"
+    );
+    for after in [file.metadata()?, fs::symlink_metadata(path)?] {
+        ensure!(
+            after.is_file()
+                && before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec()
+                && before.ctime() == after.ctime()
+                && before.ctime_nsec() == after.ctime_nsec(),
+            "retained artifact changed during read"
+        );
+    }
+    Ok(bytes)
 }

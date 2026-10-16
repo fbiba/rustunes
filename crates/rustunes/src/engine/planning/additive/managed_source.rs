@@ -159,6 +159,129 @@ pub(super) struct BatchInput {
     pub(super) scope: String,
 }
 impl ManagedContext {
+    /// One deadline for the whole plan: a full library with new tracks reads
+    /// managed history for every row, which took over 120 s for a 399-source
+    /// library.
+    pub(crate) fn open(journal: &Journal, identity: &Identity) -> Result<Self> {
+        let control = Control {
+            deadline: tokio::time::Instant::now() + Duration::from_secs(1800),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        Self::open_with_control(journal, identity, &control)
+    }
+    /// The caller's phase deadline and Arc are retained without renewal.
+    pub(crate) fn open_with_control(
+        journal: &Journal,
+        identity: &Identity,
+        caller: &Control,
+    ) -> Result<Self> {
+        caller.check()?;
+        let state = ancestry::managed_state(journal, identity)?;
+        let devices = state.join("devices");
+        let device = devices.join(hex(&identity.device_digest()));
+        let library = device.join(hex(&identity.library_digest()));
+        let path = library.join("journal");
+        directory(&state)?;
+        directory(&devices)?;
+        directory(&device)?;
+        directory(&library)?;
+        let control = Control {
+            deadline: caller.deadline,
+            cancelled: caller.cancelled.clone(),
+        };
+        let mut this = Self {
+            journal: Journal::open_read_only(&path, identity)?,
+            inputs: BTreeMap::new(),
+            held: Vec::new(),
+            held_bytes: 0,
+            directories: Vec::new(),
+            batch_targets: None,
+            batch_inputs: BTreeMap::new(),
+            recorded_sources: None,
+            control,
+        };
+        let runs = state.join("runs");
+        let mut remaining = MAX_ENTRIES;
+        let mut checked = Checked::default();
+        let run_dirs = names(&runs, &mut remaining, &mut checked)?;
+        ensure!(run_dirs.len() <= MAX_RUNS, "managed run bound exceeded");
+        this.directories.push((runs, run_dirs.clone()));
+        let mut total = 0u64;
+        // Each directory is listed once: a run is also its own first root,
+        // and a root its own first step.
+        for run in run_dirs {
+            this.control.check()?;
+            let entries = names(&run, &mut remaining, &mut checked)?;
+            this.directories.push((run.clone(), entries.clone()));
+            if run.join("run.json").try_exists()? {
+                this.retain(Held::read(&run.join("run.json"), MAX_INPUT)?)?;
+            }
+            let mut roots = vec![(run.clone(), entries.clone())];
+            for p in entries {
+                if p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n == "audio" || numbered(n, "cover-"))
+                {
+                    let listed = names(&p, &mut remaining, &mut checked)?;
+                    this.directories.push((p.clone(), listed.clone()));
+                    roots.push((p, listed));
+                }
+            }
+            for (root, entries) in roots {
+                let mut steps = vec![root];
+                for p in entries {
+                    if p.file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|n| numbered(n, "step-"))
+                    {
+                        let listed = names(&p, &mut remaining, &mut checked)?;
+                        this.directories.push((p.clone(), listed));
+                        steps.push(p);
+                    }
+                }
+                for step in steps {
+                    this.control.check()?;
+                    if step.join("input.json").try_exists()? {
+                        let held = Held::read(&step.join("input.json"), MAX_INPUT)?;
+                        total = total
+                            .checked_add(held.bytes.len() as u64)
+                            .context("managed input size overflow")?;
+                        ensure!(
+                            total <= MAX_INPUTS_TOTAL,
+                            "managed input aggregate bound exceeded"
+                        );
+                        let index = this.held.len();
+                        this.inputs
+                            .entry(hash(&held.bytes))
+                            .or_default()
+                            .push((run.clone(), index));
+                        this.retain(held)?;
+                    }
+                }
+            }
+        }
+        this.recheck()?;
+        Ok(this)
+    }
+    pub(super) fn retain(&mut self, held: Held) -> Result<()> {
+        if let Some(previous) = self.held.iter().find(|p| p.path == held.path) {
+            ensure!(
+                previous.bytes == held.bytes,
+                "managed retained evidence changed"
+            );
+            return Ok(());
+        }
+        self.held_bytes = self
+            .held_bytes
+            .checked_add(held.bytes.len() as u64)
+            .context("managed evidence size overflow")?;
+        ensure!(
+            self.held_bytes <= MAX_INPUTS_TOTAL,
+            "managed held evidence aggregate bound exceeded"
+        );
+        self.held.push(held);
+        Ok(())
+    }
     /// The insert batch and target ordinal that bound this track, if any.
     pub(super) fn batch_target(&mut self, track: u64) -> Result<Option<(InsertBatchId, usize)>> {
         self.control.check()?;
@@ -180,6 +303,105 @@ impl ManagedContext {
             .recorded_sources
             .as_ref()
             .and_then(|sources| sources.get(&track).cloned()))
+    }
+    /// A batch's retained input, checked against the journal once per plan.
+    pub(super) fn batch_input(&mut self, id: InsertBatchId) -> Result<Arc<BatchInput>> {
+        if !self.batch_inputs.contains_key(&id) {
+            let input = self
+                .read_batch_input(id)
+                .map(Arc::new)
+                .map_err(|error| format!("{error:#}"));
+            self.batch_inputs.insert(id, input);
+        }
+        self.batch_inputs[&id]
+            .clone()
+            .map_err(|error| anyhow!(error))
+    }
+    fn read_batch_input(&mut self, id: InsertBatchId) -> Result<BatchInput> {
+        self.control.check()?;
+        let record = self.journal.insert_batch(id)?;
+        let held = Held::read(&record.evidence.join("input.json"), MAX_INPUT)?;
+        ensure!(
+            hash(&held.bytes) == record.input_receipt,
+            "retained batch input differs from the journal"
+        );
+        let input: Value = serde_json::from_slice(&held.bytes)?;
+        // A session's input adds the tracks it removed; its members are an
+        // insert batch's.
+        ensure!(
+            input["schema"] == "rustunes.insert-batch-input"
+                || input["schema"] == "rustunes.session-input",
+            "unsupported batch input schema"
+        );
+        let members = input["members"]
+            .as_array()
+            .context("batch input has no members")?;
+        ensure!(
+            members.len() == record.targets.len(),
+            "batch input and journal targets differ"
+        );
+        let mut sources = Vec::with_capacity(members.len());
+        for (member, target) in members.iter().zip(&record.targets) {
+            let content = &target.target.content;
+            ensure!(
+                member["track"] == format!("{:016x}", content.track_pid)
+                    && member["path"] == content.path.as_str()
+                    && member["full_source_sha256"] == hex(&content.source.full_file_sha256),
+                "batch input member differs from its journal target"
+            );
+            let source = PathBuf::from(
+                member["source_path"]
+                    .as_str()
+                    .context("batch member has no source path")?,
+            );
+            ensure!(source.is_absolute(), "batch member source path is relative");
+            // The converted file was temporary; the FLAC is the source.
+            sources.push(match &target.target.conversion {
+                Some(conversion) => conversion.source_path.clone(),
+                None => source,
+            });
+        }
+        let scope = input["collection_scope_sha256"]
+            .as_str()
+            .context("batch input has no collection scope")?
+            .to_owned();
+        self.retain(held)?;
+        Ok(BatchInput {
+            record,
+            sources,
+            scope,
+        })
+    }
+    pub(super) fn find(&mut self, digest: [u8; 32]) -> Result<(PathBuf, Vec<u8>)> {
+        self.control.check()?;
+        let rows = self
+            .inputs
+            .get(&digest)
+            .context("missing managed producer input digest")?;
+        ensure!(rows.len() == 1, "ambiguous managed producer input digest");
+        let (run, index) = rows[0].clone();
+        let (step, before, bytes) = crate::engine::recovery::retained::locate_step(&run, digest)?;
+        ensure!(
+            bytes == self.held[index].bytes,
+            "managed locator input differs"
+        );
+        let input: Value = serde_json::from_slice(&bytes)?;
+        if input.get("pre_session_attempt").is_some() {
+            let phase = before.parent().context("pre-session phase absent")?;
+            let held = Held::read(&phase.join("input.json"), MAX_INPUT)?;
+            ensure!(
+                held.bytes == bytes,
+                "pre-session locator phase input differs"
+            );
+            self.retain(held)?;
+            if !self.directories.iter().any(|(p, _)| p == phase) {
+                let used = self.directories.iter().map(|(_, n)| n.len()).sum::<usize>();
+                let mut remaining = MAX_ENTRIES.saturating_sub(used);
+                let inventory = names(phase, &mut remaining, &mut Checked::default())?;
+                self.directories.push((phase.to_path_buf(), inventory));
+            }
+        }
+        Ok((step, bytes))
     }
     /// Check the journal, and every retained run file and directory inventory
     /// the context read; no new discovery is accepted here.

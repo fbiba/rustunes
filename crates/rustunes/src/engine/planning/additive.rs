@@ -168,6 +168,7 @@ pub(crate) fn metadata_catalogue_fields(catalog: &Catalog, track: &Track) -> ser
 
 mod managed_audio;
 pub use managed_audio::ManagedAudioReplacement;
+pub(crate) use managed_audio::source_paths;
 
 #[derive(Serialize)]
 pub struct SourceDecision {
@@ -305,6 +306,983 @@ pub enum ArtworkDecision {
     UnavailableUntilSourceValidated,
 }
 
+/// Candidates are caller-generated random identities and exact permanent paths,
+/// keyed by source relative path. Candidates for Keep/Conflict rows are unused.
+#[cfg(test)]
+pub fn build(
+    sources: &SourceCollection,
+    catalog: &Catalog,
+    index: &DeviceAudioIndex,
+    identity: &IndexIdentity,
+    journal: Option<JournalEvidence<'_>>,
+    candidates: &BTreeMap<String, Candidate>,
+) -> Result<Plan> {
+    build_with_policy(
+        sources, catalog, index, identity, journal, candidates, false,
+    )
+}
+
+/// Add-only preserves matches, except an explicitly planned missing cover for
+/// this tool's own insertion with the exact original source and no prior cover.
+#[cfg(test)]
+pub fn build_with_policy(
+    sources: &SourceCollection,
+    catalog: &Catalog,
+    index: &DeviceAudioIndex,
+    identity: &IndexIdentity,
+    journal: Option<JournalEvidence<'_>>,
+    candidates: &BTreeMap<String, Candidate>,
+    preserve_existing_tracks: bool,
+) -> Result<Plan> {
+    build_inner(
+        sources,
+        catalog,
+        index,
+        identity,
+        journal,
+        candidates,
+        preserve_existing_tracks,
+    )
+}
+
+/// Plans from a saved snapshot's catalogue and audio index.
+pub fn build_from_snapshot(
+    sources: &SourceCollection,
+    snapshot: &crate::engine::state::snapshot::Snapshot,
+    journal: Option<JournalEvidence<'_>>,
+    candidates: &BTreeMap<String, Candidate>,
+    preserve_existing_tracks: bool,
+) -> Result<Plan> {
+    build_inner(
+        sources,
+        &snapshot.catalog,
+        &snapshot.index,
+        &snapshot.identity,
+        journal,
+        candidates,
+        preserve_existing_tracks,
+    )
+}
+
+/// Mixed execution replans retain the caller's absolute deadline and Arc.
+pub(crate) fn build_from_snapshot_with_control(
+    sources: &SourceCollection,
+    snapshot: &crate::engine::state::snapshot::Snapshot,
+    journal: Option<JournalEvidence<'_>>,
+    candidates: &BTreeMap<String, Candidate>,
+    preserve_existing_tracks: bool,
+    control: &crate::engine::execution::native_insert::Control,
+) -> Result<Plan> {
+    control.check()?;
+    build_inner_with_control(
+        sources,
+        &snapshot.catalog,
+        &snapshot.index,
+        &snapshot.identity,
+        journal,
+        candidates,
+        preserve_existing_tracks,
+        Some(control),
+    )
+}
+
+fn build_inner(
+    sources: &SourceCollection,
+    catalog: &Catalog,
+    index: &DeviceAudioIndex,
+    identity: &IndexIdentity,
+    journal: Option<JournalEvidence<'_>>,
+    candidates: &BTreeMap<String, Candidate>,
+    preserve_existing_tracks: bool,
+) -> Result<Plan> {
+    build_inner_with_control(
+        sources,
+        catalog,
+        index,
+        identity,
+        journal,
+        candidates,
+        preserve_existing_tracks,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_inner_with_control(
+    sources: &SourceCollection,
+    catalog: &Catalog,
+    index: &DeviceAudioIndex,
+    identity: &IndexIdentity,
+    journal: Option<JournalEvidence<'_>>,
+    candidates: &BTreeMap<String, Candidate>,
+    preserve_existing_tracks: bool,
+    control: Option<&crate::engine::execution::native_insert::Control>,
+) -> Result<Plan> {
+    if let Some(control) = control {
+        control.check()?;
+    }
+    index.ensure_matches(catalog, identity)?;
+    ensure!(
+        sources.inspected_len() != 0 || !sources.failures.is_empty(),
+        "empty source selection cannot produce a sync plan"
+    );
+    ensure!(
+        sources.inspected_len() + sources.failures.len() <= 4096,
+        "source plan exceeds bound"
+    );
+    ensure!(
+        sources.selection_stats.selected_files == sources.inspected_len() + sources.failures.len(),
+        "source inspection does not cover its complete selected scope"
+    );
+    let paths = catalog.music_paths()?;
+    // Folders tracks use, and the phone's own registry: an emptied library
+    // keeps its folders but no track names them.
+    let folders: BTreeSet<_> = paths
+        .iter()
+        .filter_map(|p| p.rsplit_once('/').map(|(parent, _)| parent.to_owned()))
+        .chain(catalog.music_folders().iter().cloned())
+        .collect();
+    let journal_evidence = journal.as_ref().map(|e| (e.journal, e.identity));
+    let mut managed_context = None;
+    let mut journal = JournalView::read(journal, identity, index)?;
+    let mut planner = Planner::new(catalog, &journal.reserved_ids);
+    let mut reserved_paths: BTreeSet<_> = paths.iter().map(|p| p.to_ascii_lowercase()).collect();
+    reserved_paths.append(&mut journal.reserved_paths);
+    let device: BTreeMap<_, _> = catalog.tracks().iter().map(|t| (t.sync_id, t)).collect();
+    let mut audio: BTreeMap<[u8; 32], Vec<u64>> = BTreeMap::new();
+    for track in index.tracks().values() {
+        audio
+            .entry(track.fingerprint.audio.sha256)
+            .or_default()
+            .push(track.sync_id);
+    }
+    let mut source_audio: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+    let mut names = BTreeSet::new();
+    for source in &sources.tracks {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        validate_relative(&source.relative_path)?;
+        ensure!(
+            names.insert(&source.relative_path),
+            "duplicate source path in plan"
+        );
+        *source_audio
+            .entry(source.fingerprint.audio.sha256)
+            .or_default() += 1;
+    }
+    for source in &sources.mp3_tracks {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        validate_relative(&source.relative_path)?;
+        ensure!(
+            names.insert(&source.relative_path),
+            "duplicate source path in plan"
+        );
+    }
+    for failed in &sources.failures {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        validate_relative(&failed.relative_path)?;
+        ensure!(
+            names.insert(&failed.relative_path),
+            "duplicate source path in plan"
+        );
+    }
+    let mut matched = BTreeSet::new();
+    let mut rows = Vec::new();
+    let mut sorted: Vec<_> = sources.tracks.iter().collect();
+    sorted.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    for source in sorted {
+        let exact = audio
+            .get(&source.fingerprint.audio.sha256)
+            .cloned()
+            .unwrap_or_default();
+        matched.extend(exact.iter().copied());
+        let mut row = source_row(source);
+        let projected = ProjectedFields::from_source(&source.metadata);
+        let report =
+            source_validation::inspect(&sources.base_directory.join(&source.relative_path), false);
+        let revalidation = check_revalidation(source, &report);
+        let source_supported = report.supported_by_current_profile;
+        row.validation_issues = report.issues;
+        if let Ok(fields) = &projected {
+            row.projected = Some(fields.clone());
+        }
+        for id in &exact {
+            row.matches.push(existing_match(
+                source,
+                device[id],
+                index,
+                &journal,
+                true,
+                projected.as_ref().ok(),
+                catalog,
+            ));
+        }
+        // Only a source this run could add again is a replacement.
+        if !preserve_existing_tracks
+            && source_supported
+            && revalidation.is_ok()
+            && source_audio[&source.fingerprint.audio.sha256] == 1
+            && let Some(fields) = row.projected.as_ref()
+            && let Some((j, identity)) = journal_evidence
+        {
+            row.managed_audio_replacement = managed_audio::describe(
+                &mut managed_context,
+                JournalEvidence {
+                    journal: j,
+                    identity,
+                },
+                &journal.active_bindings,
+                sources,
+                source,
+                fields,
+                catalog,
+                index,
+                control,
+            );
+        }
+        if let Err(error) = revalidation {
+            row.decision = conflict("source_changed_or_invalid", error.to_string());
+        } else if let Some(description) = row
+            .managed_audio_replacement
+            .as_ref()
+            .filter(|description| description.blocks())
+        {
+            let cover = report
+                .artwork
+                .as_ref()
+                .map(|art| (art.sha256.as_str(), art.bytes));
+            row.artwork = artwork_decision(cover, &exact, catalog, index, &journal);
+            // A blocked replacement never enters the additive planner: later
+            // rows must not reuse groups allocated for a nonexecuting proposal.
+            row.decision = conflict(
+                if description.replacement_identity_established {
+                    "managed_audio_replacement_proposed"
+                } else {
+                    "managed_audio_replacement_evidence_refused"
+                },
+                description.refusal.clone().unwrap_or_else(|| "Changed audio at the source path of a track this tool inserted; sync with --replace-changed replaces the track (removes it, then adds the new audio)".into()),
+            );
+        } else if preserve_existing_tracks
+            && exact.len() == 1
+            && source_audio[&source.fingerprint.audio.sha256] == 1
+            && projected.is_ok()
+            && row.validation_issues.iter().all(|issue| {
+                issue.severity != source_validation::Severity::Error
+                    || issue.code == "compilation_grouping_unverified"
+            })
+        {
+            // Compilation grouping limits insertion; they cannot require a
+            // rewrite of an independently matched existing audio file.
+            row.decision = Decision::Keep;
+            row.artwork = ArtworkDecision::PreservedExistingTrack {
+                source_cover_sha256: report.artwork.as_ref().map(|a| a.sha256.clone()),
+                source_cover_bytes: report.artwork.as_ref().map(|a| a.bytes),
+                observed_cache_ids: exact
+                    .iter()
+                    .filter_map(|id| catalog.artwork().track_cache_ids().get(id).copied())
+                    .collect(),
+            };
+            if source_supported
+                && let Some(cover) = &report.artwork
+                && let Some(binding) = journal.binding(exact[0], index)
+                && owes_cover(
+                    catalog,
+                    exact[0],
+                    &source.fingerprint,
+                    binding,
+                    !journal.blockers.is_empty(),
+                )
+            {
+                row.artwork = ArtworkDecision::PendingOwnedCover {
+                    sha256: cover.sha256.clone(),
+                    bytes: cover.bytes,
+                };
+            }
+        } else if projected.is_err()
+            || (!source_supported
+                && !(exact.len() == 1
+                    && row.validation_issues.iter().all(|issue| {
+                        issue.severity != source_validation::Severity::Error
+                            || issue.code == "compilation_grouping_unverified"
+                    })))
+        {
+            // Name what failed, as validate does.
+            let mut reasons: Vec<String> = row
+                .validation_issues
+                .iter()
+                .filter(|issue| issue.severity == source_validation::Severity::Error)
+                .map(|issue| issue.message.clone())
+                .collect();
+            if reasons.is_empty()
+                && let Err(error) = &projected
+            {
+                reasons.push(format!("{error:#}"));
+            }
+            row.decision = conflict(
+                "unsupported_source",
+                format!(
+                    "Source validation/projection must pass before planning: {}",
+                    reasons.join("; ")
+                ),
+            );
+        } else {
+            let projected = projected?;
+            let cover = report
+                .artwork
+                .as_ref()
+                .map(|art| (art.sha256.as_str(), art.bytes));
+            row.artwork = artwork_decision(cover, &exact, catalog, index, &journal);
+            if source_audio[&source.fingerprint.audio.sha256] > 1 {
+                row.decision = conflict(
+                    "duplicate_source_audio",
+                    "Select one source variant explicitly; no identity allocated".into(),
+                );
+            } else if exact.len() > 1 {
+                row.decision = conflict(
+                    "multiple_existing_audio_matches",
+                    "Every existing audio match is preserved; no automatic identity selection"
+                        .into(),
+                );
+            } else if exact.len() == 1 {
+                let owned = journal.binding(exact[0], index).is_some();
+                let differs = row
+                    .matches
+                    .iter()
+                    .any(|m| !m.catalog_differences.is_empty());
+                row.decision = if preserve_existing_tracks || !differs {
+                    Decision::Keep
+                } else if !owned {
+                    conflict(
+                        "existing_metadata_update_unqualified",
+                        "Encoded audio is present, but source metadata Update requires admitted inserted ownership".into(),
+                    )
+                } else {
+                    let changes = &row.matches[0].catalog_differences;
+                    match update::from_differences(&projected, device[&exact[0]], changes) {
+                        Ok(Some(_)) => Decision::Update {
+                            track_id: pid(exact[0]),
+                            changes: changes
+                                .iter()
+                                .map(|d| FieldDifference {
+                                    field: d.field,
+                                    current: d.current.clone(),
+                                    desired: d.desired.clone(),
+                                })
+                                .collect(),
+                        },
+                        Ok(None) => Decision::Keep,
+                        Err(error) => update_refused(&error),
+                    }
+                };
+            } else {
+                for track in catalog
+                    .tracks()
+                    .iter()
+                    .filter(|track| plausible(&projected, track))
+                {
+                    row.matches.push(existing_match(
+                        source,
+                        track,
+                        index,
+                        &journal,
+                        false,
+                        Some(&projected),
+                        catalog,
+                    ));
+                }
+                let composer = native_composer(catalog, projected.composer.as_deref());
+                if let Err(error) = &composer {
+                    row.decision = conflict("composer_lookup_unqualified", error.to_string());
+                } else if !row.matches.is_empty() {
+                    row.decision = conflict("plausible_existing_audio_requires_comparison", "Encoded mismatch is not absence: plausible metadata/duration requires optional PCM comparison or explicit review; titles establish no identity".into());
+                } else if !journal.blockers.is_empty() {
+                    row.decision = conflict("journal_reconciliation_required", "Outstanding intent or drifted verified binding requires reconciliation before any new identity proposal".into());
+                } else if let Some(candidate) = candidates.get(&source.relative_path) {
+                    row.native_composer = composer?;
+                    row.decision = match plan_add(
+                        &mut planner,
+                        source,
+                        candidate,
+                        &folders,
+                        &mut reserved_paths,
+                    ) {
+                        Ok(decision) => decision,
+                        Err(error) => conflict("candidate_or_grouping_conflict", error.to_string()),
+                    };
+                } else {
+                    row.decision = conflict("candidate_required", "Missing encoded audio still needs caller-selected random identities and an exact new destination".into());
+                }
+            }
+        }
+        rows.push(row);
+    }
+    for source in &sources.mp3_tracks {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        let mut row = mp3_row(
+            source,
+            sources,
+            catalog,
+            index,
+            &journal,
+            preserve_existing_tracks,
+        )?;
+        let unmatched = matches!(
+            row.decision,
+            Decision::Conflict {
+                code: "mp3_insertion_unqualified",
+                ..
+            }
+        );
+        // A source this run cannot send is left out whole, so it is never a
+        // replacement either: an earlier version's track stays.
+        let prepared = unmatched.then(|| {
+            if let Some(refusal) = unconvertible(sources, &source.source) {
+                return Err(conflict("flac_conversion_refused", format!("{refusal:#}")));
+            }
+            let prepared = PreparedSource::read_expected(
+                &sources.base_directory.join(&source.relative_path),
+                &source.source,
+            )
+            .map_err(|e| conflict("source_changed_or_invalid", format!("{e:#}")))?;
+            prepared
+                .ensure_batch_insertion_allowed()
+                .map_err(|e| conflict("mp3_source_profile_unsupported", format!("{e:#}")))?;
+            Ok(prepared)
+        });
+        if matches!(prepared, Some(Ok(_)))
+            && !preserve_existing_tracks
+            && let Some((j, identity)) = journal_evidence
+        {
+            row.managed_audio_replacement = managed_audio::describe_mpeg(
+                &mut managed_context,
+                JournalEvidence {
+                    journal: j,
+                    identity,
+                },
+                &journal.active_bindings,
+                &journal.conversions,
+                sources,
+                source,
+                catalog,
+                control,
+            );
+        }
+        if let Some(description) = row
+            .managed_audio_replacement
+            .as_ref()
+            .filter(|description| description.blocks())
+        {
+            row.decision = conflict(
+                if description.replacement_identity_established {
+                    "managed_audio_replacement_proposed"
+                } else {
+                    "managed_audio_replacement_evidence_refused"
+                },
+                description.refusal.clone().unwrap_or_else(|| format!("Changed audio at the source path of a track this tool inserted from a {} file; sync with --replace-changed replaces the track (removes it, then adds the new audio)", source.source.format().label())),
+            );
+        } else if let Some(prepared) = prepared {
+            let converts = sources.flac_to_alac
+                && source.source.format() == music_protocol::media::format::Format::Flac;
+            row.decision = match prepared {
+                Err(refusal) => refusal,
+                Ok(prepared) => {
+                    if !journal.blockers.is_empty() {
+                        conflict(
+                            "journal_reconciliation_required",
+                            "Reconcile pending or drifted bindings before MPEG allocation".into(),
+                        )
+                    } else if journal_evidence.is_none() {
+                        conflict(
+                            "mp3_journal_required",
+                            format!(
+                                "{} additions go in an insert batch, which needs the existing idle journal (plan with --journal).",
+                                prepared.source().format().label()
+                            ),
+                        )
+                    } else if let Some(plausible) = plausible_mpeg(&prepared, catalog) {
+                        conflict(
+                            "plausible_existing_audio_requires_comparison",
+                            format!(
+                                "Encoded mismatch is not absence: track {plausible} has this source's title, its artist or album and its duration; it may be an earlier version of it. Titles establish no identity, so nothing is added"
+                            ),
+                        )
+                    } else if let Some(candidate) = candidates.get(&source.relative_path) {
+                        match crate::engine::state::journal::mpeg_insert::ensure_new_source(
+                            &prepared,
+                            index,
+                            &journal.active_bindings,
+                        )
+                        .and_then(|()| {
+                            plan_mpeg_add(
+                                &mut planner,
+                                &prepared,
+                                converts,
+                                candidate,
+                                &folders,
+                                &mut reserved_paths,
+                            )
+                        }) {
+                            Ok(decision) => {
+                                let cover = music_protocol::media::mpeg::cover_picture(
+                                    &source.source.artwork,
+                                )
+                                .map(|p| (p.sha256.as_str(), p.bytes));
+                                row.artwork =
+                                    artwork_decision(cover, &[], catalog, index, &journal);
+                                row.flac_to_alac = converts;
+                                if let Some(report) = row.mp3_insertion.as_mut() {
+                                    report.insertion_route = Some("insert_batch");
+                                    report.required_qualification = if converts {
+                                        vec![
+                                            "checked_lossless_flac_to_alac_conversion",
+                                            "fresh_complete_state_before_each_batch",
+                                            "original_native_transfer_and_full_readback",
+                                            "observed_insert_batch_settlement",
+                                        ]
+                                    } else {
+                                        vec![
+                                            "fresh_complete_state_before_each_batch",
+                                            "original_native_transfer_and_full_readback",
+                                            "observed_insert_batch_settlement",
+                                        ]
+                                    };
+                                }
+                                decision
+                            }
+                            Err(e) => {
+                                conflict("mp3_candidate_or_grouping_conflict", format!("{e:#}"))
+                            }
+                        }
+                    } else {
+                        conflict(
+                            "candidate_required",
+                            "Missing audio needs an exact new identity and destination".into(),
+                        )
+                    }
+                }
+            };
+        }
+        matched.extend(
+            row.matches
+                .iter()
+                .map(|m| u64::from_str_radix(&m.track_id, 16))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+        rows.push(row);
+    }
+    for failed in &sources.failures {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        rows.push(SourceDecision {
+            relative_path: failed.relative_path.clone(),
+            managed_audio_replacement: None,
+            source_file_bytes: None,
+            source_file_sha256: None,
+            encoded_audio_sha256: None,
+            projected: None,
+            mp3: None,
+            mp3_insertion: None,
+            flac_to_alac: false,
+            validation_issues: Vec::new(),
+            matches: Vec::new(),
+            artwork: ArtworkDecision::UnavailableUntilSourceValidated,
+            native_composer: None,
+            decision: conflict("source_inspection_failed", failed.message.clone()),
+        });
+    }
+    rows.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    skip::leave_out(&mut rows);
+    let (recent_play_resets, recent_skip_resets) = artwork_recent_reset_disclosure(&rows, catalog);
+    if let (Some(Ok(context)), Some(_)) = (&managed_context, journal_evidence) {
+        // The held managed ancestry still needs a final publication recheck.
+        context.recheck()?;
+    }
+    if let Some(control) = control {
+        control.check()?;
+    }
+    Ok(Plan {
+        schema: "rustunes.additive-plan",
+        mode: "additive_dry_run",
+        preserve_existing_tracks,
+        flac_to_alac: sources.flac_to_alac,
+        source_root: sources
+            .root
+            .to_str()
+            .context("source root must be UTF-8")?
+            .to_owned(),
+        selection: SelectionScope {
+            base_directory: sources
+                .base_directory
+                .to_str()
+                .context("source base directory must be UTF-8")?
+                .to_owned(),
+            recursive: sources.options.recursive,
+            include: sources.options.include.clone(),
+            exclude: sources.options.exclude.clone(),
+            selected_files: sources.selection_stats.selected_files,
+            selected_bytes: sources.selection_stats.selected_bytes,
+        },
+        exclusions: sources
+            .exclusions
+            .iter()
+            .map(|e| ExcludedSource {
+                relative_path: e.relative_path.clone(),
+                reason: e.reason.as_str(),
+                descendants_unscanned: e.descendants_unscanned,
+            })
+            .collect(),
+        metadata_comparison_scope: MetadataComparisonScope {
+            compared_fields: vec![
+                "title",
+                "sort_name",
+                "content_rating",
+                "content_rating_level",
+                "compilation",
+                "artist",
+                "album",
+                "album_artist",
+                "genre",
+                "composer",
+                "copyright",
+                "year",
+                "track",
+                "track_total",
+                "disc",
+                "disc_total",
+                "total_time_ms",
+            ],
+            unverified_fields: vec!["content_rating", "compilation"],
+            ascii_case_equivalent_group_fields: vec!["artist", "album", "album_artist"],
+            container_byte_drift_reported_separately: true,
+        },
+        device_sha256: hex(&identity.device_identifier_sha256),
+        library_sha256: hex(&identity.library_identity_sha256),
+        database_sha256: hex(&catalog.source_hashes().database),
+        wal_sha256: catalog.source_hashes().wal.as_ref().map(hex),
+        media_anchor: catalog.persisted_media_anchor(),
+        device_track_count: catalog.tracks().len(),
+        journal_blockers: journal.blockers,
+        artwork_import_recent_play_resets: recent_play_resets,
+        artwork_import_recent_skip_resets: recent_skip_resets,
+        sources: rows,
+        preserved_unmatched_device_tracks: device
+            .keys()
+            .filter(|id| !matched.contains(id))
+            .map(|id| pid(*id))
+            .collect(),
+        phone_deletions: 0,
+        execution_authorized_by_plan: false,
+    })
+}
+
+/// Full-file equality proves the same MPEG bytes; the device index records no
+/// MPEG frame digest. No tag-only audio equality is inferred here.
+fn mp3_row(
+    source: &crate::engine::planning::source_collection::Mp3Track,
+    sources: &SourceCollection,
+    catalog: &Catalog,
+    index: &DeviceAudioIndex,
+    journal: &JournalView,
+    preserve_existing_tracks: bool,
+) -> Result<SourceDecision> {
+    let f = &source.source.fingerprint;
+    let exact: Vec<_> = index
+        .other_audio()
+        .values()
+        .filter(|t| t.file_bytes == f.file_bytes && hex(&t.full_file_sha256) == f.full_file_sha256)
+        .collect();
+    let fresh =
+        music_protocol::media::mpeg::read(&sources.base_directory.join(&source.relative_path));
+    let revalidated = fresh.as_ref().is_ok_and(|s| s == &source.source);
+    let duplicate = sources
+        .mp3_tracks
+        .iter()
+        .filter(|t| t.source.fingerprint.audio == f.audio)
+        .count()
+        > 1;
+    // A track this tool inserted from the same frames, whose source has since
+    // changed only outside them (its tags or cover): the phone still holds the
+    // file that was sent, and its catalogue fields can follow the new tags.
+    let retagged = if exact.is_empty() && revalidated {
+        owned_mpeg_audio(&source.source, journal, index)
+    } else {
+        Vec::new()
+    };
+    // A FLAC this tool sent as an ALAC converted from it: the journal links
+    // the FLAC's audio to that track, whether or not this run converts.
+    let converted = if exact.is_empty() && retagged.is_empty() && revalidated {
+        converted_flac_audio(&source.source, journal, index)
+    } else {
+        Vec::new()
+    };
+    let desired = (!retagged.is_empty() || !converted.is_empty()).then(|| {
+        PreparedSource::read_expected(
+            &sources.base_directory.join(&source.relative_path),
+            &source.source,
+        )
+        .and_then(|prepared| prepared.projected())
+    });
+    let mut matches = Vec::new();
+    for audio in &exact {
+        let track = catalog
+            .tracks()
+            .iter()
+            .find(|t| t.sync_id == audio.sync_id)
+            .context("MPEG index target absent")?;
+        let mut diffs = Vec::new();
+        for (field, current, values) in [
+            (
+                "title",
+                &track.metadata.title,
+                &source.source.metadata.title,
+            ),
+            (
+                "artist",
+                &track.metadata.artist,
+                &source.source.metadata.artist,
+            ),
+            (
+                "album",
+                &track.metadata.album,
+                &source.source.metadata.album,
+            ),
+        ] {
+            // An empty value is no value (`metadata::tag_value`).
+            let values: Vec<_> = music_protocol::media::metadata::tag_values(values).collect();
+            if values.len() != 1 || values[0] != current {
+                diffs.push(FieldDifference {
+                    field,
+                    current: json!(current),
+                    desired: json!(values),
+                });
+            }
+        }
+        matches.push(ExistingMatch {
+            track_id: pid(audio.sync_id),
+            wire_id: wire(audio.sync_id),
+            path: audio.afc_path.clone(),
+            codec: audio.codec.format().codec_label(),
+            encoded_audio_equal: true,
+            full_container_equal: true,
+            match_basis: Some("full_file_equality_with_mpeg_layout"),
+            ownership: if journal.binding(audio.sync_id, index).is_some() {
+                "inserted_by_us"
+            } else {
+                "unowned"
+            },
+            catalog_differences: diffs,
+            canonicalized_fields: Vec::new(),
+            device_file_sha256: None,
+        });
+    }
+    for binding in &retagged {
+        let track = catalog
+            .tracks()
+            .iter()
+            .find(|t| t.sync_id == binding.content.track_pid)
+            .context("MPEG binding target absent")?;
+        let (catalog_differences, canonicalized_fields) = match &desired {
+            Some(Ok(fields)) => compared_fields(fields, catalog, track),
+            _ => Default::default(),
+        };
+        matches.push(ExistingMatch {
+            track_id: pid(track.sync_id),
+            wire_id: wire(track.sync_id),
+            path: binding.content.path.clone(),
+            codec: binding.content.source.format().codec_label(),
+            encoded_audio_equal: true,
+            full_container_equal: false,
+            match_basis: Some("owned_mpeg_frame_identity"),
+            ownership: "inserted_by_us",
+            catalog_differences,
+            canonicalized_fields,
+            device_file_sha256: Some(hex(&binding.content.source.full_file_sha256)),
+        });
+    }
+    for binding in &converted {
+        let track = catalog
+            .tracks()
+            .iter()
+            .find(|t| t.sync_id == binding.content.track_pid)
+            .context("converted FLAC's binding target absent")?;
+        let (catalog_differences, canonicalized_fields) = match &desired {
+            Some(Ok(fields)) => compared_fields(fields, catalog, track),
+            _ => Default::default(),
+        };
+        matches.push(ExistingMatch {
+            track_id: pid(track.sync_id),
+            wire_id: wire(track.sync_id),
+            path: binding.content.path.clone(),
+            codec: binding.content.source.format().codec_label(),
+            encoded_audio_equal: false,
+            full_container_equal: false,
+            match_basis: Some("flac_conversion"),
+            ownership: "inserted_by_us",
+            catalog_differences,
+            canonicalized_fields,
+            device_file_sha256: Some(hex(&binding.content.source.full_file_sha256)),
+        });
+    }
+    let shape_matches = exact.iter().all(|t| {
+        let crate::engine::state::audio_index::OtherCodec::Mpeg1Layer3 {
+            sample_rate,
+            channels,
+            frame_count,
+            audio_offset,
+            audio_bytes,
+            trailing_tag_bytes,
+        } = t.codec
+        else {
+            let crate::engine::state::audio_index::OtherCodec::Encoded(encoded) = &t.codec else {
+                return false;
+            };
+            return source
+                .source
+                .stream
+                .as_ref()
+                .is_some_and(|s| s.encoded == *encoded);
+        };
+        sample_rate == f.audio.sample_rate
+            && channels == f.audio.channels
+            && frame_count == f.audio.frame_count
+            && audio_offset == source.source.audio_offset
+            && audio_bytes == f.audio.audio_bytes
+            && trailing_tag_bytes == source.source.trailing_tag_bytes
+    });
+    let preparation = if exact.is_empty() && revalidated {
+        Some(crate::engine::planning::source_collection::mp3::preparation::assess(&source.source))
+    } else {
+        None
+    };
+    let decision = if !shape_matches {
+        conflict(
+            "device_mpeg_classification_conflict",
+            "Full-file identity and saved MPEG frame layout disagree".into(),
+        )
+    } else if !revalidated {
+        conflict(
+            "source_changed_or_invalid",
+            "MP3 source changed since inspection".into(),
+        )
+    } else if duplicate {
+        conflict(
+            "duplicate_source_audio",
+            "Select one MPEG source variant explicitly; no identity allocated".into(),
+        )
+    } else if exact.len() > 1 {
+        conflict(
+            "multiple_existing_audio_matches",
+            "All matching MPEG files are preserved; selection is ambiguous".into(),
+        )
+    } else if exact.len() == 1 {
+        Decision::Keep
+    } else if retagged.len() > 1 {
+        conflict(
+            "multiple_existing_audio_matches",
+            "Several MPEG tracks this tool inserted hold these frames; all are preserved".into(),
+        )
+    } else if let ([binding], [found], Some(desired)) = (&retagged[..], &matches[..], &desired) {
+        // The cover is compared as sent: a PNG's or GIF's own bytes never
+        // equal the JPEG that went with the track.
+        match sent_cover(
+            &sources.base_directory.join(&source.relative_path),
+            &source.source,
+        ) {
+            Ok(cover) => retagged_mpeg_decision(
+                binding,
+                desired,
+                found,
+                cover,
+                source.source.format().label(),
+                catalog,
+                index,
+                journal,
+                preserve_existing_tracks,
+            ),
+            Err(error) => conflict("source_changed_or_invalid", format!("{error:#}")),
+        }
+    } else if let ([binding], [found], Some(desired)) = (&converted[..], &matches[..], &desired) {
+        // The cover that went with the ALAC: the FLAC's, as a JPEG.
+        match sent_cover(
+            &sources.base_directory.join(&source.relative_path),
+            &source.source,
+        ) {
+            Ok(cover) => retagged_mpeg_decision(
+                binding,
+                desired,
+                found,
+                cover,
+                "FLAC converted to ALAC",
+                catalog,
+                index,
+                journal,
+                preserve_existing_tracks,
+            ),
+            Err(error) => conflict("source_changed_or_invalid", format!("{error:#}")),
+        }
+    } else {
+        conflict("mp3_insertion_unqualified", {
+            let mut message = String::from(
+                "No phone track holds this audio; no identity or destination is allocated.",
+            );
+            if let Some(report) = &preparation {
+                for issue in &report.compatibility_issues {
+                    message.push(' ');
+                    message.push_str(&issue.detail);
+                    message.push('.');
+                }
+            }
+            message
+        })
+    };
+    let cover = music_protocol::media::mpeg::cover_picture(&source.source.artwork);
+    Ok(SourceDecision {
+        relative_path: source.relative_path.clone(),
+        managed_audio_replacement: None,
+        source_file_bytes: Some(f.file_bytes),
+        source_file_sha256: Some(f.full_file_sha256.clone()),
+        encoded_audio_sha256: Some(f.audio.sha256.clone()),
+        projected: desired.and_then(Result::ok),
+        mp3: Some(source.source.clone()),
+        mp3_insertion: preparation,
+        flac_to_alac: false,
+        validation_issues: music_protocol::media::mpeg::cover_left_out(&source.source.artwork)
+            .map(|why| source_validation::Issue::cover_left_out(&why))
+            .into_iter()
+            .collect(),
+        matches,
+        artwork: if exact.is_empty() && retagged.is_empty() && converted.is_empty() {
+            ArtworkDecision::UnavailableUntilSourceValidated
+        } else {
+            ArtworkDecision::PreservedExistingTrack {
+                source_cover_sha256: cover.map(|c| c.sha256.clone()),
+                source_cover_bytes: cover.map(|c| c.bytes),
+                observed_cache_ids: exact
+                    .iter()
+                    .map(|t| t.sync_id)
+                    .chain(
+                        retagged
+                            .iter()
+                            .chain(&converted)
+                            .map(|b| b.content.track_pid),
+                    )
+                    .filter_map(|id| catalog.artwork().track_cache_ids().get(&id).copied())
+                    .collect(),
+            }
+        },
+        native_composer: None,
+        decision,
+    })
+}
+
 /// The bindings of MP3s this tool inserted that hold `source`'s frames, each
 /// with its file unchanged on the phone.
 fn owned_mpeg_audio<'a>(
@@ -356,6 +1334,78 @@ fn converted_flac_audio<'a>(
                 )
         })
         .collect()
+}
+
+/// An owned MP3 (or `label` track) whose source changed outside its frames:
+/// Keep when the catalogue already shows its tags (or under add-only),
+/// otherwise Update of the fields that differ. Its cover went with its audio
+/// and is not sent on its own, so a source cover other than the one sent is a
+/// conflict.
+#[allow(clippy::too_many_arguments)]
+fn retagged_mpeg_decision(
+    binding: &Binding,
+    desired: &Result<ProjectedFields>,
+    found: &ExistingMatch,
+    cover: Option<(String, usize)>,
+    label: &str,
+    catalog: &Catalog,
+    index: &DeviceAudioIndex,
+    journal: &JournalView,
+    preserve_existing_tracks: bool,
+) -> Decision {
+    if preserve_existing_tracks {
+        return Decision::Keep;
+    }
+    let fields = match desired {
+        Ok(fields) => fields,
+        Err(error) => {
+            return conflict(
+                "metadata_update_unsupported",
+                format!("the {label}'s tags are outside the insert-batch profile: {error:#}"),
+            );
+        }
+    };
+    let track = binding.content.track_pid;
+    if !matches!(
+        artwork_decision(
+            cover.as_ref().map(|(sha, bytes)| (sha.as_str(), *bytes)),
+            &[track],
+            catalog,
+            index,
+            journal
+        ),
+        ArtworkDecision::VerifiedJournalMatch { .. }
+            | ArtworkDecision::NoSourceCoverPreserveExisting
+    ) {
+        return conflict(
+            "mp3_cover_update_unsupported",
+            format!(
+                "The source's front cover differs from the one sent with this {label}; its cover is sent only with its audio, so it is not updated"
+            ),
+        );
+    }
+    let Some(current) = catalog.tracks().iter().find(|t| t.sync_id == track) else {
+        return conflict(
+            "metadata_update_unsupported",
+            "MPEG binding target absent".into(),
+        );
+    };
+    let changes = &found.catalog_differences;
+    match update::from_differences(fields, current, changes) {
+        Ok(Some(_)) => Decision::Update {
+            track_id: pid(track),
+            changes: changes
+                .iter()
+                .map(|d| FieldDifference {
+                    field: d.field,
+                    current: d.current.clone(),
+                    desired: d.desired.clone(),
+                })
+                .collect(),
+        },
+        Ok(None) => Decision::Keep,
+        Err(error) => update_refused(&error),
+    }
 }
 
 /// Why an owned track's changed tags are not sent as an edit. A field only a
@@ -661,6 +1711,50 @@ impl JournalView {
         }
         Ok(result)
     }
+    fn binding(&self, id: u64, index: &DeviceAudioIndex) -> Option<&Binding> {
+        self.active_bindings.iter().find(|b| {
+            b.content.track_pid == id
+                && index.matches_transferred_source(id, &b.content.path, &b.content.source)
+        })
+    }
+}
+
+fn existing_match(
+    source: &SourceTrack,
+    track: &Track,
+    index: &DeviceAudioIndex,
+    journal: &JournalView,
+    exact: bool,
+    projected: Option<&ProjectedFields>,
+    catalog: &Catalog,
+) -> ExistingMatch {
+    let (codec, full_sha) = if let Some(audio) = index.tracks().get(&track.sync_id) {
+        ("alac", audio.fingerprint.full_file_sha256)
+    } else {
+        let audio = &index.other_audio()[&track.sync_id];
+        (audio.codec.format().codec_label(), audio.full_file_sha256)
+    };
+    let ownership = if journal.binding(track.sync_id, index).is_some() {
+        "inserted_by_us"
+    } else {
+        "unowned"
+    };
+    let (catalog_differences, canonicalized_fields) = projected
+        .map(|p| compared_fields(p, catalog, track))
+        .unwrap_or_default();
+    ExistingMatch {
+        track_id: pid(track.sync_id),
+        wire_id: wire(track.sync_id),
+        path: track.afc_path.clone().unwrap_or_default(),
+        codec,
+        encoded_audio_equal: exact,
+        full_container_equal: full_sha == source.fingerprint.full_file_sha256,
+        match_basis: None,
+        ownership,
+        catalog_differences,
+        canonicalized_fields,
+        device_file_sha256: None,
+    }
 }
 
 /// The catalogue fields of `track` that differ from the source projection,
@@ -767,6 +1861,29 @@ fn differences(s: &ProjectedFields, track: &Track) -> Vec<FieldDifference> {
     output
 }
 
+/// A catalogue track an MP3 with no matching audio might be an earlier
+/// version of, by the same rule as `plausible`.
+fn plausible_mpeg(source: &PreparedSource, catalog: &Catalog) -> Option<String> {
+    let assessment = source.assessment();
+    let (metadata, timing) = (
+        assessment.metadata.as_ref()?,
+        assessment.coded_timing_proposal.as_ref()?,
+    );
+    catalog
+        .tracks()
+        .iter()
+        .find(|track| {
+            let m = &track.metadata;
+            same_name(&metadata.title, &m.title)
+                && (same_name(&metadata.artist, &m.artist) || same_name(&metadata.album, &m.album))
+                && timing
+                    .total_time_ms_floor
+                    .abs_diff(u64::from(m.total_time_ms))
+                    <= 1000
+        })
+        .map(|track| pid(track.sync_id))
+}
+
 fn plausible(source: &ProjectedFields, track: &Track) -> bool {
     let m = &track.metadata;
     same_name(&source.title, &m.title)
@@ -823,6 +1940,47 @@ fn sent_cover(
         crate::engine::planning::source_collection::mp3::artwork::batch_cover(path, source)?
             .map(|cover| (hex(&cover.sha256), cover.bytes.len())),
     )
+}
+
+fn artwork_decision(
+    cover: Option<(&str, usize)>,
+    matches: &[u64],
+    catalog: &Catalog,
+    index: &DeviceAudioIndex,
+    journal: &JournalView,
+) -> ArtworkDecision {
+    let Some((sha, bytes)) = cover else {
+        return ArtworkDecision::NoSourceCoverPreserveExisting;
+    };
+    if matches.len() == 1
+        && let Some(binding) = journal.binding(matches[0], index)
+        && let Some(art) = &binding.content.artwork
+        && hex(&art.sha256) == sha
+        && art.bytes == bytes as u64
+        && catalog.artwork().track_cache_ids().get(&matches[0]) == Some(&art.cache_id)
+    {
+        return ArtworkDecision::VerifiedJournalMatch {
+            sha256: sha.into(),
+            bytes,
+            cache_id: art.cache_id,
+        };
+    }
+    let observed: BTreeSet<_> = matches
+        .iter()
+        .filter_map(|id| catalog.artwork().track_cache_ids().get(id).copied())
+        .collect();
+    if !observed.is_empty() {
+        ArtworkDecision::ExistingNeedsVerification {
+            sha256: sha.into(),
+            bytes,
+            observed_cache_ids: observed.into_iter().collect(),
+        }
+    } else {
+        ArtworkDecision::SeparateUpdateNeeded {
+            sha256: sha.into(),
+            bytes,
+        }
+    }
 }
 
 fn plan_add(
