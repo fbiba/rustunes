@@ -47,6 +47,8 @@ const SMALL: u64 = 1024 * 1024;
 const FRAME_CAP: u64 = 16 * 1024 * 1024;
 const MAX_PLAN: u64 = 32 * 1024 * 1024;
 
+pub(crate) mod playback;
+
 pub struct Options<'a> {
     pub run_dir: &'a Path,
     pub trace: &'a Path,
