@@ -19,6 +19,10 @@ use std::{
     time::Instant,
 };
 
+mod ordinary_stats;
+
+mod ordinary_maintenance;
+
 pub(super) struct VerifiedPlaybackBridge {
     receipt: Value,
     sha256: [u8; 32],
@@ -27,6 +31,69 @@ impl VerifiedPlaybackBridge {
     pub(super) fn evidence(&self) -> Value {
         json!({"receipt_sha256":reader::hex(&self.sha256),"receipt":self.receipt})
     }
+}
+
+pub(super) fn verify(
+    immediate: &Current,
+    immediate_dir: &Path,
+    fresh: &Current,
+    fresh_dir: &Path,
+    output: &Path,
+    deadline: Instant,
+) -> Result<VerifiedPlaybackBridge> {
+    same_scope(immediate, fresh)?;
+    reader::directory(output)?;
+    let mut budget = Budget::new_until(deadline);
+    let old = materialize(
+        immediate,
+        immediate_dir,
+        &output.join("immediate"),
+        &mut budget,
+    )?;
+    let new = materialize(fresh, fresh_dir, &output.join("fresh"), &mut budget)?;
+    let delta = reader::delta(&old, &new, &budget)?;
+    let delta_sha = reader::durable(
+        &output.join("full-sql-delta.json"),
+        &serde_json::to_vec_pretty(&delta)?,
+    )?;
+    let changes = match verify_views(&old, &new, &budget) {
+        Ok(changes) => changes,
+        Err(error) => {
+            reader::durable(
+                &output.join("refused.json"),
+                &serde_json::to_vec_pretty(&json!({
+                    "schema":"rustunes.playback-bridge-refusal",
+                    "reason":format!("{error:#}"),"full_delta_sha256":reader::hex(&delta_sha),
+                    "phone_writes":0,"journal_completion_authorized":false,
+                }))?,
+            )?;
+            return Err(error);
+        }
+    };
+    reader::recheck(&old, &budget)?;
+    reader::recheck(&new, &budget)?;
+    let receipt = json!({
+        "schema":"rustunes.artwork-recovery-playback-bridge",
+        "device_sha256":reader::hex(&fresh.identity.device_digest()),
+        "library_sha256":reader::hex(&fresh.identity.library_digest()),
+        "immediate_state_receipt_sha256":reader::hex(&immediate.receipt_sha256),
+        "fresh_state_receipt_sha256":reader::hex(&fresh.receipt_sha256),
+        "immediate_sql":old.hashes,"fresh_sql":new.hashes,
+        "media_anchor":fresh.catalog.persisted_media_anchor(),
+        "database_pid":fresh.catalog.database_pid(),"primary_container_pid":fresh.catalog.primary_container_pid(),
+        "schema_sha256":old.schema_hash()?,"table_count":45,"changes":changes,
+        "full_delta_sha256":reader::hex(&delta_sha),"nonplayback_sql_exact":true,
+        "prefs_cdb_raw_artwork_exact":true,"new_media_revision":false,
+        "fresh_playback_equal_to_pre_import_claimed":false,
+        "history_and_completed_play_counters_validated_independently":true,
+        "live_revision_bookkeeping_validated_separately":true,
+        "phone_writes":0,"replay_authorized":false,"journal_completion_authorized":false,
+    });
+    let sha256 = reader::durable(
+        &output.join("receipt.json"),
+        &serde_json::to_vec_pretty(&receipt)?,
+    )?;
+    Ok(VerifiedPlaybackBridge { receipt, sha256 })
 }
 
 fn same_scope(a: &Current, b: &Current) -> Result<()> {
@@ -91,6 +158,80 @@ pub(super) fn ordinary_raw_artwork_comparison(
     }
 }
 
+pub(super) fn verify_ordinary(
+    immediate: &Current,
+    immediate_dir: &Path,
+    fresh: &Current,
+    fresh_dir: &Path,
+    output: &Path,
+    control: &Control,
+) -> Result<VerifiedPlaybackBridge> {
+    control.check()?;
+    same_ordinary_scope(immediate, fresh)?;
+    reader::directory(output)?;
+    let mut budget =
+        Budget::new_cancellable_until(control.deadline.into_std(), Arc::clone(&control.cancelled));
+    let old = materialize_profile(
+        immediate,
+        immediate_dir,
+        &output.join("immediate"),
+        &mut budget,
+        true,
+    )?;
+    let new = materialize_profile(fresh, fresh_dir, &output.join("fresh"), &mut budget, true)?;
+    let delta = serde_json::to_vec_pretty(&reader::delta(&old, &new, &budget)?)?;
+    ensure!(
+        delta.len() <= 256 << 20,
+        "ordinary playback delta exceeds bound"
+    );
+    let delta_sha = reader::durable(&output.join("full-sql-delta.json"), &delta)?;
+    let changes = verify_views(&old, &new, &budget);
+    reader::recheck(&old, &budget)?;
+    reader::recheck(&new, &budget)?;
+    let changes = match changes {
+        Ok(changes) => changes,
+        Err(error) => {
+            reader::durable(
+                &output.join("refused.json"),
+                &serde_json::to_vec_pretty(&json!({
+                    "schema":"rustunes.ordinary-playback-refusal",
+                    "reason":format!("{error:#}"),"full_delta_sha256":reader::hex(&delta_sha),
+                    "phone_writes":0,"journal_completion_authorized":false,
+                }))?,
+            )?;
+            return Err(error);
+        }
+    };
+    control.check()?;
+    let nonplayback_exact = changes["maintenance_task_operation_date"].is_null();
+    let receipt = json!({
+        "schema":"rustunes.ordinary-recovery-playback-bridge",
+        "device_sha256":reader::hex(&fresh.identity.device_digest()),
+        "library_sha256":reader::hex(&fresh.identity.library_digest()),
+        "immediate_state_receipt_sha256":reader::hex(&immediate.receipt_sha256),
+        "fresh_state_receipt_sha256":reader::hex(&fresh.receipt_sha256),
+        "immediate_sql":old.hashes,"fresh_sql":new.hashes,
+        "media_anchor":fresh.catalog.persisted_media_anchor(),
+        "database_pid":fresh.catalog.database_pid(),"primary_container_pid":fresh.catalog.primary_container_pid(),
+        "schema_sha256":old.schema_hash()?,"table_count":45,"changes":changes,
+        "full_delta_sha256":reader::hex(&delta_sha),"nonplayback_sql_exact":nonplayback_exact,
+        "nonplayback_sql_exact_except":if nonplayback_exact { Vec::<&str>::new() } else {
+            vec!["_MLDatabaseProperties.MLMaintenanceTaskOperationDate"]
+        },
+        "prefs_and_cdb_exact":true,
+        "raw_artwork_comparison":ordinary_raw_artwork_comparison(immediate, fresh)?,
+        "all_managed_physical_preservation_still_required":true,
+        "new_media_revision":false,"history_and_completed_counters_validated_independently":true,
+        "phone_writes":0,"replay_authorized":false,"journal_completion_authorized":false,
+    });
+    let sha256 = reader::durable(
+        &output.join("receipt.json"),
+        &serde_json::to_vec_pretty(&receipt)?,
+    )?;
+    control.check()?;
+    Ok(VerifiedPlaybackBridge { receipt, sha256 })
+}
+
 fn materialize(
     current: &Current,
     directory: &Path,
@@ -131,6 +272,80 @@ fn materialize_profile(
         "playback bridge SQL differs from bound Current"
     );
     Ok(result)
+}
+
+/// SQL evidence only. The caller must separately prove the original write,
+/// Current scope, physical files and original transcript before any completion.
+/// Completed plays and skips, Playback History, revision housekeeping and the
+/// maintenance clock are the only accepted differences; no authority follows.
+pub(super) fn verify_views(a: &Snapshot, b: &Snapshot, budget: &Budget) -> Result<Value> {
+    budget.check()?;
+    ensure!(
+        a.layout_qualified()? && b.version == a.version && a.schema == b.schema,
+        "playback bridge has unsupported or changed full SQL schema"
+    );
+    verify_tables(&a.tables, &b.tables, budget)
+}
+
+fn verify_tables(
+    a: &BTreeMap<String, Table>,
+    b: &BTreeMap<String, Table>,
+    budget: &Budget,
+) -> Result<Value> {
+    ensure!(a.keys().eq(b.keys()), "playback bridge tables differ");
+    let mut maintenance = None;
+    for (name, old) in a {
+        budget.check()?;
+        let new = &b[name];
+        ensure!(
+            old.columns == new.columns && old.definitions == new.definitions,
+            "playback bridge table definition differs: {name}"
+        );
+        if name == "_MLDatabaseProperties" {
+            maintenance = ordinary_maintenance::check(old, new, budget)?;
+        } else if ![
+            "item_stats",
+            "container",
+            "container_item",
+            "entity_revision",
+        ]
+        .contains(&name.as_str())
+        {
+            ensure!(old.rows == new.rows, "nonplayback SQL changed in {name}");
+        }
+    }
+    let table = |tables: &BTreeMap<String, Table>, name: &str| {
+        tables
+            .get(name)
+            .cloned()
+            .with_context(|| format!("missing playback table {name}"))
+    };
+    let items = keyed(&table(a, "item")?, "item_pid")?;
+    let old_stats = table(a, "item_stats")?;
+    let new_stats = table(b, "item_stats")?;
+    let stats = ordinary_stats::check(&old_stats, &new_stats, &items, budget)?;
+    let history = check_history(
+        &table(a, "container")?,
+        &table(b, "container")?,
+        &table(a, "container_item")?,
+        &table(b, "container_item")?,
+        &items,
+        budget,
+    )?;
+    let revisions = check_revisions(
+        None,
+        &table(a, "entity_revision")?,
+        &table(b, "entity_revision")?,
+        &stats,
+        &items,
+        history.changed_container,
+        budget,
+    )?;
+    let events = stats.values().collect::<Vec<_>>();
+    Ok(
+        json!({"completed_events":events,"playback_history":history.report,
+        "entity_revisions":revisions,"maintenance_task_operation_date":maintenance}),
+    )
 }
 
 fn keyed(t: &Table, key: &str) -> Result<BTreeMap<i64, Row>> {
@@ -501,3 +716,6 @@ fn check_revisions(
     );
     Ok(changes)
 }
+
+#[cfg(test)]
+mod tests;
