@@ -912,6 +912,47 @@ impl Model<'_> {
         Ok(())
     }
 
+    /// The session's revisions: every touched group once, by class, then
+    /// each update's item in operation order.
+    fn allocate_session(&mut self, after_genre_first: &dyn Fn(i64, i64) -> bool) -> Result<()> {
+        let mut groups = std::mem::take(&mut self.touched);
+        let genre_first = match (
+            groups.iter().find(|t| t.0 == Class::Genre),
+            groups.iter().find(|t| t.0 == Class::Composer),
+        ) {
+            (Some(genre), Some(composer)) => after_genre_first(genre.1, composer.1),
+            _ => false,
+        };
+        let after = self.after;
+        // A stable sort: groups the after state has not revised keep their
+        // touch order, and their missing rows then refuse.
+        groups.sort_by_key(|&(class, group, _)| {
+            (
+                rank(class, genre_first),
+                after_revision(after, class.revision_class(), group).unwrap_or(i64::MAX),
+            )
+        });
+        for (class, group, update) in groups {
+            let new_entity = self.created.contains(&(class, group));
+            let revision = self.allocate(class.revision_class(), group, new_entity)?;
+            self.receipts[update].revisions.push(NewRevision {
+                entity: class.table(),
+                entity_pid: group,
+                revision,
+            });
+        }
+        for update in 0..self.receipts.len() {
+            let pid = self.receipts[update].item_pid;
+            let revision = self.allocate(ITEM_REVISION_CLASS, pid, false)?;
+            self.receipts[update].revisions.push(NewRevision {
+                entity: "item",
+                entity_pid: pid,
+                revision,
+            });
+        }
+        Ok(())
+    }
+
     fn moved(
         &mut self,
         class: Class,
@@ -938,3 +979,417 @@ impl Model<'_> {
         Ok(())
     }
 }
+
+/// The after state's own revision of an entity, when it has one.
+fn after_revision(after: &Tables, class: i64, entity: i64) -> Option<i64> {
+    let t = after.get("entity_revision")?;
+    let rows: Vec<_> = t
+        .rows
+        .keys()
+        .filter(|r| {
+            typed::int(t, r, "entity_pid").ok() == Some(entity)
+                && typed::int(t, r, "class").ok() == Some(class)
+                && typed::int(t, r, "revision_type").ok() == Some(0)
+        })
+        .collect();
+    match rows.as_slice() {
+        [row] => typed::int(t, row, "revision").ok(),
+        _ => None,
+    }
+}
+
+fn describe(name: &str, expected: &Table, actual: &Table) -> String {
+    let show = |t: &Table, row: &Row| {
+        t.columns
+            .iter()
+            .zip(row)
+            .map(|(c, v)| format!("{c}={v:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines = vec![format!("{name}:")];
+    for (row, n) in &expected.rows {
+        if actual.rows.get(row) != Some(n) {
+            lines.push(format!("  expected only: {}", show(expected, row)));
+        }
+        if lines.len() > 8 {
+            break;
+        }
+    }
+    for (row, n) in &actual.rows {
+        if expected.rows.get(row) != Some(n) {
+            lines.push(format!("  observed only: {}", show(actual, row)));
+        }
+        if lines.len() > 16 {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
+/// Verify one metadata edit session. `operation` is the encoded session bytes
+/// that were staged; `base_anchor` is the anchor the caller prepared against.
+pub(crate) fn verify(
+    before: &Tables,
+    after: &Tables,
+    operation: &[u8],
+    base_anchor: u32,
+) -> Result<MetadataEditReceipt> {
+    verify_in(before, after, operation, base_anchor, Window::SameRun)
+}
+
+/// `verify` for a later run's capture, after the phone may have been used:
+/// the session is modelled exactly, and what the phone did since is
+/// absorbed as `Window::LaterRun` allows.
+pub(crate) fn verify_later(
+    before: &Tables,
+    after: &Tables,
+    operation: &[u8],
+    base_anchor: u32,
+) -> Result<MetadataEditReceipt> {
+    verify_in(before, after, operation, base_anchor, Window::LaterRun)
+}
+
+fn verify_in(
+    before: &Tables,
+    after: &Tables,
+    operation: &[u8],
+    base_anchor: u32,
+    window: Window,
+) -> Result<MetadataEditReceipt> {
+    let (envelope, updates) = decode(operation)?;
+    ensure!(
+        before.keys().eq(after.keys())
+            && before.iter().all(|(n, t)| {
+                t.columns == after[n].columns && t.definitions == after[n].definitions
+            }),
+        "metadata edit table set or column definitions differ"
+    );
+    ensure!(
+        envelope.revision == base_anchor.checked_add(1).context("anchor exhausted")?,
+        "metadata edit revision is not the prepared anchor plus one"
+    );
+    ensure!(
+        decimal(property(before, ANCHOR)?, false)? == i64::from(base_anchor),
+        "metadata edit before state is not at the prepared anchor"
+    );
+    let info = table(before, "db_info")?;
+    ensure!(info.rows.len() == 1, "db_info is not a single row");
+    let info_row = info.rows.keys().next().context("db_info row")?;
+    ensure!(
+        typed::int(info, info_row, "db_pid")? == envelope.database_pid as i64
+            && typed::int(info, info_row, "primary_container_pid")?
+                == envelope.primary_container_pid as i64,
+        "metadata edit database or library container identity differs"
+    );
+    let edits = conform(before, &updates)?;
+    model_session(
+        before,
+        after,
+        base_anchor,
+        envelope.revision,
+        &edits,
+        window,
+    )
+}
+
+/// The model proper: apply `edits` to the before tables and require the
+/// result to equal the after tables. The caller has already established that
+/// the edits are within the recipe.
+fn model_session(
+    before: &Tables,
+    after: &Tables,
+    base_anchor: u32,
+    revision: u32,
+    edits: &[Edit],
+    window: Window,
+) -> Result<MetadataEditReceipt> {
+    let last_synced = decimal(property(before, LAST_SYNCED)?, false)?;
+    let revisions = table(before, "entity_revision")?;
+    let mut base_revision = last_synced;
+    for row in revisions.rows.keys() {
+        base_revision = base_revision.max(typed::int(revisions, row, "revision")?);
+    }
+
+    let mut model = Model {
+        expected: before.clone(),
+        after,
+        counter: base_revision,
+        created: BTreeSet::new(),
+        revised: BTreeSet::new(),
+        receipts: Vec::new(),
+        touched: Vec::new(),
+    };
+
+    // Strings new to the library add exactly one sort_map row each.
+    let mut sent: BTreeSet<&str> = BTreeSet::new();
+    for e in edits {
+        for (a, b) in [&e.title, &e.composer, &e.artist]
+            .into_iter()
+            .flatten()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+        {
+            sent.insert(a);
+            sent.insert(b);
+        }
+        if let Some(a) = &e.album {
+            sent.insert(&a.text);
+            sent.insert(&a.sort);
+        }
+        if let Some(a) = &e.album_artist {
+            sent.insert(&a.text);
+            sent.insert(&a.sort);
+        }
+        if let Some(g) = &e.genre {
+            sent.insert(g);
+        }
+    }
+    let known = table(before, "sort_map")?;
+    let after_map = table(after, "sort_map")?;
+    let mut additions = Vec::new();
+    for name in &sent {
+        if typed::unique(known, "name", text(name)).is_ok() {
+            continue;
+        }
+        let row = typed::unique(after_map, "name", text(name))
+            .with_context(|| format!("sort_map did not gain a row for {name:?}"))?;
+        ensure!(
+            matches!(after_map.at(row, "name_order")?, Cell::Integer(_))
+                && matches!(after_map.at(row, "name_section")?, Cell::Integer(_))
+                && matches!(after_map.at(row, "sort_key")?, Cell::Blob(key) if !key.is_empty()),
+            "sort_map row for {name:?} has unexpected storage"
+        );
+        let t = model
+            .expected
+            .get_mut("sort_map")
+            .context("sort_map absent")?;
+        ensure!(
+            t.rows.insert(row.clone(), 1).is_none(),
+            "sort_map row exists"
+        );
+        additions.push((*name).to_owned());
+    }
+
+    let genre_first = |genre: i64, composer: i64| {
+        matches!(
+            (
+                after_revision(after, Class::Genre.revision_class(), genre),
+                after_revision(after, Class::Composer.revision_class(), composer),
+            ),
+            (Some(g), Some(c)) if g < c
+        )
+    };
+    for edit in edits {
+        model
+            .apply(edit)
+            .with_context(|| format!("track {:#018x}", edit.sync_id))?;
+    }
+    model.allocate_session(&genre_first)?;
+
+    // A group created in this session ends with its lowest member.
+    let created: Vec<_> = model.created.iter().copied().collect();
+    for (class, group) in created {
+        let members = model.members(class, group, None)?;
+        let Some(lowest) = members.first().copied() else {
+            continue;
+        };
+        let mut row = model.group(class, group)?;
+        let was = row.int("representative_item_pid")?;
+        if was != lowest {
+            row.set("representative_item_pid", int(lowest))?;
+            row.store(&mut model.expected)?;
+            if let Some(receipt) = model.receipts.iter_mut().rev().find(|r| {
+                r.groups
+                    .iter()
+                    .any(|g| g.class == class.table() && g.group_pid == group)
+            }) {
+                receipt.representatives.push(RepresentativeMove {
+                    class: class.table(),
+                    group_pid: group,
+                    before: was,
+                    after: lowest,
+                });
+            }
+        }
+    }
+
+    // Sync properties.
+    let highest = model.counter;
+    ensure!(
+        highest > base_revision,
+        "metadata edit allocated no revision"
+    );
+    let anchor = i64::from(base_anchor) + 1;
+    ensure!(
+        decimal(property(after, ANCHOR)?, false)? == anchor
+            && decimal(property(after, LAST_SYNCED)?, false)? == highest
+            && decimal(property(after, HERO)?, false)? == highest,
+        "metadata edit anchor, last-synced or hero revision differs from the model"
+    );
+    let generation = decimal(property(after, GENERATION)?, true)?;
+    ensure!(
+        generation != decimal(property(before, GENERATION)?, true)?,
+        "metadata edit generation id did not change"
+    );
+    let mut property_changes = BTreeMap::new();
+    let properties = table(before, "_MLDatabaseProperties")?;
+    for key in [ANCHOR, LAST_SYNCED, GENERATION, HERO] {
+        let old = property_row(before, key)?;
+        let value = property(after, key)?;
+        let previous = properties.at(old, "value")?.text()?;
+        if value != previous {
+            property_changes.insert(key, (previous.to_owned(), value.to_owned()));
+            let mut desired = old.clone();
+            typed::set(properties, &mut desired, "value", text(value))?;
+            typed::replace(&mut model.expected, "_MLDatabaseProperties", old, desired)?;
+        }
+    }
+    // The phone's own maintenance clock may advance meanwhile; it carries no
+    // library content. Adding or removing it still refuses below.
+    if let (Ok(old), Ok(value)) = (
+        property_row(before, MAINTENANCE),
+        property(after, MAINTENANCE),
+    ) {
+        let previous = properties.at(old, "value")?.text()?;
+        if value != previous {
+            ensure!(
+                maintenance_date(value)? > maintenance_date(previous)?,
+                "metadata edit maintenance date did not advance"
+            );
+            property_changes.insert(MAINTENANCE, (previous.to_owned(), value.to_owned()));
+            let mut desired = old.clone();
+            typed::set(properties, &mut desired, "value", text(value))?;
+            typed::replace(&mut model.expected, "_MLDatabaseProperties", old, desired)?;
+        }
+    }
+
+    let keep_local_evaluations = evaluate_albums(before, after, &mut model.expected, highest)?;
+
+    // Recent play/skip counters: every nonzero value may reset to zero.
+    let stats = table(before, "item_stats")?;
+    recent_counters::qualify(stats)?;
+    let observed = table(after, "item_stats")?;
+    let resets = recent_counters::absorb(
+        model
+            .expected
+            .get_mut("item_stats")
+            .context("item_stats absent")?,
+        observed,
+        &Budget::new(),
+    )?;
+    let filled_phone_entries = fill_phone_entries(before, after, &mut model.expected)?;
+    // The session's own block is above every earlier revision, so the
+    // phone's renumbering since lies above the model's highest revision.
+    let between_runs_playback = window.absorb(&mut model.expected, after, &Budget::new())?;
+
+    let mismatches: Vec<_> = model
+        .expected
+        .iter()
+        .filter(|(n, t)| t.rows != after[*n].rows)
+        .map(|(n, t)| describe(n, t, &after[n]))
+        .collect();
+    ensure!(
+        mismatches.is_empty(),
+        "unmodelled metadata edit rows:\n{}",
+        mismatches.join("\n")
+    );
+    Ok(MetadataEditReceipt {
+        schema: SCHEMA,
+        base_anchor,
+        revision,
+        base_revision,
+        highest_revision: highest,
+        updates: model.receipts,
+        sort_map_additions: additions,
+        property_changes,
+        recent_counter_resets: resets,
+        keep_local_evaluations,
+        filled_phone_entries,
+        between_runs_playback,
+    })
+}
+
+/// Albums at keep_local_status 0 that the model left untouched and that the
+/// after state shows at 2 with every other cell equal: `expected` takes the
+/// status, the album's live revision moves to its after number, which must lie
+/// above `highest` (the session's own block) and be shared with no other
+/// evaluation, and a stats revision row the after state lacks goes.
+fn evaluate_albums(
+    before: &Tables,
+    after: &Tables,
+    expected: &mut Tables,
+    highest: i64,
+) -> Result<Vec<KeepLocalEvaluation>> {
+    let albums = table(before, "album")?;
+    let after_albums = table(after, "album")?;
+    let key = albums.column("album_pid")?;
+    let revisions = table(before, "entity_revision")?;
+    let after_revisions = table(after, "entity_revision")?;
+    let (number, pid, class, kind) = (
+        revisions.column("revision")?,
+        revisions.column("entity_pid")?,
+        revisions.column("class")?,
+        revisions.column("revision_type")?,
+    );
+    let album_class = Class::Album.revision_class();
+    let own = |t: &Table, album: i64, type_: i64| -> Vec<Row> {
+        t.rows
+            .keys()
+            .filter(|r| {
+                r[pid] == int(album) && r[class] == int(album_class) && r[kind] == int(type_)
+            })
+            .cloned()
+            .collect()
+    };
+    let mut numbers = BTreeSet::new();
+    let mut evaluated = Vec::new();
+    for row in albums.rows.keys() {
+        if typed::int(albums, row, "keep_local_status")? != 0
+            || table(expected, "album")?.rows.get(row) != Some(&1)
+        {
+            continue;
+        }
+        let mut desired = row.clone();
+        typed::set(albums, &mut desired, "keep_local_status", int(2))?;
+        if after_albums.rows.get(&desired) != Some(&1) {
+            continue;
+        }
+        let album = row[key].integer()?;
+        let (live, moved) = match (
+            own(revisions, album, 0).as_slice(),
+            own(after_revisions, album, 0).as_slice(),
+        ) {
+            ([live], [moved]) => (live.clone(), moved.clone()),
+            _ => bail!("evaluated album {album} has no single live revision"),
+        };
+        let now = moved[number].integer()?;
+        ensure!(
+            table(expected, "entity_revision")?.rows.get(&live) == Some(&1)
+                && now > highest
+                && numbers.insert(now),
+            "evaluated album {album} revision {now} is not above the session's block"
+        );
+        typed::replace(expected, "album", row, desired)?;
+        typed::replace(expected, "entity_revision", &live, moved)?;
+        let mut removed_stats_revision = None;
+        for stats in own(revisions, album, 1) {
+            if !after_revisions.rows.contains_key(&stats) {
+                expected
+                    .get_mut("entity_revision")
+                    .context("revisions absent")?
+                    .rows
+                    .remove(&stats);
+                removed_stats_revision = Some(stats[number].integer()?);
+            }
+        }
+        evaluated.push(KeepLocalEvaluation {
+            album_pid: album,
+            revision: (live[number].integer()?, now),
+            removed_stats_revision,
+        });
+    }
+    Ok(evaluated)
+}
+
+#[cfg(test)]
+pub(crate) mod tests;
