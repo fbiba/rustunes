@@ -485,4 +485,456 @@ impl Model<'_> {
             ),
         })
     }
+
+    /// Find the phone-created row in the after state, require it to equal the
+    /// model, and add it to the expected tables.
+    fn create(&mut self, class: Class, g: &NewGroup<'_>) -> Result<i64> {
+        let after = table(self.after, class.table())?;
+        let existing = self.t(class.table())?;
+        let key_column = existing.column(class.key())?;
+        let known: BTreeSet<i64> = existing
+            .rows
+            .keys()
+            .map(|r| r[key_column].integer())
+            .collect::<Result<_>>()?;
+        ensure!(
+            existing.columns == after.columns,
+            "{} columns differ",
+            class.table()
+        );
+        let name_column = after.column(class.name())?;
+        let sync_column = after.column("sync_id")?;
+        let key_cell = after.column("grouping_key")?;
+        let mut candidates = Vec::new();
+        for (row, n) in &after.rows {
+            let id = row[key_column].integer()?;
+            if known.contains(&id) {
+                continue;
+            }
+            ensure!(*n == 1, "duplicate new {} row", class.table());
+            let by_sync = matches!(class, Class::Album | Class::AlbumArtist);
+            if row[name_column] == text(g.name)
+                && (!by_sync || row[sync_column] == int(g.sync))
+                && row[key_cell] == Cell::Blob(g.key.clone())
+            {
+                candidates.push(row);
+            }
+        }
+        ensure!(
+            candidates.len() == 1,
+            "expected exactly one new {} row for {:?}, found {}",
+            class.table(),
+            g.name,
+            candidates.len()
+        );
+        let observed = candidates[0].clone();
+        let id = observed[key_column].clone();
+        ensure!(
+            matches!(id, Cell::Integer(n) if n != 0),
+            "new {} id is not a nonzero integer",
+            class.table()
+        );
+        let mut built = Vec::with_capacity(after.columns.len());
+        for column in &after.columns {
+            built.push(self.new_cell(class, column, &id, g)?);
+        }
+        for (i, column) in after.columns.iter().enumerate() {
+            // The final representative of a row several updates join is the
+            // lowest member; the whole-table comparison checks it at the end.
+            if column == "representative_item_pid" {
+                continue;
+            }
+            ensure!(
+                built[i] == observed[i],
+                "new {} row {:?} differs from the model in {column}: expected {:?}, found {:?}",
+                class.table(),
+                g.name,
+                built[i],
+                observed[i]
+            );
+        }
+        let pid = id.integer()?;
+        let t = self
+            .expected
+            .get_mut(class.table())
+            .context("group table")?;
+        ensure!(t.rows.insert(built, 1).is_none(), "new group row exists");
+        self.created.insert((class, pid));
+        Ok(pid)
+    }
+
+    /// Artist, composer and genre rows are matched by grouping key.
+    fn resolve_by_key(
+        &mut self,
+        class: Class,
+        name: &str,
+        sort: Option<&str>,
+        item: i64,
+        year: i64,
+    ) -> Result<Resolved> {
+        let key = self.key_of(name)?;
+        let t = self.t(class.table())?;
+        let key_column = t.column("grouping_key")?;
+        let hits: Vec<Row> = t
+            .rows
+            .keys()
+            .filter(|r| r[key_column] == Cell::Blob(key.clone()))
+            .cloned()
+            .collect();
+        match hits.as_slice() {
+            [] => {
+                let pid = self.create(
+                    class,
+                    &NewGroup {
+                        name,
+                        sort,
+                        representative: item,
+                        key,
+                        sync: 0,
+                        parent: 0,
+                        year,
+                        order: (0, 0),
+                    },
+                )?;
+                Ok(Resolved { pid, created: true })
+            }
+            [row] => {
+                self.joinable(class, t, row, name, sort)?;
+                Ok(Resolved {
+                    pid: typed::int(t, row, class.key())?,
+                    created: false,
+                })
+            }
+            _ => bail!("{} {name:?} matches several groups by key", class.label()),
+        }
+    }
+
+    /// A join must not rewrite the joined row's name or sort name.
+    fn joinable(
+        &self,
+        class: Class,
+        t: &Table,
+        row: &Row,
+        name: &str,
+        sort: Option<&str>,
+    ) -> Result<()> {
+        let stored = t.at(row, class.name())?.text()?;
+        ensure!(
+            stored == name,
+            "{} {name:?} would join the group named {stored:?} and rewrite its name",
+            class.label()
+        );
+        if let (Some(column), Some(sort)) = (class.sort(), sort) {
+            let stored_sort = match t.at(row, column)? {
+                Cell::Text(s) if !s.is_empty() => s.as_str(),
+                Cell::Text(_) | Cell::Null => stored,
+                _ => bail!("{column} is not text"),
+            };
+            ensure!(
+                stored_sort == sort,
+                "{} {name:?} has sort name {stored_sort:?}, not {sort:?}",
+                class.label()
+            );
+        }
+        Ok(())
+    }
+
+    /// Albums and album artists are matched by the wire sync id.
+    fn resolve_by_sync(
+        &mut self,
+        class: Class,
+        sync: i64,
+        name: &str,
+        sort: &str,
+        item: i64,
+        parent: i64,
+        year: i64,
+    ) -> Result<Resolved> {
+        let t = self.t(class.table())?;
+        let sync_column = t.column("sync_id")?;
+        let hits: Vec<Row> = t
+            .rows
+            .keys()
+            .filter(|r| r[sync_column] == int(sync))
+            .cloned()
+            .collect();
+        match hits.as_slice() {
+            [] => {
+                let key = self.key_of(name)?;
+                let order = self.order(sort)?;
+                let pid = self.create(
+                    class,
+                    &NewGroup {
+                        name,
+                        sort: Some(sort),
+                        representative: item,
+                        key,
+                        sync,
+                        parent,
+                        year,
+                        order,
+                    },
+                )?;
+                Ok(Resolved { pid, created: true })
+            }
+            [row] => {
+                self.joinable(class, t, row, name, Some(sort))?;
+                if class == Class::Album {
+                    ensure!(
+                        typed::int(t, row, "album_artist_pid")? == parent,
+                        "album {name:?} belongs to another album artist"
+                    );
+                }
+                Ok(Resolved {
+                    pid: typed::int(t, row, class.key())?,
+                    created: false,
+                })
+            }
+            _ => bail!("{} sync id {sync} matches several rows", class.label()),
+        }
+    }
+
+    fn apply(&mut self, e: &Edit) -> Result<()> {
+        let pid = e.item_pid;
+        let mut item = self.load("item", "item_pid", pid)?;
+        let mut extra = self.load("item_extra", "item_pid", pid)?;
+        let mut search = self.load("item_search", "item_pid", pid)?;
+        let mut groups = Vec::new();
+        let mut moves = Vec::new();
+        let mut touched: Vec<(Class, i64)> = Vec::new();
+
+        if let Some((title, sort)) = &e.title {
+            extra.set("title", text(title))?;
+            extra.set("sort_title", text(sort))?;
+            let (order, section) = self.order(sort)?;
+            item.set("title_order", int(order))?;
+            item.set("title_order_section", int(section))?;
+            search.set("search_title", int(self.order(title)?.0))?;
+        }
+        if let Some(n) = e.track_number {
+            item.set("track_number", int(n.into()))?;
+            item.set("episode_sort_id", int(n.into()))?;
+        }
+        if let Some(n) = e.disc_number {
+            item.set("disc_number", int(n.into()))?;
+        }
+        if let Some(n) = e.track_count {
+            extra.set("track_count", int(n.into()))?;
+        }
+        if let Some(n) = e.disc_count {
+            extra.set("disc_count", int(n.into()))?;
+        }
+        if let Some(n) = e.year {
+            extra.set("year", int(n.into()))?;
+        }
+        if let Some(flag) = e.is_compilation {
+            item.set("is_compilation", int(flag.into()))?;
+        }
+        if let Some(n) = e.content_rating {
+            extra.set("content_rating", int(n.into()))?;
+        }
+        if let Some(copyright) = &e.copyright {
+            extra.set("copyright", text(copyright))?;
+        }
+        if let Some(comment) = &e.comment {
+            extra.set("comment", text(comment))?;
+        }
+        let year = extra.int("year")?;
+
+        // Album artist (full set), album, artist, composer, genre, in the
+        // order the receiver allocates their revisions.
+        let mut aa_pid = item.int("album_artist_pid")?;
+        let mut album_created = false;
+        if let Some(full) = &e.album_artist {
+            let found = self.resolve_by_sync(
+                Class::AlbumArtist,
+                full.pid as i64,
+                &full.text,
+                &full.sort,
+                pid,
+                0,
+                year,
+            )?;
+            let old = item.int("album_artist_pid")?;
+            if found.created {
+                touched.push((Class::AlbumArtist, found.pid));
+            }
+            self.moved(
+                Class::AlbumArtist,
+                pid,
+                old,
+                &found,
+                &mut groups,
+                &mut moves,
+            )?;
+            item.set("album_artist_pid", int(found.pid))?;
+            let (order, section) = self.order(&full.sort)?;
+            item.set("album_artist_order", int(order))?;
+            item.set("album_artist_order_section", int(section))?;
+            search.set("search_album_artist", int(self.order(&full.text)?.0))?;
+            aa_pid = found.pid;
+        }
+        if let Some(album) = &e.album {
+            let found = self.resolve_by_sync(
+                Class::Album,
+                album.pid as i64,
+                &album.text,
+                &album.sort,
+                pid,
+                aa_pid,
+                year,
+            )?;
+            let old = item.int("album_pid")?;
+            if found.created {
+                touched.push((Class::Album, found.pid));
+                album_created = true;
+            }
+            self.moved(Class::Album, pid, old, &found, &mut groups, &mut moves)?;
+            item.set("album_pid", int(found.pid))?;
+            let (order, section) = self.order(&album.sort)?;
+            item.set("album_order", int(order))?;
+            item.set("album_order_section", int(section))?;
+            search.set("search_album", int(self.order(&album.text)?.0))?;
+        }
+        if let Some((artist, sort)) = &e.artist {
+            let found = self.resolve_by_key(Class::ItemArtist, artist, Some(sort), pid, year)?;
+            let old = item.int("item_artist_pid")?;
+            if found.created {
+                touched.push((Class::ItemArtist, found.pid));
+            }
+            self.moved(Class::ItemArtist, pid, old, &found, &mut groups, &mut moves)?;
+            item.set("item_artist_pid", int(found.pid))?;
+            let (order, section) = self.order(sort)?;
+            item.set("item_artist_order", int(order))?;
+            item.set("item_artist_order_section", int(section))?;
+            let shown = self.order(artist)?.0;
+            search.set("search_artist", int(shown))?;
+            if e.album_artist.is_none() {
+                // Observed in every artist-only session: the receiver also
+                // moves the album-artist search order to the new artist.
+                search.set("search_album_artist", int(shown))?;
+            }
+        }
+        if let Some((composer, sort)) = &e.composer {
+            let found = self.resolve_by_key(Class::Composer, composer, Some(sort), pid, year)?;
+            let old = item.int("composer_pid")?;
+            if found.created {
+                touched.push((Class::Composer, found.pid));
+            }
+            self.moved(Class::Composer, pid, old, &found, &mut groups, &mut moves)?;
+            item.set("composer_pid", int(found.pid))?;
+            let (order, section) = self.order(sort)?;
+            item.set("composer_order", int(order))?;
+            item.set("composer_order_section", int(section))?;
+            search.set("search_composer", int(self.order(composer)?.0))?;
+        }
+        if let Some(genre) = &e.genre {
+            let found = self.resolve_by_key(Class::Genre, genre, None, pid, year)?;
+            let old = item.int("genre_id")?;
+            if found.created {
+                touched.push((Class::Genre, found.pid));
+            }
+            self.moved(Class::Genre, pid, old, &found, &mut groups, &mut moves)?;
+            item.set("genre_id", int(found.pid))?;
+            let (order, section) = self.order(genre)?;
+            item.set("genre_order", int(order))?;
+            item.set("genre_order_section", int(section))?;
+        }
+
+        // A year that differs from the album's gives the album a new revision
+        // and recomputes its year as the members' maximum (seen in several
+        // sessions, and a phone edit 2022 -> 2021); a year equal to the album's leaves the album
+        // alone (2021 -> 2022 into a 2022 album). An album created by this
+        // update already carries both.
+        let year_album = match e.year {
+            Some(year) if !album_created => {
+                let album = item.int("album_pid")?;
+                (album != 0
+                    && self.group(Class::Album, album)?.int("album_year")? != i64::from(year))
+                .then_some(album)
+            }
+            _ => None,
+        };
+
+        let extra_changed = extra.row != extra.old;
+        let content_rating = extra.int("content_rating")?;
+        let title_cell = extra.get("title")?.clone();
+        let location_cell = extra.get("location")?.clone();
+        item.store(&mut self.expected)?;
+        extra.store(&mut self.expected)?;
+        search.store(&mut self.expected)?;
+        if extra_changed {
+            // The receiver's item_extra triggers mirror these three cells.
+            let mut state = self.load("item_state", "item_pid", pid)?;
+            let nonnull = |c: Cell| if c == Cell::Null { text("") } else { c };
+            state.set("title", nonnull(title_cell))?;
+            state.set("location", nonnull(location_cell))?;
+            state.set("has_explicit_content", int((content_rating == 1).into()))?;
+            state.store(&mut self.expected)?;
+        }
+        let mut album_year = None;
+        if let Some(album) = year_album {
+            let items = self.members(Class::Album, album, None)?;
+            let extras = self.t("item_extra")?;
+            let mut newest = 0;
+            for member in &items {
+                let row = extras.one("item_pid", *member)?;
+                newest = newest.max(typed::int(extras, row, "year")?);
+            }
+            let mut row = self.group(Class::Album, album)?;
+            let before = row.int("album_year")?;
+            row.set("album_year", int(newest))?;
+            row.store(&mut self.expected)?;
+            touched.push((Class::Album, album));
+            album_year = Some(YearRecompute {
+                album_pid: album,
+                before,
+                after: newest,
+            });
+        }
+
+        // Revisions are allocated once every update is applied.
+        let update = self.receipts.len();
+        for (class, group) in touched {
+            if !self.touched.iter().any(|t| (t.0, t.1) == (class, group)) {
+                self.touched.push((class, group, update));
+            }
+        }
+        self.receipts.push(UpdateReceipt {
+            track: format!("{:#018x}", e.sync_id),
+            item_pid: pid,
+            fields: e.keys.clone(),
+            groups,
+            representatives: moves,
+            album_year,
+            revisions: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn moved(
+        &mut self,
+        class: Class,
+        item: i64,
+        old: i64,
+        found: &Resolved,
+        groups: &mut Vec<GroupOutcome>,
+        moves: &mut Vec<RepresentativeMove>,
+    ) -> Result<()> {
+        groups.push(GroupOutcome {
+            class: class.table(),
+            outcome: if found.created {
+                "created"
+            } else if found.pid == old {
+                "unchanged"
+            } else {
+                "joined"
+            },
+            group_pid: found.pid,
+        });
+        if found.pid != old {
+            self.relocate(class, item, old, found.pid, found.created, moves)?;
+        }
+        Ok(())
+    }
 }
