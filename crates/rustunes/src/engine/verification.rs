@@ -74,5 +74,6 @@ pub(crate) mod artwork;
 pub(crate) mod audio_capture;
 pub(crate) mod catalogue_capture;
 pub(crate) mod journal;
+pub(crate) mod metadata_edit_sql;
 pub(crate) mod removal_sql;
 pub(crate) mod sql_tables;
