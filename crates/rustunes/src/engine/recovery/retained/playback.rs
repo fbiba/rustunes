@@ -23,6 +23,9 @@ mod ordinary_stats;
 
 mod ordinary_maintenance;
 
+pub(crate) mod between_runs;
+pub(crate) use between_runs::Window;
+
 pub(super) struct VerifiedPlaybackBridge {
     receipt: Value,
     sha256: [u8; 32],

@@ -268,6 +268,128 @@ fn ensure_same_started(journal: &Journal, expected: &Attempt, start: &StartEvide
     Ok(())
 }
 
+fn verify_artwork_catalog(
+    attempt: &Attempt,
+    retained: &RetainedRun,
+    current: &Current,
+    options: &Options<'_>,
+    deadline: Instant,
+) -> Result<Json> {
+    let art = attempt
+        .prepared
+        .content
+        .artwork
+        .as_ref()
+        .context("prepared artwork missing")?;
+    let cover = retained.cover.as_ref().context("retained cover missing")?;
+    ensure!(
+        artwork_update::prepare(
+            &retained.before,
+            attempt.prepared.content.track_pid,
+            art.cache_id,
+            cover,
+            operation_time(&attempt.prepared.operation)?
+        )? == attempt.prepared.operation,
+        "artwork operation does not rebuild from retained cover"
+    );
+    let strict = |catalog: &Catalog| -> Result<Json> {
+        let proof = artwork_verification::verify_independent_representative(
+            &retained.before,
+            catalog,
+            attempt.prepared.content.track_pid,
+            art.cache_id,
+        )?;
+        Ok(serde_json::to_value(proof)?)
+    };
+    // Strict-current success needs no optional saved-after artifact or wider
+    // schema profile. The bridge is a separate complete preservation proof.
+    let strict_refusal = match strict(&current.catalog) {
+        Ok(proof) => return Ok(proof),
+        Err(error) => error,
+    };
+    let immediate_dir = retained.step.join("after");
+    let fresh_dir = options.current_state_dir;
+    match fs::symlink_metadata(&immediate_dir) {
+        // A run stopped before its own After capture: the fresh capture is a
+        // later run's, so tracks played or skipped since are absorbed by the
+        // catalogue rule, everything else compared exactly.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let proof =
+                match artwork_verification::verify_independent_representative_after_listening(
+                    &retained.before,
+                    &current.catalog,
+                    attempt.prepared.content.track_pid,
+                    art.cache_id,
+                    &playback::between_runs::catalogue_listening,
+                ) {
+                    Ok(proof) => proof,
+                    Err(later) => {
+                        return Err(strict_refusal
+                            .context(format!("later-run projection also refused: {later:#}")));
+                    }
+                };
+            return Ok(json!({"schema":"rustunes.artwork-recovery-later-run",
+                "original_artwork_transition":proof,"verified_against":"fresh_capture_after_listening",
+                "strict_fresh_projection_refusal":format!("{strict_refusal:#}").chars().take(2048).collect::<String>(),
+                "fresh_permanent_readback_still_required":true,"operation_replayed":false}));
+        }
+        Err(e) => return Err(e.into()),
+        Ok(_) => directory(&immediate_dir)?,
+    }
+    directory(fresh_dir)?;
+    let immediate_dir = fs::canonicalize(immediate_dir)?;
+    let fresh_dir = fs::canonicalize(fresh_dir)?;
+    let receipt = read_bounded(&immediate_dir.join("state-receipt.json"), SMALL)?;
+    let immediate = crate::engine::recovery::saved::load_saved_current(
+        &crate::engine::recovery::saved::SavedCurrent {
+            directory: immediate_dir.clone(),
+            receipt_sha256: hex(&Sha256::digest(&receipt)),
+        },
+        &current.device,
+        options.trace,
+    )?;
+    let loaded_fresh = crate::engine::recovery::saved::load_saved_current(
+        &crate::engine::recovery::saved::SavedCurrent {
+            directory: fresh_dir.clone(),
+            receipt_sha256: hex(&current.receipt_sha256),
+        },
+        &current.device,
+        options.trace,
+    )?;
+    let h = current.catalog.source_hashes();
+    let actual = loaded_fresh.current.catalog.source_hashes();
+    ensure!(
+        h.database == actual.database
+            && h.database_bytes == actual.database_bytes
+            && h.wal == actual.wal
+            && h.wal_bytes == actual.wal_bytes
+            && current.raw_preferences == loaded_fresh.current.raw_preferences
+            && current.plist_preferences == loaded_fresh.current.plist_preferences
+            && current.cdb == loaded_fresh.current.cdb
+            && current.artwork_db == loaded_fresh.current.artwork_db,
+        "saved fresh playback evidence differs from captured Current"
+    );
+    let original = strict(&immediate.current.catalog)?;
+    let bridge = playback::verify(
+        &immediate.current,
+        &immediate_dir,
+        current,
+        &fresh_dir,
+        &options.trace.join("playback-bridge"),
+        deadline.into_std(),
+    )?;
+    durable_write(
+        options.trace,
+        "retained-immediate-state.json",
+        &immediate.receipt,
+    )?;
+    Ok(json!({"schema":"rustunes.artwork-recovery-two-stage",
+        "original_artwork_transition":original,"verified_against":"matched_step_immediate_after",
+        "strict_fresh_projection_refusal":format!("{strict_refusal:#}").chars().take(2048).collect::<String>(),
+        "playback_bridge":bridge.evidence(),"fresh_permanent_readback_still_required":true,
+        "operation_replayed":false}))
+}
+
 /// An Insert's input names the pre-session capture it was prepared from; an
 /// Artwork's names none.
 fn check_pre_session(input: &Json, kind: AttemptKind) -> Result<()> {
