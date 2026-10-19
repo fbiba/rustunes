@@ -337,6 +337,60 @@ pub(crate) fn qualify_selection(
     Ok((steps, batches))
 }
 
+/// Exact journal targets for these tracks, in order: item, path, size and
+/// full hash from the complete index, and the active binding if owned. A
+/// track whose file is already gone has no file to remove.
+pub(crate) fn targets(
+    before: &Before,
+    journal: &Journal,
+    tracks: &[u64],
+) -> Result<Vec<RemovalTarget>> {
+    let mut owned = std::collections::BTreeMap::new();
+    for active in journal.active_bindings()? {
+        owned.insert(
+            active.binding.content.track_pid,
+            (active.reference.id, active.reference.version),
+        );
+    }
+    let catalog = &before.snapshot.catalog;
+    let index = &before.snapshot.index;
+    tracks
+        .iter()
+        .map(|track| {
+            let entry = catalog
+                .tracks()
+                .iter()
+                .find(|t| t.sync_id == *track)
+                .with_context(|| format!("track {track:016x} is not in the catalogue"))?;
+            let (path, file_bytes, file_sha256) = match &entry.afc_path {
+                None => (None, None, None),
+                Some(_) if index.gone().contains(track) => (None, None, None),
+                Some(path) => {
+                    let (bytes, sha) = if let Some(audio) = index.tracks().get(track) {
+                        (
+                            audio.fingerprint.file_bytes,
+                            audio.fingerprint.full_file_sha256,
+                        )
+                    } else if let Some(audio) = index.other_audio().get(track) {
+                        (audio.file_bytes, audio.full_file_sha256)
+                    } else {
+                        bail!("track {track:016x} has a path but no complete index entry")
+                    };
+                    (Some(path.clone()), Some(bytes), Some(sha))
+                }
+            };
+            Ok(RemovalTarget {
+                track: *track,
+                item_pid: before.item_pid(*track)?,
+                path,
+                file_bytes,
+                file_sha256,
+                binding: owned.get(track).copied(),
+            })
+        })
+        .collect()
+}
+
 /// What a batch ended as.
 pub(crate) struct Settled {
     pub(crate) batch: BatchId,
@@ -401,6 +455,162 @@ pub(crate) enum Requests<'a> {
     /// The session names no track (a playlist deletion); every asset request
     /// refuses but eligible foreign artwork and Genius ones.
     None,
+}
+
+/// Connect, guard and sign one metadata-only `operation` against the exact
+/// `before` state, then call `start`, which must durably record Started and
+/// return the journal's copy of the bytes, and send them. The guards hold the
+/// state files, ArtworkDB and an empty staging folder unchanged from `before`
+/// through the Ready session. Own asset requests (`requests`) refuse.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_metadata_only<T: StartedOperation>(
+    before: &Before,
+    operation: &[u8],
+    requests: Requests<'_>,
+    input_receipt: [u8; 32],
+    host_name: &str,
+    send: &Path,
+    control: &Control,
+    start: impl FnOnce([u8; 32], [u8; 21]) -> Result<T>,
+) -> Sent {
+    let current = &before.current;
+    let prepared = (|| {
+        let artwork = current
+            .artwork_db
+            .clone()
+            .context("a metadata-only session requires the copied ArtworkDB")?;
+        ensure!(
+            !artwork.is_empty() && artwork.len() as u64 <= MAX_ASSET,
+            "ArtworkDB exceeds bound"
+        );
+        // A compensating batch's rows have no file location.
+        let mut state = FreshState::for_unfilled(
+            &current.device,
+            &current.catalog,
+            &current.raw_preferences,
+            &current.plist_preferences,
+            input_receipt,
+            before.snapshot.index.unfilled(),
+        )?;
+        state.bind_copied_cdb(&current.cdb)?;
+        ensure!(
+            state.media_anchor() == before.anchor(),
+            "session state anchor differs from the snapshot"
+        );
+        let templates = templates::build_from_copied_cdb(
+            &current.cdb,
+            &current.catalog,
+            &current.library,
+            host_name,
+        )?;
+        let session = session::prepare(
+            templates.request,
+            &templates.finished,
+            current.library.library_id(),
+            before.anchor(),
+        )?;
+        let operations = operation_budget(
+            state.state_read_chunks()?,
+            artwork.len() as u64,
+            operation.len(),
+        )?;
+        create_trace(send)?;
+        Ok((artwork, state, session, operations))
+    })();
+    let (artwork, state, session_prepared, operations) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => return Sent::Unsent(error),
+    };
+    let artwork_sha = sha(&artwork);
+    let ancillary = state.ancillary();
+    let policy = match match requests {
+        Requests::Refuse(first) => ancillary.metadata(&(first as i64).to_string()),
+        Requests::Unfilled(targets) => ancillary.metadata_unfilled(
+            &targets
+                .iter()
+                .map(|t| (*t as i64).to_string())
+                .collect::<Vec<_>>(),
+        ),
+        Requests::None => Ok(ancillary.metadata_without_tracks()),
+    }
+    .and_then(|policy| {
+        policy.ensure_session(current.library.library_id(), before.anchor())?;
+        Ok(policy)
+    }) {
+        Ok(policy) => policy,
+        Err(error) => return Sent::Unsent(error),
+    };
+    let mut session = None;
+    let mut afc = None;
+    let ready = controlled(control, async {
+        let provider = timeout_at(
+            control
+                .deadline
+                .min(Instant::now() + Duration::from_secs(15)),
+            device::provider(),
+        )
+        .await
+        .context("discovery deadline")??;
+        ensure!(
+            provider.udid == current.device,
+            "discovered device differs from the captured state"
+        );
+        let afc = afc.insert(
+            Transfer::connect_bounded(
+                &provider,
+                send,
+                control.deadline,
+                operations,
+                Arc::clone(&control.cancelled),
+            )
+            .await?,
+        );
+        guard(afc, &state, artwork.len() as u64, artwork_sha).await?;
+        control.check()?;
+        let live = session
+            .insert(Session::connect(&provider, session_prepared, send, control.deadline).await?);
+        guard(afc, &state, artwork.len() as u64, artwork_sha).await?;
+        let signature = live.sign_metadata(operation)?;
+        durable_write(send, "operation.cig", &signature)?;
+        sync_trace(send)?;
+        Ok((live.ready_receipt_sha256(), signature))
+    })
+    .await
+    .and_then(|(ready, signature)| {
+        control.check()?;
+        Ok((ready, start(ready, signature)?))
+    });
+    let (ready, started) = match ready {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = durable_write(
+                send,
+                "error.txt",
+                format!("{error:#}\nNothing was written to the phone.\n").as_bytes(),
+            );
+            return Sent::Unsent(error);
+        }
+    };
+    // From here the record is Started: nothing on the phone changed yet, and
+    // only observation may settle it.
+    let (Some(mut session), Some(mut afc)) = (session, afc) else {
+        return Sent::Started(Err(anyhow::anyhow!("transport lost before Started")));
+    };
+    let wire = controlled(control, async {
+        session.stage_metadata(&mut afc, &started).await?;
+        control.check()?;
+        session.finish_metadata().await?;
+        session.wait_metadata_only_with_policy(&policy).await?;
+        Ok((
+            ready,
+            session.terminal_receipt_sha256()?,
+            sha(started.operation()),
+        ))
+    })
+    .await;
+    drop(session);
+    drop(afc);
+    Sent::Started(wire)
 }
 
 /// Every surviving indexed file is as before (its allocation aside,
@@ -532,4 +742,86 @@ fn stable(attrs: Option<Attributes>) -> Option<Attributes> {
         attrs.remove("st_atime");
         attrs
     })
+}
+
+fn operation_budget(
+    state_chunks: u64,
+    artwork_bytes: u64,
+    operation_bytes: usize,
+) -> Result<usize> {
+    ensure!(
+        operation_bytes > 0
+            && operation_bytes <= music_protocol::protocol::signing::MAX_OPERATION_BYTES,
+        "removal operation exceeds bound"
+    );
+    // Two complete guards, write and readback of metadata and signature, and a
+    // generous margin: exhaustion after Started strands a staged operation.
+    let operations = state_chunks
+        .checked_add(artwork_bytes.div_ceil(CHUNK))
+        .and_then(|n| n.checked_add(64))
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add((operation_bytes as u64).div_ceil(CHUNK) * 4 + 512))
+        .context("removal operation budget overflow")?;
+    let operations = usize::try_from(operations)?;
+    ensure!(
+        operations <= MAX_BOUNDED_OPS,
+        "removal AFC allowance exceeds bound"
+    );
+    Ok(operations)
+}
+
+/// The session takes no cancellation token; dropping the future closes both
+/// transports and leaves a Started record for observation.
+pub(crate) async fn controlled<T>(
+    control: &Control,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    control.check()?;
+    let cancellation = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Err(error) = control.check() {
+                return error;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        error = cancellation => Err(error),
+        result = timeout_at(control.deadline, future) => result.context("session deadline")?,
+    }
+}
+
+pub(crate) fn next_directory(parent: &Path, prefix: &str) -> Result<PathBuf> {
+    for n in 1..10_000 {
+        let path = parent.join(format!("{prefix}-{n:03}"));
+        if !path.try_exists()? {
+            return Ok(path);
+        }
+    }
+    bail!(
+        "too many observation directories under {}",
+        parent.display()
+    )
+}
+
+/// Name in a batch receipt the files whose allocation alone changed
+/// (`DeviceAudioIndex::allocation_changed`), if any.
+pub(crate) fn allocation_changed(
+    receipt: &mut serde_json::Value,
+    before: &Snapshot,
+    after: &Snapshot,
+) {
+    let ids = before.index.allocation_changed(&after.index);
+    if !ids.is_empty() {
+        receipt["allocation_changed"] = json!(
+            ids.iter()
+                .map(|id| format!("{id:016x}"))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+pub(crate) fn sha(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
