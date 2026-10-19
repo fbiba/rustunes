@@ -482,3 +482,6 @@ impl Journal {
         durable_commit(tx, &self.database, &self.directory, &mut self.poisoned)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -1429,3 +1429,6 @@ pub(super) fn settle_insert(
     );
     Ok(state)
 }
+
+#[cfg(test)]
+mod tests;
