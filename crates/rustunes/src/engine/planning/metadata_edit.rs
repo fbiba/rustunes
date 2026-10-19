@@ -1885,3 +1885,6 @@ fn schedule_within(
         sessions.push(updates.iter().map(|u| u.sync_id).collect());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;
