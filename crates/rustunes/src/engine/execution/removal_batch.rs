@@ -413,6 +413,257 @@ pub(crate) enum Purpose {
     CompensateInsertBatch(InsertBatchId),
 }
 
+/// Prepare, send and settle one batch removing `tracks` (in this order) from
+/// the exact `before` state. Errors before Started leave nothing behind but a
+/// Prepared batch that is cancelled here; after Started the batch is settled
+/// by observation or left Started for `settle`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run(
+    journal: &mut Journal,
+    identity: &Identity,
+    before: &Before,
+    tracks: &[u64],
+    purpose: Purpose,
+    coordination: Option<CoordinationId>,
+    host_name: &str,
+    control: &Control,
+) -> Result<Settled> {
+    control.check()?;
+    ensure!(
+        journal.outstanding_removal_batch()?.is_none(),
+        "an earlier removal batch is unfinished; run resume first"
+    );
+    let items = tracks
+        .iter()
+        .map(|t| before.item_pid(*t))
+        .collect::<Result<Vec<_>>>()?;
+    removal_sql::qualify(&before.sql.tables, &items)?;
+    let targets = targets(before, journal, tracks)?;
+    let current = &before.current;
+    let operation = match purpose {
+        Purpose::Remove => mutation::delete_many(&current.catalog, tracks, SystemTime::now())?,
+        Purpose::CompensateInsert(_) | Purpose::CompensateInsertBatch(_) => {
+            mutation::delete_many_unfilled(&current.catalog, tracks, SystemTime::now())?
+        }
+    };
+    let base_anchor = before.anchor();
+    let evidence = &before.directory;
+    let input = serde_json::to_vec_pretty(&json!({
+        "schema":"rustunes.removal-batch-input",
+        "base_anchor":base_anchor,
+        "operation_sha256":hex(&sha(&operation)),
+        "before_index_sha256":hex(&before.snapshot.index_receipt_sha256),
+        "before_current_sha256":hex(&current.receipt_sha256),
+        "artwork_database_sha256":hex(&sha(current.artwork_db.as_deref().unwrap_or_default())),
+        "host_name":host_name,
+        "compensates":match purpose {
+            Purpose::Remove => serde_json::Value::Null,
+            Purpose::CompensateInsert(id) => json!({"attempt":id.as_i64()}),
+            Purpose::CompensateInsertBatch(id) => json!({"insert_batch":id.as_i64()}),
+        },
+        "targets":targets.iter().map(|t| json!({
+            "track":format!("{:016x}",t.track),"item_pid":t.item_pid,"path":t.path,
+            "file_bytes":t.file_bytes,"file_sha256":t.file_sha256.map(|h| hex(&h)),
+            "binding":t.binding.map(|(id,version)| json!({"id":id.as_i64(),"version":version})),
+        })).collect::<Vec<_>>(),
+    }))?;
+    durable_write(evidence, "input.json", &input)?;
+    durable_write(evidence, "operation.plist", &operation)?;
+    let input_sha = sha(&input);
+    let id = journal.prepare_removal_batch(&RemovalIntent {
+        coordination,
+        compensates: match purpose {
+            Purpose::CompensateInsert(id) => Some(id),
+            _ => None,
+        },
+        compensates_insert_batch: match purpose {
+            Purpose::CompensateInsertBatch(id) => Some(id),
+            _ => None,
+        },
+        operation: operation.clone(),
+        base_anchor,
+        before_current: current.receipt_sha256,
+        before_index: before.snapshot.index_receipt_sha256,
+        input_receipt: input_sha,
+        evidence: evidence.clone(),
+        targets,
+        playlists: Vec::new(),
+    })?;
+    let requests = match purpose {
+        Purpose::Remove => Requests::Refuse(tracks[0]),
+        _ => Requests::Unfilled(tracks),
+    };
+    send_and_settle(
+        journal, identity, before, id, &operation, requests, input_sha, host_name, control,
+    )
+    .await
+}
+
+/// Prepare, send and settle one batch deleting `playlists` (in this order)
+/// from the exact `before` state, under the same rules as `run`. Each must be
+/// an empty ordinary playlist (`removal_sql::qualify_deletion`) named as in
+/// `before`. The session names no track, so every asset request refuses.
+pub(crate) async fn run_playlists(
+    journal: &mut Journal,
+    identity: &Identity,
+    before: &Before,
+    playlists: &[PlaylistTarget],
+    coordination: CoordinationId,
+    host_name: &str,
+    control: &Control,
+) -> Result<Settled> {
+    control.check()?;
+    ensure!(
+        journal.outstanding_removal_batch()?.is_none(),
+        "an earlier removal batch is unfinished; run resume first"
+    );
+    let pids: Vec<i64> = playlists.iter().map(|p| p.container as i64).collect();
+    removal_sql::qualify_deletion(&before.sql.tables, &pids)?;
+    let containers = before.sql.table("container")?;
+    for playlist in playlists {
+        let row = typed::unique(
+            containers,
+            "container_pid",
+            Cell::Integer(playlist.container as i64),
+        )?;
+        ensure!(
+            containers.at(row, "name")?.text()? == playlist.name,
+            "playlist {:016x} is no longer named {:?}",
+            playlist.container,
+            playlist.name
+        );
+    }
+    let current = &before.current;
+    let containers: Vec<u64> = playlists.iter().map(|p| p.container).collect();
+    let operation = mutation::delete_playlists(&current.catalog, &containers, SystemTime::now())?;
+    let base_anchor = before.anchor();
+    let evidence = &before.directory;
+    let input = serde_json::to_vec_pretty(&json!({
+        "schema":"rustunes.playlist-removal-input",
+        "base_anchor":base_anchor,
+        "operation_sha256":hex(&sha(&operation)),
+        "before_index_sha256":hex(&before.snapshot.index_receipt_sha256),
+        "before_current_sha256":hex(&current.receipt_sha256),
+        "artwork_database_sha256":hex(&sha(current.artwork_db.as_deref().unwrap_or_default())),
+        "host_name":host_name,
+        "playlists":playlists.iter().map(|p| json!({
+            "container":format!("{:016x}",p.container),"name":p.name,
+        })).collect::<Vec<_>>(),
+    }))?;
+    durable_write(evidence, "input.json", &input)?;
+    durable_write(evidence, "operation.plist", &operation)?;
+    let input_sha = sha(&input);
+    let id = journal.prepare_removal_batch(&RemovalIntent {
+        coordination: Some(coordination),
+        compensates: None,
+        compensates_insert_batch: None,
+        operation: operation.clone(),
+        base_anchor,
+        before_current: current.receipt_sha256,
+        before_index: before.snapshot.index_receipt_sha256,
+        input_receipt: input_sha,
+        evidence: evidence.clone(),
+        targets: Vec::new(),
+        playlists: playlists.to_vec(),
+    })?;
+    send_and_settle(
+        journal,
+        identity,
+        before,
+        id,
+        &operation,
+        Requests::None,
+        input_sha,
+        host_name,
+        control,
+    )
+    .await
+}
+
+/// Send Prepared batch `id` and settle it by observation. A failure before
+/// Started cancels it; after Started it is settled or left for `settle`.
+#[allow(clippy::too_many_arguments)]
+async fn send_and_settle(
+    journal: &mut Journal,
+    identity: &Identity,
+    before: &Before,
+    id: BatchId,
+    operation: &[u8],
+    requests: Requests<'_>,
+    input_sha: [u8; 32],
+    host_name: &str,
+    control: &Control,
+) -> Result<Settled> {
+    let send = before.directory.join("send");
+    let wire = match send_metadata_only(
+        before,
+        operation,
+        requests,
+        input_sha,
+        host_name,
+        &send,
+        control,
+        |ready, signature| journal.start_removal_batch(id, ready, signature),
+    )
+    .await
+    {
+        Sent::Unsent(error) => {
+            journal.cancel_removal_batch(id)?;
+            return Err(error);
+        }
+        Sent::Started(wire) => wire.and_then(|(ready, terminal, operation_sha)| {
+            durable_write(
+                &send,
+                "wire.json",
+                &serde_json::to_vec_pretty(&json!({
+                    "schema":"rustunes.removal-batch-wire","batch":id.as_i64(),
+                    "ready_sha256":hex(&ready),"terminal_sha256":hex(&terminal),
+                    "operation_sha256":hex(&operation_sha),
+                }))?,
+            )?;
+            sync_trace(&send)
+        }),
+    };
+    if let Err(error) = &wire {
+        let _ = durable_write(
+            &send,
+            "error.txt",
+            format!(
+                "{error:#}\nBatch {} is Started; it is observed below.\n",
+                id.as_i64()
+            )
+            .as_bytes(),
+        );
+    }
+    let batch = journal.removal_batch(id)?;
+    let mut attempt = 1;
+    let observed = loop {
+        match settle(journal, identity, &batch, Window::SameRun, control).await {
+            Err(error) if attempt < SETTLE_ATTEMPTS && control.check().is_ok() => {
+                let _ = durable_write(
+                    &send,
+                    &format!("observation-error-{attempt}.txt"),
+                    format!("{error:#}\nBatch {} is observed again.\n", id.as_i64()).as_bytes(),
+                );
+                attempt += 1;
+                tokio::time::sleep(SETTLE_PAUSE).await;
+            }
+            result => break result,
+        }
+    };
+    match (observed, wire) {
+        (Ok(settled), _) => Ok(settled),
+        (Err(error), Ok(())) => Err(error.context(format!(
+            "removal batch {} is Started after {SETTLE_ATTEMPTS} observations; the next run (or resume) observes it again",
+            id.as_i64()
+        ))),
+        (Err(error), Err(wire)) => Err(error.context(format!(
+            "removal batch {} is Started after a transport error ({wire:#}) and {SETTLE_ATTEMPTS} observations; the next run (or resume) observes it again",
+            id.as_i64()
+        ))),
+    }
+}
+
 /// Whether a batch attempt that failed or did not apply may be tried again
 /// from fresh state: the run was not cancelled and nothing is left Started.
 pub(crate) fn may_try_again(
@@ -613,6 +864,347 @@ pub(crate) async fn send_metadata_only<T: StartedOperation>(
     Sent::Started(wire)
 }
 
+/// Remove `tracks` in order, at most `batch_size` per session. Each batch is
+/// captured fresh under `run/batch-NNN` and settled before the next starts;
+/// `progress(removed, total)` runs after each one. A batch the phone rolled
+/// back (NotApplied), or one that failed before it was sent, is tried once
+/// more from fresh state (`run/batch-NNN-attempt-2`); a second such outcome,
+/// or a batch left Started, stops the run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remove_all(
+    journal_path: &Path,
+    identity: &Identity,
+    tracks: &[u64],
+    batch_size: usize,
+    coordination: Option<CoordinationId>,
+    run_directory: &Path,
+    host_name: &str,
+    control: impl Fn() -> Control,
+    mut progress: impl FnMut(&Settled, usize, usize) -> Result<()>,
+) -> Result<Vec<Settled>> {
+    ensure!(batch_size > 0, "batch size must be positive");
+    let mut settled = Vec::new();
+    let mut removed = 0;
+    for (number, chunk) in tracks.chunks(batch_size).enumerate() {
+        crate::engine::observe(crate::engine::Event::RemovalBatchStarted {
+            number: number + 1,
+            batches: tracks.len().div_ceil(batch_size),
+            tracks: chunk.len(),
+            removed,
+            total: tracks.len(),
+        })?;
+        let mut attempt = 1;
+        let batch = loop {
+            let control = control();
+            let directory = run_directory.join(match attempt {
+                1 => format!("batch-{:03}", number + 1),
+                n => format!("batch-{:03}-attempt-{n}", number + 1),
+            });
+            let result = async {
+                let taken = taken(journal_path, identity)?;
+                let before = capture_for_removal(&directory, identity, &taken, &control).await?;
+                let mut journal = Journal::open(journal_path, identity)?;
+                run(
+                    &mut journal,
+                    identity,
+                    &before,
+                    chunk,
+                    Purpose::Remove,
+                    coordination,
+                    host_name,
+                    &control,
+                )
+                .await
+            }
+            .await;
+            match result {
+                Ok(batch) if batch.state == BatchState::Verified => break batch,
+                Ok(_) | Err(_)
+                    if attempt < BATCH_ATTEMPTS
+                        && may_try_again(journal_path, identity, &control)? =>
+                {
+                    attempt += 1
+                }
+                Ok(batch) => bail!(
+                    "removal batch {} did not apply on the phone, after {attempt} attempts; {removed} of {} tracks were removed",
+                    batch.batch.as_i64(),
+                    tracks.len()
+                ),
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "{removed} of {} tracks were removed before this batch",
+                        tracks.len()
+                    )));
+                }
+            }
+        };
+        removed += batch.removed;
+        progress(&batch, removed, tracks.len())?;
+        settled.push(batch);
+    }
+    Ok(settled)
+}
+
+/// Capture a fresh complete state under `directory` and remove the rows an
+/// unfinished insertion left without audio, as one compensating batch. Each
+/// row must still be a library row with no file location and no asset, and
+/// no file may exist at any of the insertion's `planned` permanent paths.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compensate(
+    journal_path: &Path,
+    identity: &Identity,
+    directory: &Path,
+    tracks: &[u64],
+    planned: &[String],
+    purpose: Purpose,
+    coordination: Option<CoordinationId>,
+    host_name: &str,
+    control: &Control,
+) -> Result<Settled> {
+    ensure!(
+        purpose != Purpose::Remove && !tracks.is_empty() && planned.len() == tracks.len(),
+        "compensation needs the rows of an unfinished insertion"
+    );
+    let unfilled: BTreeSet<u64> = tracks.iter().copied().collect();
+    let absent = Absent::unfilled(&unfilled);
+    let (_, before) = capture(directory, Some(identity), absent, control).await?;
+    ensure!(
+        before.snapshot.index.unfilled() == &unfilled,
+        "a row the unfinished insertion left now holds audio, or is gone; nothing was sent"
+    );
+    let library = identity::parse(&before.snapshot.raw_preferences)?;
+    let trace = directory.join("planned-paths");
+    create_trace(&trace)?;
+    let deadline = control
+        .deadline
+        .min(Instant::now() + Duration::from_secs(30));
+    let mut afc = read_only(
+        identity,
+        &library,
+        &trace,
+        deadline,
+        planned.len() * 4 + 16,
+        control,
+    )
+    .await?;
+    for path in planned {
+        ensure!(
+            afc.stat(path).await?.is_none(),
+            "a file exists at {path}, where the unfinished insertion planned its audio; nothing was sent"
+        );
+    }
+    drop(afc);
+    durable_write(
+        directory,
+        "planned-paths-absent.json",
+        &serde_json::to_vec_pretty(&json!({
+            "schema":"rustunes.compensation-planned-paths",
+            "tracks":tracks.iter().map(|t| format!("{t:016x}")).collect::<Vec<_>>(),
+            "absent":planned,
+        }))?,
+    )?;
+    let mut journal = Journal::open(journal_path, identity)?;
+    run(
+        &mut journal,
+        identity,
+        &before,
+        tracks,
+        purpose,
+        coordination,
+        host_name,
+        control,
+    )
+    .await
+}
+
+/// Observe a Started batch and settle it: Verified when the complete after
+/// state is the modelled removal with survivors intact and target files gone;
+/// NotApplied when nothing moved and nothing is staged but this batch's own
+/// unfinished operation pair, which is removed first. A target's file may
+/// already be gone from a session the phone rolled back: the catalogue
+/// decides, and the proof lists those files. Otherwise it stays Started and
+/// the error says why; the full SQL delta is kept.
+pub(crate) async fn settle(
+    journal: &mut Journal,
+    identity: &Identity,
+    batch: &BatchRecord,
+    window: Window,
+    control: &Control,
+) -> Result<Settled> {
+    ensure!(
+        batch.state == BatchState::Started,
+        "removal batch {} is not Started",
+        batch.id.as_i64()
+    );
+    let evidence = &batch.evidence;
+    // A compensating batch removes rows without audio; only those may lack it.
+    let unfilled: BTreeSet<u64> = batch
+        .targets
+        .iter()
+        .filter(|t| t.path.is_none())
+        .map(|t| t.track)
+        .collect();
+    // A removal the phone rolled back may have deleted a target's file.
+    let absent = Absent {
+        unfilled: &unfilled,
+        gone: batch.compensates.is_none() && batch.compensates_insert_batch.is_none(),
+        ..Absent::NONE
+    };
+    let targeted: BTreeSet<u64> = batch.targets.iter().map(|t| t.track).collect();
+    let before = snapshot::open_allowing(&evidence.join("snapshot"), absent)?;
+    ensure!(
+        before.index_receipt_sha256 == batch.before_index,
+        "retained before snapshot differs from the journaled batch"
+    );
+    let run = next_directory(evidence, "observe")?;
+    create_trace(&run)?;
+    let library = identity::parse(&before.raw_preferences)?;
+    let before_sql = materialize(&before, &run.join("sql-before"), control)?;
+    let before_tables = &before_sql.tables;
+    let items: Vec<i64> = batch.targets.iter().map(|t| t.item_pid).collect();
+    let playlists: Vec<i64> = batch.playlists.iter().map(|p| p.container as i64).collect();
+    let after_dir = run.join("snapshot");
+    audio_capture::capture_allowing(&after_dir, absent, control, device::provider).await?;
+    let after = snapshot::open_allowing(&after_dir, absent)?;
+    ensure!(
+        before.index.gone().is_subset(&targeted) && after.index.gone().is_subset(&targeted),
+        "an audio file missing from the phone belongs to no target of batch {}; it stays Started",
+        batch.id.as_i64()
+    );
+    let after_sql = materialize(&after, &run.join("sql-after"), control)?;
+    let after_tables = &after_sql.tables;
+    let budget =
+        Budget::new_cancellable_until(control.deadline.into_std(), Arc::clone(&control.cancelled));
+    if let Ok(delta) = reader::delta(&before_sql, &after_sql, &budget) {
+        durable_write(&run, "sql-delta.json", &serde_json::to_vec(&delta)?)?;
+    }
+    let anchor = after.catalog.persisted_media_anchor();
+    if anchor == batch.base_anchor {
+        let unchanged = match (playlists.is_empty(), window) {
+            (true, Window::SameRun) => {
+                removal_sql::not_applied(before_tables, after_tables, &items)?
+            }
+            (true, Window::LaterRun) => {
+                removal_sql::not_applied_later(before_tables, after_tables, &items)?
+            }
+            // Listening never touches an empty playlist.
+            (false, _) => {
+                removal_sql::deletion_not_applied(before_tables, after_tables, &playlists)?
+            }
+        };
+        ensure!(
+            unchanged,
+            "the anchor did not move but the catalogue changed; batch {} stays Started",
+            batch.id.as_i64()
+        );
+        let staged = staged_names(identity, &library, &run, control).await?;
+        let staged_removed = remove_unfinished(
+            identity,
+            &library,
+            &run,
+            &staged,
+            stale_staging::Unfinished {
+                send: &evidence.join("send"),
+                operation: &batch.operation,
+                signature: batch.signature,
+            },
+            batch.id.as_i64(),
+            control,
+        )
+        .await?;
+        let proof = serde_json::to_vec_pretty(&json!({
+            "schema":"rustunes.removal-batch-not-applied","batch":batch.id.as_i64(),
+            "anchor":anchor,"after_index_sha256":hex(&after.index_receipt_sha256),
+            "targets_present":items,"playlists_present":playlists,"staging_empty":true,
+            "staged_removed":staged_removed,
+            "target_files_gone":after.index.gone().iter().map(|t| format!("{t:016x}")).collect::<Vec<_>>(),
+        }))?;
+        durable_write(&run, "not-applied.json", &proof)?;
+        journal.mark_removal_batch_not_applied(batch.id, sha(&proof))?;
+        return Ok(Settled {
+            batch: batch.id,
+            state: BatchState::NotApplied,
+            evidence: run,
+            removed: 0,
+            deleted_playlists: 0,
+        });
+    }
+    let unmodelled = || {
+        format!(
+            "the phone's catalogue is not the modelled removal; batch {} stays Started and {} keeps the delta",
+            batch.id.as_i64(),
+            run.display()
+        )
+    };
+    // A later run: the phone may have been played since the session.
+    let between_runs =
+        |expected: &mut removal_sql::Tables, observed: &removal_sql::Tables, floor: i64| {
+            between_runs::absorb_above(expected, observed, &budget, floor)
+        };
+    let removal = match (playlists.is_empty(), window) {
+        (true, Window::SameRun) => serde_json::to_value(
+            removal_sql::verify(before_tables, after_tables, &items, batch.base_anchor)
+                .with_context(unmodelled)?,
+        )?,
+        (true, Window::LaterRun) => serde_json::to_value(
+            removal_sql::verify_later(
+                before_tables,
+                after_tables,
+                &items,
+                batch.base_anchor,
+                &between_runs,
+            )
+            .with_context(unmodelled)?,
+        )?,
+        (false, Window::SameRun) => serde_json::to_value(
+            removal_sql::verify_deletion(
+                before_tables,
+                after_tables,
+                &playlists,
+                batch.base_anchor,
+            )
+            .with_context(unmodelled)?,
+        )?,
+        (false, Window::LaterRun) => serde_json::to_value(
+            removal_sql::verify_deletion_later(
+                before_tables,
+                after_tables,
+                &playlists,
+                batch.base_anchor,
+                &between_runs,
+            )
+            .with_context(unmodelled)?,
+        )?,
+    };
+    survivors_unchanged(&before, &after, batch)?;
+    let remaining = wait_absent(identity, &library, &run, batch, control).await?;
+    ensure!(
+        remaining.is_empty(),
+        "target files are still on the phone after {} s: {}; batch {} stays Started",
+        ASSET_WAIT.as_secs(),
+        remaining.join(", "),
+        batch.id.as_i64()
+    );
+    let mut receipt = json!({
+        "schema":"rustunes.removal-batch-verification","batch":batch.id.as_i64(),
+        "base_anchor":batch.base_anchor,"verified_anchor":anchor,
+        "before_index_sha256":hex(&batch.before_index),
+        "after_index_sha256":hex(&after.index_receipt_sha256),
+        "removal":removal,"survivors_unchanged":true,"target_files_absent":true,
+    });
+    allocation_changed(&mut receipt, &before, &after);
+    let receipt = serde_json::to_vec_pretty(&receipt)?;
+    durable_write(&run, "verification.json", &receipt)?;
+    journal.settle_removal_batch(batch.id, sha(&receipt), anchor)?;
+    Ok(Settled {
+        batch: batch.id,
+        state: BatchState::Verified,
+        evidence: run,
+        removed: batch.targets.len(),
+        deleted_playlists: batch.playlists.len(),
+    })
+}
+
 /// Every surviving indexed file is as before (its allocation aside,
 /// `TrackAudio::same_file`), no target is indexed, and no file appeared.
 fn survivors_unchanged(before: &Snapshot, after: &Snapshot, batch: &BatchRecord) -> Result<()> {
@@ -669,6 +1261,92 @@ fn survivors_unchanged(before: &Snapshot, after: &Snapshot, batch: &BatchRecord)
         );
     }
     Ok(())
+}
+
+/// Poll every target file until it is absent or `ASSET_WAIT` passes.
+pub(crate) async fn wait_absent(
+    identity: &Identity,
+    library: &LibraryIdentity,
+    run: &Path,
+    batch: &BatchRecord,
+    control: &Control,
+) -> Result<Vec<String>> {
+    let paths: Vec<String> = batch
+        .targets
+        .iter()
+        .filter_map(|t| t.path.clone())
+        .collect();
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trace = run.join("absence");
+    create_trace(&trace)?;
+    let deadline = control.deadline.min(Instant::now() + ASSET_WAIT);
+    let mut afc = read_only(
+        identity,
+        library,
+        &trace,
+        deadline,
+        paths.len() * 200,
+        control,
+    )
+    .await?;
+    let mut remaining = paths;
+    loop {
+        let mut still = Vec::new();
+        for path in remaining {
+            if afc.stat(&path).await?.is_some() {
+                still.push(path);
+            }
+        }
+        remaining = still;
+        if remaining.is_empty() || Instant::now() + Duration::from_secs(2) >= deadline {
+            return Ok(remaining);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        control.check()?;
+    }
+}
+
+/// `stale_staging::remove_unfinished` for batch `id`, which stays Started
+/// when the staged files are not provably its own unfinished pair.
+pub(crate) async fn remove_unfinished(
+    identity: &Identity,
+    library: &LibraryIdentity,
+    run: &Path,
+    staged: &[String],
+    record: stale_staging::Unfinished<'_>,
+    id: i64,
+    control: &Control,
+) -> Result<Vec<String>> {
+    stale_staging::remove_unfinished(identity, library, run, staged, record, control)
+        .await
+        .with_context(|| {
+            format!(
+                "the operation is still staged on the phone ({}); batch {id} stays Started",
+                staged.join(", ")
+            )
+        })
+}
+
+pub(crate) async fn staged_names(
+    identity: &Identity,
+    library: &LibraryIdentity,
+    run: &Path,
+    control: &Control,
+) -> Result<Vec<String>> {
+    let trace = run.join("staging");
+    create_trace(&trace)?;
+    let deadline = control
+        .deadline
+        .min(Instant::now() + Duration::from_secs(30));
+    let mut afc = read_only(identity, library, &trace, deadline, 16, control).await?;
+    Ok(afc
+        .names(STAGING)
+        .await?
+        .into_iter()
+        .filter(|n| n != "." && n != "..")
+        .collect())
 }
 
 async fn read_only(
@@ -824,4 +1502,7 @@ pub(crate) fn allocation_changed(
 
 pub(crate) fn sha(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
