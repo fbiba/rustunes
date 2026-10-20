@@ -49,6 +49,8 @@ pub use insertion_batch::{
     Conversion, InsertBatchId, InsertBatchRecord, InsertBatchState, InsertIntent, InsertTarget,
     TargetOutcome,
 };
+mod session;
+pub use session::SessionIds;
 mod metadata_batch;
 pub use metadata_batch::{
     MetadataBatchId, MetadataBatchRecord, MetadataBatchState, MetadataIntent, StartedMetadataBatch,
