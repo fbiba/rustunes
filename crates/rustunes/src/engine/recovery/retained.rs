@@ -49,6 +49,8 @@ const MAX_PLAN: u64 = 32 * 1024 * 1024;
 
 pub(crate) mod playback;
 
+mod ordinary_sql;
+
 pub struct Options<'a> {
     pub run_dir: &'a Path,
     pub trace: &'a Path,
