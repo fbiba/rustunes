@@ -22,7 +22,10 @@ use std::{
 };
 use typed::*;
 
+mod model;
+
 mod rows;
+use model::compare;
 
 /// A well-formed effect that needs an independent immediate-to-current proof.
 /// This error is never completion authority. Input, schema, I/O and control
@@ -184,6 +187,63 @@ impl Wire {
             artist_wire: artist as i64,
         })
     }
+}
+pub(super) fn verify(
+    p: &PreparedAttempt,
+    source: &Metadata,
+    before_catalog: &Catalog,
+    before: Capture<'_>,
+    after: Capture<'_>,
+    out: &Path,
+    window: Window,
+    control: &Control,
+    attributes: &music_protocol::protocol::transfer::Attributes,
+) -> Result<serde_json::Value> {
+    control.check()?;
+    let w = Wire::read(p, source, before_catalog)?;
+    let h = before_catalog.source_hashes();
+    ensure!(
+        before.database_sha256 == h.database && before.wal.map(|(_, h)| h) == h.wal,
+        "ordinary before SQL differs from reconstructed operation"
+    );
+    let mut budget = Budget::new_cancellable_until(
+        control.deadline.into_std(),
+        std::sync::Arc::clone(&control.cancelled),
+    );
+    reader::directory(out)?;
+    let a = reader::materialize_with_control(before, &out.join("before"), &mut budget)?;
+    let z = reader::materialize_with_control(after, &out.join("after"), &mut budget)?;
+    let delta = serde_json::to_vec_pretty(&reader::delta(&a, &z, &budget)?)?;
+    ensure!(delta.len() <= 256 << 20, "ordinary SQL delta exceeds bound");
+    let delta_hash = reader::durable(&out.join("full-sql-delta.json"), &delta)?;
+    let result: Result<serde_json::Value> = (|| {
+        let f = before_facts(p, &w, &a, &budget)?;
+        let observed = compare(p, &w, &f, &a, &z, window, &budget)?;
+        corroborate_dates(observed.dates, p.content.source.file_bytes, attributes)?;
+        let mut receipt = serde_json::json!({"schema":"rustunes.ordinary-new-group-alac-sql",
+            "operation_sha256":hex(&Sha256::digest(&p.operation)),"before_sql":a.hashes,"after_sql":z.hashes,
+            "full_delta_sha256":hex(&delta_hash),"all45_typed_tables_checked":true,
+            "source_samples":w.ticks,"source_total_time_ms":w.millis,"before_derived_internal_slot":f.slot,
+            "before_maximum_revision":f.maximum,"new_sort_maps":observed.new_maps,
+            "receiver_dates_bits":observed.dates.map(|d|format!("{:016x}",d.to_bits())),
+            "integrity_sha256":hex(&Sha256::digest(&observed.integrity)),"recent_counter_resets":observed.recent_resets,
+            "fresh_target_birthtime_corroborated":true,"journal_completion_or_replay_authorized":false});
+        if let Some(playback) = observed.playback {
+            receipt["between_runs_playback"] = playback;
+        }
+        Ok(receipt)
+    })();
+    reader::recheck(&a, &budget)?;
+    reader::recheck(&z, &budget)?;
+    let receipt: serde_json::Value = result?;
+    budget.check()?;
+    reader::durable(
+        &out.join("receipt.json"),
+        &serde_json::to_vec_pretty(&receipt)?,
+    )?;
+    budget.check()?;
+    control.check()?;
+    Ok(receipt)
 }
 fn corroborate_dates(
     dates: [f64; 2],
