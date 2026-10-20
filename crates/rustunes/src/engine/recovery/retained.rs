@@ -51,6 +51,8 @@ pub(crate) mod playback;
 
 mod ordinary_sql;
 
+mod ordinary_bridge;
+
 pub struct Options<'a> {
     pub run_dir: &'a Path,
     pub trace: &'a Path,
@@ -268,6 +270,181 @@ fn ensure_same_started(journal: &Journal, expected: &Attempt, start: &StartEvide
         "checked recovery original Ready evidence differs from the writable journal"
     );
     Ok(())
+}
+
+/// Normal apply layout: before + step-NNNN/{input,transfer,after}; artwork
+/// layout: before + input.json + transfer. The matching input digest, not the
+/// highest step number, selects the outstanding operation. No source path is
+/// needed: exact permanent audio readback supplies the original embedded tags.
+pub(crate) async fn check<F, Fut>(
+    journal: &Journal,
+    current: &Current,
+    options: Options<'_>,
+    control: &Control,
+    mut connect: F,
+) -> Result<CheckedReconciliation>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    control.check()?;
+    ensure!(
+        control.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180),
+        "recovery exceeds 180-second whole deadline"
+    );
+    ensure_identity(journal, current)?;
+    let attempt = match dispatch(journal)? {
+        Dispatch::Local(out) => {
+            return Ok(CheckedReconciliation {
+                report: out,
+                trace: None,
+                completion: None,
+            });
+        }
+        Dispatch::Started(attempt) => attempt,
+    };
+    let mut out = report("uncertain", Some(&attempt));
+    create_trace(options.trace)?;
+    let result:Result<(CompletionEvidence,StartEvidence,Option<PathBuf>)>=async {
+        let start = journal.start_evidence(attempt.id)?.context("original Ready evidence missing")?;
+        ensure!(current.catalog.persisted_media_anchor()==attempt.prepared.current_media_anchor.checked_add(1).context("prepared anchor overflow")?,"current anchor differs from the exact prepared revision; later or absent effects remain uncertain");
+        let retained=load_run(journal,current,options.run_dir,options.trace)?;
+        let artwork_catalog_proof = if attempt.prepared.kind == AttemptKind::Artwork {
+            Some(verify_artwork_catalog(&attempt, &retained, current, &options, control.deadline)?)
+        } else { None };
+        control.check()?;
+        let mut state=FreshState::new(&current.device,&current.catalog,&current.raw_preferences,&current.plist_preferences,current.receipt_sha256)?;
+        state.bind_copied_cdb(&current.cdb)?;
+        let audio_bytes=attempt.prepared.content.source.file_bytes;
+        ensure!(audio_bytes>0&&audio_bytes<=MAX_AUDIO,"prepared audio exceeds bounded recovery readback");
+        let operations=state.state_read_chunks()?.checked_mul(4).and_then(|n|n.checked_add(audio_bytes.div_ceil(65536)*2+256)).context("recovery read budget overflow")?;
+        ensure!(operations<=MAX_BOUNDED_OPS as u64,"recovery read budget exceeds one connection allowance");
+        let provider=timeout_at(control.deadline.min(Instant::now()+Duration::from_secs(15)),connect()).await.context("recovery discovery deadline")??;
+        ensure!(provider.udid==current.device,"recovery device differs from verified identity");
+        let audio_trace=options.trace.join("audio");create_trace(&audio_trace)?;
+        let mut afc=Transfer::connect_bounded_readonly_summary(&provider,&audio_trace,control.deadline,operations as usize,Arc::clone(&control.cancelled)).await?;
+        state.verify_state(&mut afc).await?;
+        let spool=options.trace.join("permanent-audio.m4a");
+        let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&spool)?;
+        let audio_hash=afc.read_exact(&attempt.prepared.content.path,audio_bytes,MAX_AUDIO,&mut file).await?;file.sync_all()?;
+        ensure!(audio_hash==attempt.prepared.content.source.full_file_sha256,"permanent audio differs from prepared full container");
+        ensure!(fingerprint::read(&spool)?==attempt.prepared.content.source,"permanent encoded audio fingerprint differs from prepared content");
+        let held=BoundSource::open(&spool,&attempt.prepared.content.source.require_alac()?)?;
+        let mut ordinary_attributes = None;
+        let mut managed_preservation_required = false;
+        let catalog_proof=match attempt.prepared.kind {
+            AttemptKind::Insert=> {
+                let source=metadata::read(&spool)?;held.check()?;
+                let (album,artist)=insert_groups(&attempt.prepared.operation)?;
+                let mut planner=Planner::new(&retained.before,&BTreeSet::new());
+                let planned=planner.plan(&source,CandidateIds {track:attempt.prepared.content.track_pid,album:Some(album),artist:Some(artist)})?;
+                ensure!(planned.album_pid()==album&&planned.artist_pid()==artist,"retained insertion grouping differs");
+                let rebuilt=insert::prepare_live(&source,&planned,&retained.before,operation_time(&attempt.prepared.operation)?)?;
+                ensure!(rebuilt==attempt.prepared.operation,"insertion does not rebuild from exact permanent source and before catalog");
+                let expected=ExpectedInsert {track_id:attempt.prepared.content.track_pid,album_id:album,artist_id:artist,path:&attempt.prepared.content.path,file_bytes:audio_bytes,metadata:(&source).into(),presented:true};
+                // The full SQL model covers an ordinary insertion's usual
+                // shape; any other is proven as the insertion itself was.
+                if ordinary_sql::covers(&attempt.prepared,&source)? {
+                    let attributes = afc.stat(&attempt.prepared.content.path).await?.context("ordinary permanent target is absent")?;
+                    control.check()?;
+                    let proof = ordinary_bridge::verify_catalog(&attempt,&retained,current,&source,
+                        &expected,&options,control,&attributes)?;
+                    managed_preservation_required = proof.managed_preservation_required;
+                    ordinary_attributes = Some(attributes);
+                    proof.evidence
+                } else {
+                    serde_json::to_value(insert_verification::verify_insert(&retained.before,&current.catalog,&expected)?)?
+                }
+            }
+            AttemptKind::Artwork=> {
+                artwork_catalog_proof.context("verified artwork catalog proof missing")?
+            }
+        };
+        state.verify_state(&mut afc).await?;
+        let permanent_art=if let Some(art)=&attempt.prepared.content.artwork {
+            let cover=retained.cover.as_ref().context("retained cover missing")?;
+            let policy=retained.artwork_policy.context("an insertion carries no artwork")?;
+            let art_control=Control {deadline:control.deadline.min(Instant::now()+Duration::from_secs(120)),cancelled:Arc::clone(&control.cancelled)};
+            let proof=serde_json::to_value(crate::engine::verification::artwork::verify_track(current,attempt.prepared.content.track_pid,art.cache_id,cover,&options.trace.join("permanent-artwork"),&art_control,&mut connect).await?)?;
+            let protected=if let ArtworkPolicy::PreserveAlbum(album)=policy {
+                Some(crate::engine::verification::artwork::verify_album_original(current,album,cover,&options.trace.join("preserved-album"),&art_control,&mut connect).await?)
+            }else{None};
+            Some(json!({"track":proof,"preserved_album_original_after":protected}))
+        } else {None};
+        let managed_preservation = if managed_preservation_required {
+            control.check()?;
+            let bindings = journal.active_verified_bindings()?;
+            let physical = crate::engine::verification::journal::verify(journal,current,
+                crate::engine::verification::journal::Selection::All,&options.trace.join("managed-preservation"),
+                &crate::engine::verification::journal::ReadControl {deadline:control.deadline,cancelled:Arc::clone(&control.cancelled)},
+                &mut connect).await?;
+            control.check()?;
+            ordinary_bridge::require_complete_preservation(current,&bindings,&physical)?;
+            let before: BTreeSet<_> = bindings.iter().map(|b| Ok((b.content.track_pid,b.content_sha256()?,b.receipt_sha256,b.media_anchor)))
+                .collect::<Result<_>>()?;
+            let after: BTreeSet<_> = journal.active_verified_bindings()?.iter()
+                .map(|b| Ok((b.content.track_pid,b.content_sha256()?,b.receipt_sha256,b.media_anchor)))
+                .collect::<Result<_>>()?;
+            ensure!(before == after,"active managed bindings changed across recovery readback");
+            Some(json!({"report_sha256":hex(&Sha256::digest(serde_json::to_vec_pretty(&physical)?)),
+                "selected_bindings":physical.selected_bindings,"planned_audio_bytes":physical.planned_audio_bytes,
+                "planned_artwork_tracks":physical.planned_artwork_tracks,"complete_audio_and_artwork_preservation":true,
+                "original_deadline_and_cancellation_retained":true,"phone_writes":0,"journal_mutations":0}))
+        } else {None};
+        // Recheck audio/state after any image decode/read so all completion
+        // inputs remain tied to the same exact SQL/prefs/CDB snapshot.
+        state.verify_state(&mut afc).await?;
+        ensure!(afc.read_hash(&attempt.prepared.content.path,audio_bytes,MAX_AUDIO).await?==audio_hash,"permanent audio changed during recovery");
+        state.verify_state(&mut afc).await?;
+        if let Some(attributes) = ordinary_attributes {
+            ensure!(afc.stat(&attempt.prepared.content.path).await? == Some(attributes), "ordinary target attributes changed during recovery");
+        }
+        held.check()?;control.check()?;drop(afc);
+        let evidence=json!({"schema":"rustunes.completed-intent-reconciliation","attempt_id":attempt.id.as_i64().to_string(),
+            "track_id":format!("{:016x}",attempt.prepared.content.track_pid),"input_sha256":hex(&attempt.prepared.input_receipt_sha256),
+            "operation_sha256":hex(&Sha256::digest(&attempt.prepared.operation)),"original_ready_sha256":hex(&retained.ready_sha256),
+            "original_terminal_sha256":hex(&retained.terminal_sha256),"retained_pending_receipt_sha256":retained.pending_sha256.map(|h|hex(&h)),
+            "fresh_state_receipt_sha256":hex(&current.receipt_sha256),"catalog":catalog_proof,"permanent_audio_sha256":hex(&audio_hash),
+            "permanent_artwork":permanent_art,"managed_preservation":managed_preservation,"media_anchor":current.catalog.persisted_media_anchor(),"phone_writes":0,"replay_attempted":false});
+        let bytes=serde_json::to_vec_pretty(&evidence)?;let hash=Sha256::digest(&bytes).into();
+        durable_write(options.trace,"verified-evidence.json",&bytes)?;
+        control.check()?;
+        Ok((CompletionEvidence {track_pid:attempt.prepared.content.track_pid,path:attempt.prepared.content.path.clone(),
+            audio_bytes,audio_file_sha256:audio_hash,artwork_sha256:attempt.prepared.content.artwork.as_ref().map(|a|a.sha256),media_anchor:current.catalog.persisted_media_anchor(),receipt_sha256:hash},start,
+            (attempt.prepared.kind==AttemptKind::Insert).then(||retained.source.clone()).flatten()))
+    }.await;
+    let completion = match result {
+        Ok((evidence, start, source)) => {
+            out.evidence_sha256 = Some(hex(&evidence.receipt_sha256));
+            Some(CheckedCompletion {
+                attempt,
+                start,
+                identity: Identity::new(&current.device, &current.library)?,
+                evidence,
+                source,
+                control: Control {
+                    deadline: control.deadline,
+                    cancelled: Arc::clone(&control.cancelled),
+                },
+            })
+        }
+        Err(error) => {
+            out.reason = Some(format!("{error:#}").chars().take(2048).collect());
+            None
+        }
+    };
+    if completion.is_none() {
+        durable_write(
+            options.trace,
+            "recovery.json",
+            &serde_json::to_vec_pretty(&out)?,
+        )?;
+    }
+    Ok(CheckedReconciliation {
+        report: out,
+        trace: Some(options.trace.to_owned()),
+        completion,
+    })
 }
 
 fn verify_artwork_catalog(
@@ -1296,3 +1473,6 @@ fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+mod tests;
