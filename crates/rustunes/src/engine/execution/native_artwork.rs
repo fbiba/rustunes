@@ -158,6 +158,186 @@ pub struct PendingVerification {
     pub evidence: ArtworkEvidence,
 }
 
+pub async fn execute<F, Fut>(
+    journal: &mut Journal,
+    update: ArtworkUpdate<'_, '_>,
+    control: &Control,
+    connect: F,
+) -> Result<PendingVerification>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DeviceProvider>>,
+{
+    control.check()?;
+    ensure!(
+        control.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(180),
+        "artwork deadline exceeds 180-second bound"
+    );
+    let attempt = journal.attempt(update.attempt)?;
+    ensure!(
+        attempt.state == AttemptState::Prepared && attempt.prepared.kind == AttemptKind::Artwork,
+        "engine requires one unstarted Artwork attempt"
+    );
+    let prepared = &attempt.prepared;
+    let state = update.state;
+    let source = BoundSource::open(update.source, update.desired_source)?;
+    let current = fingerprint::read(update.source)?;
+    ensure!(
+        current == *update.desired_source,
+        "desired source fingerprint changed"
+    );
+    let art = artwork::read(update.source)?;
+    source.check()?;
+    ensure!(
+        art.source_size == current.file_bytes && art.source_sha256 == current.full_file_sha256,
+        "artwork source differs from validated source"
+    );
+    let cover = art
+        .cover
+        .context("desired source contains no supported JPEG or PNG cover")?;
+    validate_preparation(journal, prepared, state, &current, &cover)?;
+    let asset_id = (prepared.content.track_pid as i64).to_string();
+    let policy = state.common.ancillary().artwork(&asset_id)?;
+    policy.ensure_session(
+        state.common.library_identity().library_id(),
+        state.common.media_anchor(),
+    )?;
+    let templates = templates::build_from_copied_cdb(
+        &state.copied_cdb,
+        state.catalog,
+        state.common.library_identity(),
+        update.host_name,
+    )?;
+    let session_prepared = session::prepare(
+        templates.request,
+        &templates.finished,
+        state.common.library_identity().library_id(),
+        state.common.media_anchor(),
+    )?;
+    let operations = operation_budget(
+        state.common.state_read_chunks()?,
+        state.artwork_bytes,
+        prepared.content.source.file_bytes,
+        cover.bytes.len() as u64,
+    )?;
+    create_trace(update.trace)?;
+    durable_write(update.trace, "operation.plist", &prepared.operation)?;
+    durable_write(update.trace, "source-cover.jpg", &cover.bytes)?;
+    durable_write(
+        update.trace,
+        "artwork-input.plist",
+        &input_receipt(prepared, state, &current)?,
+    )?;
+
+    let result = async {
+        control.check()?;
+        let provider = timeout_at(
+            control
+                .deadline
+                .min(Instant::now() + Duration::from_secs(15)),
+            connect(),
+        )
+        .await
+        .context("artwork discovery deadline")??;
+        ensure!(
+            provider.udid == state.common.device_identifier(),
+            "discovered device differs from prepared artwork state"
+        );
+        let mut afc = Transfer::connect_bounded(
+            &provider,
+            update.trace,
+            control.deadline,
+            operations,
+            Arc::clone(&control.cancelled),
+        )
+        .await?;
+        let stage = format!("Airlock/Media/Artwork/{asset_id}");
+        preflight(&mut afc, state, &prepared.content, &stage).await?;
+        control.check()?;
+        let mut session =
+            Session::connect(&provider, session_prepared, update.trace, control.deadline).await?;
+        // Recheck the exact state in this Ready session, before ANY AFC write.
+        preflight(&mut afc, state, &prepared.content, &stage).await?;
+        source.check()?;
+        control.check()?;
+        let signature = session.sign_metadata(&prepared.operation)?;
+        durable_write(update.trace, "operation.cig", &signature)?;
+        sync_trace(update.trace)?;
+        let ready = session.ready_receipt_sha256();
+        let permit = journal.mark_started(
+            update.attempt,
+            StartEvidence {
+                ready_media_anchor: state.common.media_anchor(),
+                ready_receipt_sha256: ready,
+                signature,
+            },
+        )?;
+        // This durable transition is the sole gate to mutating operations.
+        session.stage_metadata(&mut afc, &permit).await?;
+        control.check()?;
+        session.finish_metadata().await?;
+        session.wait_for_artwork_with_policy(&policy).await?;
+        source.check()?;
+        crate::engine::execution::native_insert::staging_folders(&mut afc, true).await?;
+        afc.require_absent(&stage).await?;
+        let uploaded = afc
+            .write_new(
+                &stage,
+                &mut Cursor::new(&cover.bytes),
+                cover.bytes.len() as u64,
+            )
+            .await?;
+        ensure!(
+            uploaded == cover.sha256,
+            "artwork upload digest differs; partial stage retained"
+        );
+        source.check()?;
+        control.check()?;
+        session.complete_artwork(&asset_id).await?;
+        session.wait_finished().await?;
+        let terminal = session.terminal_receipt_sha256()?;
+        drop(session);
+        let permanent = verify_audio(&mut afc, &prepared.content).await?;
+        source.check()?;
+        control.check()?;
+        drop(afc);
+        let mut evidence = ArtworkEvidence {
+            content: prepared.content.clone(),
+            desired_source_sha256: current.full_file_sha256,
+            desired_source_bytes: current.file_bytes,
+            operation_sha256: Sha256::digest(permit.operation()).into(),
+            ready_receipt_sha256: ready,
+            terminal_receipt_sha256: terminal,
+            permanent_audio_sha256: permanent,
+            // The write's replies and the stored size confirmed these bytes.
+            staged_cover_sha256: uploaded,
+            media_anchor: state
+                .common
+                .media_anchor()
+                .checked_add(1)
+                .context("Media anchor exhausted")?,
+            receipt_sha256: [0; 32],
+        };
+        let receipt = evidence_plist(&evidence)?;
+        evidence.receipt_sha256 = Sha256::digest(&receipt).into();
+        durable_write(update.trace, "pending-verification.plist", &receipt)?;
+        sync_trace(update.trace)?;
+        Ok(PendingVerification { permit, evidence })
+    }
+    .await;
+    if let Err(error) = &result {
+        let _ = durable_write(
+            update.trace,
+            "error.txt",
+            format!(
+                "{error:#}\nNo retry or cleanup attempted. Reconcile any Started journal attempt.\n"
+            )
+            .as_bytes(),
+        );
+    }
+    result
+}
+
 fn validate_preparation(
     journal: &Journal,
     prepared: &PreparedAttempt,
@@ -413,3 +593,39 @@ fn input_receipt(
     d.insert("GeniusProvider".into(), "Disabled".into());
     binary(d)
 }
+fn evidence_plist(e: &ArtworkEvidence) -> Result<Vec<u8>> {
+    let art = e
+        .content
+        .artwork
+        .as_ref()
+        .context("artwork evidence missing cover")?;
+    let mut d = Dictionary::new();
+    d.insert(
+        "Status".into(),
+        "PendingIndependentCatalogVerification".into(),
+    );
+    d.insert("TrackPID".into(), (e.content.track_pid as i64).into());
+    d.insert("PermanentPath".into(), e.content.path.clone().into());
+    d.insert(
+        "TransferredAudioBytes".into(),
+        e.content.source.file_bytes.into(),
+    );
+    d.insert("DesiredSourceBytes".into(), e.desired_source_bytes.into());
+    d.insert("CoverBytes".into(), art.bytes.into());
+    d.insert("CacheID".into(), art.cache_id.into());
+    d.insert("MediaAnchor".into(), e.media_anchor.into());
+    for (name, hash) in [
+        ("OperationSHA256", e.operation_sha256),
+        ("ReadyFrameSHA256", e.ready_receipt_sha256),
+        ("TerminalFrameSHA256", e.terminal_receipt_sha256),
+        ("PermanentAudioSHA256", e.permanent_audio_sha256),
+        ("DesiredSourceSHA256", e.desired_source_sha256),
+        ("StagedCoverSHA256", e.staged_cover_sha256),
+    ] {
+        d.insert(name.into(), hex(&hash).into());
+    }
+    binary(d)
+}
+
+#[cfg(test)]
+mod tests;

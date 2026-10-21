@@ -18,6 +18,7 @@ pub use observation::Observation;
 pub(crate) mod planning;
 pub(crate) mod state;
 pub(crate) mod verification;
+pub use crate::engine::execution::cover::Options as CoverRequest;
 pub use crate::engine::execution::device::{Config as DeviceConfig, Event as DeviceEvent};
 pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
@@ -93,6 +94,13 @@ impl Engine {
     pub async fn verify(&self, request: VerificationRequest<'_>) -> Result<VerificationResult> {
         self.check()?;
         self.scope(Box::pin(verification::run(request, self))).await
+    }
+    pub async fn cover(&self, request: CoverRequest<'_>) -> Result<CoverResult> {
+        self.check()?;
+        self.scope(Box::pin(crate::engine::execution::cover::run(
+            request, self,
+        )))
+        .await
     }
     /// Scope an engine operation or CLI command to this explicit device
     /// configuration. Nested engines remain isolated from one another.
