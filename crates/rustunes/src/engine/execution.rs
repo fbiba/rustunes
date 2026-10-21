@@ -5,6 +5,7 @@ pub(crate) mod cover;
 pub(crate) mod device;
 pub(crate) mod flac_to_alac;
 pub(crate) mod insert;
+pub(crate) mod insert_batch;
 pub(crate) mod metadata_batch;
 pub(crate) mod native_artwork;
 pub(crate) mod native_insert;
