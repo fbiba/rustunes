@@ -1060,6 +1060,218 @@ impl std::fmt::Display for CutShort {
 }
 impl std::error::Error for CutShort {}
 
+/// Insert `members` in order, at most `batch_size` per session. Each batch is
+/// planned from a fresh capture under `run/batch-NNN` and settled before the
+/// next starts. The first batch's session removes `removals` (fewer than
+/// `batch_size`, what a sync's removal left it) before its insertions, in
+/// the same operation budget; when no batch runs they go in removal batches
+/// of their own under `run/removal`. Returns the batches and the tracks
+/// removed. `progress(settled, inserted, total)` runs after each batch, and
+/// `left_out(member)` for each cover a batch leaves out to keep its album's
+/// image. A batch that is not Verified stops the run; one that was undone
+/// cleanly stops it with `CutShort`. FLACs to convert need `converter`, which
+/// converts a few at a time ahead of their batches (`lookahead`), and
+/// `refused(member, why)` runs for each that is not sent, as its batch
+/// begins.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn add_all(
+    journal_path: &Path,
+    identity: &Identity,
+    mut removals: Vec<u64>,
+    members: &mut [Member],
+    collection: [u8; 32],
+    batch_size: usize,
+    coordination: Option<CoordinationId>,
+    run_directory: &Path,
+    host_name: &str,
+    control: impl Fn() -> Control,
+    converter: Option<&flac_to_alac::Converter>,
+    mut progress: impl FnMut(&Settled, usize, usize) -> Result<()>,
+    mut left_out: impl FnMut(&Member) -> Result<()>,
+    mut refused: impl FnMut(&Member, &anyhow::Error) -> Result<()>,
+) -> Result<(Vec<Settled>, usize)> {
+    ensure!(
+        removals.len() < batch_size,
+        "a batch's session removes fewer tracks than the batch size"
+    );
+    let total = members.len();
+    let bytes = members
+        .iter()
+        .map(|m| std::fs::metadata(&m.source).map_or(0, |m| m.len()))
+        .sum();
+    let mut conversions = match converter {
+        Some(converter) => {
+            lookahead::Lookahead::ffmpeg(members, batch_size, converter, control().cancelled)?
+        }
+        None => {
+            ensure!(
+                members.iter().all(|m| !m.convert),
+                "sending a FLAC as ALAC needs FFmpeg (--flac-to-alac)"
+            );
+            None
+        }
+    };
+    let mut settled = Vec::new();
+    let mut inserted = 0;
+    let mut removed = 0;
+    let mut start = 0;
+    for number in 0.. {
+        if start == total {
+            break;
+        }
+        // The removals take their share of the first session's budget. A
+        // batch of FLACs ends where their conversions stop fitting.
+        let budget = batch_size - removals.len();
+        let end = match conversions.as_ref() {
+            Some(conversions) => conversions.fitting(start, total.min(start + budget))?,
+            None => total.min(start + budget),
+        };
+        let offset = std::mem::replace(&mut start, end);
+        let batches = number + 1 + (total - end).div_ceil(batch_size);
+        let chunk = &mut members[offset..end];
+        let sendable = match conversions.as_mut() {
+            Some(conversions) => conversions.batch(chunk, offset, &mut refused).await?,
+            None => chunk.len(),
+        };
+        let chunk = &mut chunk[..sendable];
+        if chunk.is_empty() {
+            continue;
+        }
+        crate::engine::observe(crate::engine::Event::InsertBatchStarted {
+            number: number + 1,
+            batches,
+            tracks: chunk.len(),
+            inserted,
+            total,
+            bytes,
+            removals: removals.len(),
+        })?;
+        let control = control();
+        let directory = run_directory.join(format!("batch-{:03}", number + 1));
+        // A removal target's file may be gone after an earlier removal of it
+        // that the phone rolled back.
+        let before = match removals.is_empty() {
+            true => removal_batch::capture_before(&directory, identity, &control).await?,
+            false => {
+                let taken = removal_batch::taken(journal_path, identity)?;
+                removal_batch::capture_for_removal(&directory, identity, &taken, &control).await?
+            }
+        };
+        for member in keep_album_images(
+            &before.current,
+            &before.directory,
+            chunk,
+            &control,
+            device::provider,
+        )
+        .await?
+        {
+            left_out(member)?;
+        }
+        let chunk = &*chunk;
+        let mut journal = Journal::open(journal_path, identity)?;
+        let session = std::mem::take(&mut removals);
+        let batch = run(
+            &mut journal,
+            identity,
+            &before,
+            &session,
+            chunk,
+            collection,
+            coordination,
+            host_name,
+            &control,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "{inserted} of {} tracks were inserted before this batch",
+                total
+            )
+        })?;
+        drop(journal);
+        removed += batch.removed;
+        // The batch is settled: its conversions are done with.
+        for member in chunk.iter().filter(|m| m.conversion.is_some()) {
+            flac_to_alac::remove(&member.source)?;
+        }
+        if batch.state == InsertBatchState::Partial {
+            let record = Journal::open(journal_path, identity)?.insert_batch(batch.batch)?;
+            let unfilled = unfilled(&record).len();
+            let removal = compensate(journal_path, identity, &record, host_name, &control)
+                .await
+                .with_context(|| {
+                    format!(
+                        "insert batch {} left {unfilled} rows without audio and their removal did not finish; run resume",
+                        batch.batch.as_i64()
+                    )
+                })?;
+            ensure!(
+                removal.state == crate::engine::state::journal::BatchState::Verified,
+                "insert batch {} left {unfilled} rows without audio; removal batch {} ended {}; run resume",
+                batch.batch.as_i64(),
+                removal.batch.as_i64(),
+                removal.state.as_str()
+            );
+            return Err(CutShort(
+                format!(
+                    "insert batch {} added {} of its {} tracks; removal batch {} took the {unfilled} rows without audio out again. {} of {} tracks were inserted",
+                    batch.batch.as_i64(),
+                    batch.inserted,
+                    chunk.len(),
+                    removal.batch.as_i64(),
+                    inserted + batch.inserted,
+                    total
+                ),
+                removed,
+            )
+            .into());
+        }
+        if batch.state == InsertBatchState::Compensated {
+            return Err(CutShort(
+                format!(
+                    "insert batch {} added {} of its {} tracks; the phone took the others out again itself. {} of {} tracks were inserted",
+                    batch.batch.as_i64(),
+                    batch.inserted,
+                    chunk.len(),
+                    inserted + batch.inserted,
+                    total
+                ),
+                removed,
+            )
+            .into());
+        }
+        ensure!(
+            batch.state == InsertBatchState::Verified,
+            "insert batch {} ended {}; {inserted} of {} tracks were inserted",
+            batch.batch.as_i64(),
+            batch.state.as_str(),
+            total
+        );
+        inserted += batch.inserted;
+        progress(&batch, inserted, total)?;
+        settled.push(batch);
+    }
+    if !removals.is_empty() {
+        let directory = run_directory.join("removal");
+        create_trace(&directory)?;
+        let alone = Box::pin(removal_batch::remove_all(
+            journal_path,
+            identity,
+            &removals,
+            batch_size,
+            coordination,
+            &directory,
+            host_name,
+            control,
+            |_, _, _| Ok(()),
+        ))
+        .await?;
+        removed += alone.iter().map(|b| b.removed).sum::<usize>();
+    }
+    Ok((settled, removed))
+}
+
 /// Clear the cover of each member that must keep its album's image unless
 /// the album's permanent original in `current` is exactly that cover, and
 /// record each finding in `directory/album-images.json`. A kept cover leaves
@@ -2097,3 +2309,7 @@ fn connections(operations: &[usize]) -> Vec<Option<usize>> {
     }
     opens
 }
+
+mod lookahead;
+#[cfg(test)]
+mod tests;
