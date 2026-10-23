@@ -26,6 +26,10 @@ pub use events::Event;
 pub use execution::pull::{
     NOT_IN_LIBRARY, PhoneTrack as PulledTrack, Report as PullResult, Request as PullRequest,
 };
+pub use planning::metadata_intent::{
+    MetadataIntent, MetadataPlan, MetadataPlanRequest, MetadataPlanResult, MetadataRequestDocument,
+    MetadataWireCandidate,
+};
 pub use planning::{PlanRequest, PlanResult};
 pub use verification::VerificationRequest;
 
@@ -85,6 +89,9 @@ impl Engine {
     }
     pub fn plan(&self, request: PlanRequest<'_>) -> Result<PlanResult> {
         self.with_observer(|| planning::run(request, self))
+    }
+    pub fn plan_metadata(&self, request: MetadataPlanRequest<'_>) -> Result<MetadataPlanResult> {
+        self.with_observer(|| planning::metadata_intent::run(request, self))
     }
     pub(crate) fn selected_device(&self) -> Option<&str> {
         self.config.device.selected_device()

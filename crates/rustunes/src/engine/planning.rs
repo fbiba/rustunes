@@ -105,8 +105,10 @@ pub(super) fn run(request: PlanRequest<'_>, engine: &Engine) -> Result<PlanResul
 
 pub(crate) mod additive;
 pub(crate) mod candidates;
+pub(crate) mod change;
 pub(crate) mod collections;
 pub(crate) mod metadata_edit;
+pub(crate) mod metadata_intent;
 pub(crate) mod removal;
 pub(crate) mod saved_plan;
 pub(crate) mod source_collection;
