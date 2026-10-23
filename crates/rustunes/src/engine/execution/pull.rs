@@ -71,6 +71,238 @@ pub struct PhoneTrack {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub schema: &'static str,
+    pub run: PathBuf,
+    /// The journal the pull wrote (in the run directory for a dry run).
+    pub journal: PathBuf,
+    /// The earlier journal it carried forward, and whether another version
+    /// of rustunes wrote it.
+    pub earlier: Option<PathBuf>,
+    pub superseded: bool,
+    pub phone_tracks: usize,
+    /// Bindings of the earlier journal the capture confirmed.
+    pub carried: usize,
+    /// Phone tracks newly bound to a library file.
+    pub matched: usize,
+    /// Phone tracks `--tracks` copied into the library and bound.
+    pub copied: Vec<PhoneTrack>,
+    /// Phone tracks left unbound: no library file holds their audio.
+    pub unbound: Vec<PhoneTrack>,
+    /// Bindings of the earlier journal whose track the phone no longer holds.
+    pub gone: usize,
+    /// Phone covers read back as the image their binding expects, under a
+    /// cache ID the earlier journal did not record (the phone was cleared
+    /// and the cover sent again) or for a newly matched track.
+    pub covers_proven: usize,
+    /// Phone covers that could not be proven so; the next sync sends them.
+    pub covers_unproven: usize,
+    pub unfinished: Vec<String>,
+    pub unreadable: Vec<String>,
+    /// Whether the new journal is now the one in use.
+    pub installed: bool,
+}
+
+pub(crate) async fn run(request: Request<'_>, engine: &crate::engine::Engine) -> Result<Report> {
+    engine.check()?;
+    ensure!(
+        (1..=1800).contains(&request.seconds),
+        "capture deadline must be 1..1800 seconds"
+    );
+    if let Some(into) = request.tracks_into {
+        ensure!(
+            fs::metadata(into).is_ok_and(|m| m.is_dir()),
+            "{} is not a directory to copy tracks into",
+            into.display()
+        );
+    }
+    let options = SelectionOptions {
+        recursive: request.recursive,
+        ..Default::default()
+    };
+    let mut library = request
+        .library
+        .map(|path| engine.with_observer(|| inspect_library(path, &options)))
+        .transpose()?;
+    // Files an earlier `pull --tracks` placed outside the library are matched
+    // too, so a second pull does not copy them again.
+    if let Some(into) = request.tracks_into {
+        let into = fs::canonicalize(into)?;
+        match &mut library {
+            Some(library) if library.holds(&into) => {}
+            Some(library) => {
+                let placed = engine.with_observer(|| inspect_library(&into, &options))?;
+                library.files.extend(placed.files);
+            }
+            None => library = Some(engine.with_observer(|| inspect_library(&into, &options))?),
+        }
+    }
+    let run = layout::new_run(request.state)?;
+    engine.emit(crate::engine::Event::RunEvidence(&run))?;
+    engine.emit(crate::engine::Event::ReadingDeviceSnapshot)?;
+    let path = run.join("snapshot");
+    let absent = crate::engine::state::audio_index::Absent {
+        gone: true,
+        ..crate::engine::state::audio_index::Absent::NONE
+    };
+    audio_capture::capture_allowing(
+        &path,
+        absent,
+        &engine.control(request.seconds),
+        device::provider,
+    )
+    .await?;
+    let saved = snapshot::open_allowing(&path, absent)?;
+    let identity = identity(&saved)?;
+    let journal = layout::journal_path(
+        request.state,
+        &saved.identity.device_identifier_sha256,
+        &saved.identity.library_identity_sha256,
+    )?;
+    let (earlier, superseded, prior) = match find_prior(
+        request.state,
+        &journal,
+        &identity,
+        matcher(&saved),
+        &run,
+    )? {
+        Some(found) => {
+            if !found.superseded && !found.prior.unfinished.is_empty() {
+                bail!(
+                    "the journal has {}; settle it first with `rustunes resume` or by running the command that started it again, then pull",
+                    found.prior.unfinished.join(" and ")
+                );
+            }
+            (Some(found.path), found.superseded, Some(found.prior))
+        }
+        None => (None, false, None),
+    };
+    let mut reconciled = reconcile_saved(&saved, prior.as_ref(), library.as_ref());
+    // A dry run copies nothing: the tracks it would copy are listed unbound.
+    if let Some(into) = request.tracks_into.filter(|_| !request.dry_run) {
+        copy_unbound(
+            &mut reconciled,
+            &saved,
+            into,
+            library.as_ref(),
+            engine,
+            request.seconds,
+        )
+        .await?;
+    }
+    let covers = prove_covers(
+        &mut reconciled,
+        &identity,
+        &run,
+        &engine.control(request.seconds),
+    )
+    .await?;
+    let target = if request.dry_run {
+        run.join("journal")
+    } else {
+        journal.clone()
+    };
+    write(
+        &target,
+        &identity,
+        receipt(&saved),
+        &reconciled.pulled,
+        prior.as_ref(),
+        request.dry_run,
+    )?;
+    let report = Report {
+        schema: "rustunes.pull",
+        run,
+        journal: target,
+        earlier,
+        superseded,
+        phone_tracks: reconciled.phone_tracks,
+        carried: reconciled.carried,
+        matched: reconciled.matched,
+        copied: reconciled.copied,
+        unbound: reconciled.unbound,
+        gone: reconciled.gone,
+        covers_proven: covers.proven,
+        covers_unproven: covers.unproven,
+        unfinished: prior
+            .as_ref()
+            .map(|p| p.unfinished.clone())
+            .unwrap_or_default(),
+        unreadable: prior
+            .as_ref()
+            .map(|p| p.unreadable.clone())
+            .unwrap_or_default(),
+        installed: !request.dry_run,
+    };
+    private_write(
+        &report.run.join("pull.json"),
+        &serde_json::to_vec_pretty(&report)?,
+    )?;
+    Ok(report)
+}
+
+/// The journal for this capture's phone and library, carried forward first
+/// when this build cannot use the one there (`Superseded`) or when there is
+/// none but an earlier journal elsewhere in `state` knows the phone's tracks.
+/// A current journal, or no journal and nothing to carry, is left alone.
+/// `library` is the directory phone tracks are matched to, with its
+/// subfolders when `recursive`. Progress goes to the engine scope's observer.
+pub(crate) async fn current_journal(
+    state: &Path,
+    saved: &snapshot::Snapshot,
+    library: Option<&Path>,
+    recursive: bool,
+    run: &Path,
+    control: &Control,
+) -> Result<PathBuf> {
+    let identity = identity(saved)?;
+    let journal = layout::journal_path(
+        state,
+        &saved.identity.device_identifier_sha256,
+        &saved.identity.library_identity_sha256,
+    )?;
+    if journal.try_exists()? {
+        match Journal::open_read_only(&journal, &identity) {
+            Ok(_) => return Ok(journal),
+            Err(error) if crate::engine::state::journal::is_superseded(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let Some(found) = find_prior(state, &journal, &identity, matcher(saved), run)? else {
+        return Ok(journal);
+    };
+    let options = SelectionOptions {
+        recursive,
+        ..Default::default()
+    };
+    let library = library
+        .map(|path| inspect_library(path, &options))
+        .transpose()?;
+    let mut reconciled = reconcile_saved(saved, Some(&found.prior), library.as_ref());
+    let covers = prove_covers(&mut reconciled, &identity, run, control).await?;
+    write(
+        &journal,
+        &identity,
+        receipt(saved),
+        &reconciled.pulled,
+        Some(&found.prior),
+        false,
+    )?;
+    crate::engine::observe(crate::engine::Event::JournalCarried {
+        earlier: &found.path,
+        journal: &journal,
+        carried: reconciled.carried,
+        matched: reconciled.matched,
+        unbound: reconciled.unbound.len(),
+        gone: reconciled.gone,
+        covers_proven: covers.proven,
+        covers_unproven: covers.unproven,
+        unfinished: &found.prior.unfinished,
+    })?;
+    Ok(journal)
+}
+
 /// The capture a pull's bindings were verified against.
 fn receipt(saved: &snapshot::Snapshot) -> (&[u8; 32], u32) {
     (
@@ -137,6 +369,73 @@ struct Found {
     prior: Prior,
 }
 
+/// The earlier journal this pull carries forward. The journal at `journal`,
+/// when there is one; otherwise the one in `state` whose bindings the capture
+/// confirms most often (another location means other identity digests), or
+/// `journal.previous` left by an interrupted pull.
+fn find_prior(
+    state: &Path,
+    journal: &Path,
+    identity: &Identity,
+    matches: impl Fn(u64, &str, &TransferredSource) -> bool,
+    run: &Path,
+) -> Result<Option<Found>> {
+    let scratch = run.join("earlier-journals");
+    fs::DirBuilder::new().mode(0o700).create(&scratch)?;
+    if journal.try_exists()? {
+        let superseded = match Journal::open_read_only(journal, identity) {
+            Ok(_) => false,
+            Err(error) if crate::engine::state::journal::is_superseded(&error) => true,
+            Err(error) => return Err(error),
+        };
+        return Ok(Some(Found {
+            path: journal.to_path_buf(),
+            superseded,
+            prior: crate::engine::state::journal::read_prior(journal, &scratch.join("0"))?,
+        }));
+    }
+    let mut candidates = vec![sibling(journal, "journal.previous")];
+    if let Ok(devices) = fs::read_dir(state.join("devices")) {
+        for device in devices.flatten() {
+            if let Ok(libraries) = fs::read_dir(device.path()) {
+                for library in libraries.flatten() {
+                    candidates.push(library.path().join("journal"));
+                }
+            }
+        }
+    }
+    let mut best: Option<(usize, Found)> = None;
+    for (n, candidate) in candidates.into_iter().enumerate() {
+        if candidate == journal || !candidate.join("journal.sqlite").is_file() {
+            continue;
+        }
+        // An unreadable candidate is not this phone's journal.
+        let Ok(prior) =
+            crate::engine::state::journal::read_prior(&candidate, &scratch.join(n.to_string()))
+        else {
+            continue;
+        };
+        let confirmed = prior
+            .bindings
+            .iter()
+            .filter(|b| matches(b.content.track_pid, &b.content.path, &b.content.source))
+            .count();
+        if confirmed > 0 && best.as_ref().is_none_or(|(most, _)| confirmed > *most) {
+            // Any journal elsewhere this build cannot open as this phone's.
+            let superseded = Journal::open_read_only(&candidate, identity).is_err();
+            best = Some((
+                confirmed,
+                Found {
+                    path: candidate,
+                    superseded,
+                    prior,
+                },
+            ));
+        }
+    }
+    Ok(best.map(|(_, found)| found))
+}
+
 fn sibling(journal: &Path, name: &str) -> PathBuf {
     journal.with_file_name(name)
 }
@@ -189,6 +488,115 @@ fn source_cover(path: &Path) -> Option<(u64, [u8; 32])> {
             .cover
     }?;
     Some((cover.bytes.len() as u64, cover.sha256))
+}
+
+/// Read back each cover `reconciled` names, in groups sharing a connection,
+/// against its source file's cover (what sync compares a binding's with),
+/// or the image its earlier binding recorded when the source has none to
+/// read. A cover read back exactly goes in its binding, so the next sync
+/// keeps it instead of sending it again; one that differs or cannot be read
+/// is left out, and that sync sends it. Nothing is written to the phone.
+async fn prove_covers(
+    reconciled: &mut Reconciled,
+    identity: &Identity,
+    run: &Path,
+    control: &Control,
+) -> Result<Covers> {
+    let traces = run.join("covers");
+    let mut checks = Vec::new();
+    let mut owners = Vec::new();
+    for candidate in std::mem::take(&mut reconciled.covers) {
+        let pulled = &reconciled.pulled[candidate.pulled];
+        let source = pulled.source.as_deref().and_then(source_cover);
+        let expected = source.or(candidate.earlier);
+        let Some((bytes, sha256)) = expected else {
+            continue;
+        };
+        checks.push(TrackCheck {
+            target: pulled.content.track_pid,
+            expected: TrackArtworkExpectation {
+                cache_id: candidate.cache_id,
+                bytes,
+                sha256,
+            },
+            trace: traces.join(format!("cover-{:04}", owners.len())),
+        });
+        owners.push(candidate.pulled);
+    }
+    let total = checks.len();
+    let mut covers = Covers {
+        proven: 0,
+        unproven: total,
+    };
+    if checks.is_empty() {
+        return Ok(covers);
+    }
+    fs::DirBuilder::new().mode(0o700).create(&traces)?;
+    let current = current::capture_controlled(
+        &traces.join("state"),
+        identity,
+        control.deadline,
+        Arc::clone(&control.cancelled),
+    )
+    .await?;
+    let (mut tried, mut failures, mut group) = (0, 0, 0);
+    while !checks.is_empty() && failures < COVER_FAILURE_RUN {
+        if control.cancelled.load(Ordering::Relaxed) {
+            bail!("pull cancelled while reading covers back; no journal was written");
+        }
+        if Instant::now() >= control.deadline {
+            break;
+        }
+        let group_control = Control {
+            deadline: control
+                .deadline
+                .min(Instant::now() + Duration::from_secs(120)),
+            cancelled: Arc::clone(&control.cancelled),
+        };
+        let result = artwork::verify_track_group(
+            &current,
+            &checks,
+            &traces.join(format!("group-{group:04}")),
+            &group_control,
+            &BTreeSet::new(),
+            device::provider,
+            |position| {
+                crate::engine::observe(crate::engine::Event::Observation(
+                    crate::engine::Observation::VerifyingArtwork {
+                        number: tried + position + 1,
+                        total,
+                    },
+                ))
+            },
+        )
+        .await;
+        group += 1;
+        match result {
+            Ok(proofs) => {
+                let proved = proofs.len();
+                for (check, owner) in checks.drain(..proved).zip(owners.drain(..proved)) {
+                    let expected = check.expected;
+                    reconciled.pulled[owner].content.artwork = Some(Artwork {
+                        cache_id: expected.cache_id,
+                        bytes: expected.bytes,
+                        sha256: expected.sha256,
+                    });
+                }
+                covers.proven += proved;
+                tried += proved;
+                failures = 0;
+            }
+            Err((position, _)) => {
+                // That cover stays unproven; the next sync sends it.
+                checks.remove(position);
+                owners.remove(position);
+                tried += 1;
+                failures += 1;
+            }
+        }
+    }
+    covers.unproven = total - covers.proven;
+    Ok(covers)
 }
 
 /// A phone track with its audio, as a capture shows it.
@@ -536,6 +944,158 @@ fn write(
     Ok(())
 }
 
+/// `pull --tracks`: copy each unbound phone track into `into` as
+/// "Artist - Title.ext", check the copy against the capture byte for byte,
+/// and bind it to its copy. A name already taken gets " (2)", " (3)", ...;
+/// no file is overwritten. Each copy is written beside its final name as
+/// ".<track ID>.rustunes-pull", which no selection takes, and linked into
+/// place once checked.
+async fn copy_unbound(
+    reconciled: &mut Reconciled,
+    saved: &snapshot::Snapshot,
+    into: &Path,
+    library: Option<&Library>,
+    engine: &crate::engine::Engine,
+    seconds: u64,
+) -> Result<()> {
+    let unbound = std::mem::take(&mut reconciled.unbound);
+    let copyable: Vec<_> = unbound
+        .iter()
+        .filter(|t| t.reason.as_deref() == Some(NOT_IN_LIBRARY))
+        .cloned()
+        .collect();
+    reconciled.unbound = unbound
+        .into_iter()
+        .filter(|t| t.reason.as_deref() != Some(NOT_IN_LIBRARY))
+        .collect();
+    if copyable.is_empty() {
+        return Ok(());
+    }
+    let into = fs::canonicalize(into)?;
+    let provider = device::provider().await?;
+    let mut afc = tokio::time::timeout(
+        Duration::from_secs(20),
+        music_protocol::protocol::afc::connect_checked(&provider),
+    )
+    .await
+    .context("timed out connecting to the phone's files")??;
+    let mut used = BTreeSet::new();
+    let total = copyable.len();
+    let bytes_total = copyable
+        .iter()
+        .filter_map(|t| u64::from_str_radix(&t.track_id, 16).ok())
+        .filter_map(|pid| file_identity(&saved.index, pid))
+        .map(|(_, bytes)| bytes)
+        .sum();
+    let mut bytes_done = 0;
+    for (number, mut track) in copyable.into_iter().enumerate() {
+        let pid = u64::from_str_radix(&track.track_id, 16)?;
+        let (sha, bytes) =
+            file_identity(&saved.index, pid).context("pulled track has no indexed audio")?;
+        engine.emit(crate::engine::Event::PullingTrack {
+            number: number + 1,
+            total,
+            track_id: pid,
+            title: &track.title,
+            artist: &track.artist,
+            bytes,
+            bytes_done,
+            bytes_total,
+        })?;
+        bytes_done += bytes;
+        let control = engine.control(seconds);
+        let phone = saved
+            .catalog
+            .tracks()
+            .iter()
+            .find(|t| t.sync_id == pid)
+            .and_then(|t| t.afc_path.clone())
+            .context("pulled track has no file")?;
+        let extension = Path::new(&phone)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("m4a")
+            .to_ascii_lowercase();
+        let staged = into.join(format!(".{pid:016x}.rustunes-pull"));
+        if staged.try_exists()? {
+            // Only an interrupted pull leaves this name.
+            fs::remove_file(&staged)?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)?;
+        let (copied, closed) = copy::read_file(
+            &mut afc,
+            &phone,
+            &mut file,
+            bytes,
+            copy::CopyLimits {
+                maximum_size: bytes,
+                maximum_reads: usize::try_from(bytes.div_ceil(copy::CHUNK as u64))? + 1,
+            },
+            control.deadline,
+            Some(control.cancelled.clone()),
+            "open phone track read-only",
+        )
+        .await?;
+        copied.map_err(|failure| failure.error)?;
+        closed
+            .context("phone track close not attempted")?
+            .map_err(|failure| failure.error)?;
+        file.sync_all()?;
+        drop(file);
+        let mut hasher = Sha256::new();
+        let copied_bytes = std::io::copy(&mut File::open(&staged)?, &mut hasher)?;
+        ensure!(
+            copied_bytes == bytes && <[u8; 32]>::from(hasher.finalize()) == sha,
+            "the copy of {} differs from the phone's file",
+            track.title
+        );
+        let identity = if saved.index.tracks().contains_key(&pid) {
+            music_protocol::media::fingerprint::read(&staged).map(Into::into)
+        } else {
+            music_protocol::media::mpeg::read(&staged).and_then(|s| s.transferred_identity())
+        };
+        let Some(identity) = identity
+            .ok()
+            .filter(|i| saved.index.matches_transferred_source(pid, &phone, i))
+        else {
+            fs::remove_file(&staged)?;
+            track.reason = Some("this build cannot read its copy as the phone's track".into());
+            reconciled.unbound.push(track);
+            continue;
+        };
+        let destination = free_name(&into, &file_name(&track), &extension, &mut used)?;
+        // Linking never replaces a file already there.
+        fs::hard_link(&staged, &destination)
+            .with_context(|| format!("placing {}", destination.display()))?;
+        fs::remove_file(&staged)?;
+        fs::set_permissions(
+            &destination,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )?;
+        File::open(&into)?.sync_all()?;
+        reconciled.pulled.push(Pulled {
+            content: Content {
+                source: identity,
+                track_pid: pid,
+                path: phone,
+                artwork: None,
+                collection: library.filter(|l| l.holds(&destination)).map(|l| l.scope),
+            },
+            source: Some(destination.clone()),
+            conversion: None,
+        });
+        track.copied_to = Some(destination);
+        track.reason = None;
+        reconciled.copied.push(track);
+    }
+    engine.emit(crate::engine::Event::TracksPulled { total, bytes_total })?;
+    Ok(())
+}
+
 /// "Artist - Title", or the title alone, with path separators and control
 /// characters replaced, at most 200 bytes.
 fn file_name(track: &PhoneTrack) -> String {
@@ -558,3 +1118,25 @@ fn file_name(track: &PhoneTrack) -> String {
     }
     name
 }
+
+fn free_name(
+    directory: &Path,
+    name: &str,
+    extension: &str,
+    used: &mut BTreeSet<PathBuf>,
+) -> Result<PathBuf> {
+    for n in 1..1000 {
+        let candidate = directory.join(match n {
+            1 => format!("{name}.{extension}"),
+            n => format!("{name} ({n}).{extension}"),
+        });
+        if !used.contains(&candidate) && !candidate.try_exists()? {
+            used.insert(candidate.clone());
+            return Ok(candidate);
+        }
+    }
+    bail!("no free name for {name} in {}", directory.display())
+}
+
+#[cfg(test)]
+mod tests;

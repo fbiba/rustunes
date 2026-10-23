@@ -23,6 +23,9 @@ pub use crate::engine::execution::device::{Config as DeviceConfig, Event as Devi
 pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
 pub use events::Event;
+pub use execution::pull::{
+    NOT_IN_LIBRARY, PhoneTrack as PulledTrack, Report as PullResult, Request as PullRequest,
+};
 pub use planning::{PlanRequest, PlanResult};
 pub use verification::VerificationRequest;
 
@@ -94,6 +97,13 @@ impl Engine {
     pub async fn verify(&self, request: VerificationRequest<'_>) -> Result<VerificationResult> {
         self.check()?;
         self.scope(Box::pin(verification::run(request, self))).await
+    }
+    /// Write the journal from a fresh capture, carrying an earlier journal
+    /// forward (`rustunes pull`). Nothing is sent to the phone.
+    pub async fn pull(&self, request: PullRequest<'_>) -> Result<PullResult> {
+        self.check()?;
+        self.scope(Box::pin(execution::pull::run(request, self)))
+            .await
     }
     pub async fn cover(&self, request: CoverRequest<'_>) -> Result<CoverResult> {
         self.check()?;
