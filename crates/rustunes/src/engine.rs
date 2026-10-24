@@ -26,6 +26,10 @@ pub use events::Event;
 pub use execution::pull::{
     NOT_IN_LIBRARY, PhoneTrack as PulledTrack, Report as PullResult, Request as PullRequest,
 };
+pub use planning::change::{
+    Action as ChangeAction, ChangePlan, Pinned as ChangePins, Planned as ChangePlanned,
+    Request as ChangePlanRequest,
+};
 pub use planning::metadata_intent::{
     MetadataIntent, MetadataPlan, MetadataPlanRequest, MetadataPlanResult, MetadataRequestDocument,
     MetadataWireCandidate,

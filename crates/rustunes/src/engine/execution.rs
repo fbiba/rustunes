@@ -11,3 +11,4 @@ pub(crate) mod native_artwork;
 pub(crate) mod native_insert;
 pub(crate) mod pull;
 pub(crate) mod removal_batch;
+pub(crate) mod replace;

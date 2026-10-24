@@ -25,6 +25,19 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::saved_plan;
+use crate::{
+    engine::planning::additive::{self, ArtworkDecision, Decision, JournalEvidence},
+    engine::planning::candidates,
+    engine::planning::removal::{self, Origin},
+    engine::planning::source_collection::{self, SelectionOptions},
+    engine::state::current::hex,
+    engine::state::journal::{CoordinationKind, Identity, Journal},
+    engine::state::snapshot,
+    engine::{
+        Engine, Event,
+        execution::{removal_batch, replace},
+    },
+};
 use music_protocol::catalogue::identity;
 use music_protocol::protocol::trace::private_write;
 
@@ -240,6 +253,28 @@ pub struct Pinned {
 }
 
 impl Pinned {
+    /// What `apply` holds the sync of a saved additive plan to: its additions
+    /// and updates, as a change plan's sync step is held to its own.
+    pub(crate) fn from_additive(plan: &additive::Plan) -> Result<Self> {
+        let mut pinned = Self::default();
+        for row in &plan.sources {
+            match &row.decision {
+                Decision::Add { .. } => {
+                    pinned
+                        .additions
+                        .insert(row.relative_path.clone(), row.source_file_sha256.clone());
+                }
+                Decision::Update { .. } => {
+                    pinned.updates.insert(
+                        row.relative_path.clone(),
+                        serde_json::to_value(&row.decision)?,
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(pinned)
+    }
     /// The removal step's selection against fresh state, before it sends.
     pub(crate) fn check_removals(&self, fresh: &BTreeSet<u64>) -> Result<()> {
         ensure!(
@@ -279,6 +314,67 @@ impl Pinned {
         );
         Ok(())
     }
+    /// The sync after the removal, planned from fresh state, before it sends.
+    pub(crate) fn check_sync(&self, plan: &additive::Plan) -> Result<()> {
+        let addition = |path: &str, sha: &Option<String>| match sha {
+            Some(sha) => format!("{path} (file {})", &sha[..sha.len().min(12)]),
+            None => path.to_owned(),
+        };
+        let mut additions = BTreeSet::new();
+        let mut updates = BTreeSet::new();
+        let mut conflicts = Vec::new();
+        for row in &plan.sources {
+            match &row.decision {
+                Decision::Add { .. } => {
+                    additions.insert(addition(&row.relative_path, &row.source_file_sha256));
+                }
+                Decision::Update { .. } => {
+                    updates.insert(format!(
+                        "{} {}",
+                        row.relative_path,
+                        serde_json::to_value(&row.decision)?
+                    ));
+                }
+                Decision::Conflict { code, .. } => {
+                    conflicts.push(format!("{}: {code}", row.relative_path))
+                }
+                Decision::Keep | Decision::Skip { .. } => {}
+            }
+        }
+        conflicts.extend(plan.journal_blockers.iter().cloned());
+        let planned_additions: BTreeSet<String> = self
+            .additions
+            .iter()
+            .map(|(path, sha)| addition(path, sha))
+            .collect();
+        let planned_updates: BTreeSet<String> = self
+            .updates
+            .iter()
+            .map(|(path, decision)| format!("{path} {decision}"))
+            .collect();
+        let mut found = Vec::new();
+        if additions != planned_additions {
+            found.push(format!(
+                "additions: {}",
+                differences(&planned_additions, &additions)
+            ));
+        }
+        if updates != planned_updates {
+            found.push(format!(
+                "updates: {}",
+                differences(&planned_updates, &updates)
+            ));
+        }
+        if !conflicts.is_empty() {
+            found.push(format!("now blocked by {}", conflicts.join(", ")));
+        }
+        ensure!(
+            found.is_empty(),
+            "the sync no longer matches the saved plan ({}); it added and updated nothing",
+            found.join("; ")
+        );
+        Ok(())
+    }
 }
 
 /// Up to five entries on each side of two sets that differ.
@@ -309,6 +405,16 @@ fn differences(planned: &BTreeSet<String>, fresh: &BTreeSet<String>) -> String {
     }
 }
 
+pub struct Request<'a> {
+    pub action: Action,
+    pub source: &'a Path,
+    pub snapshot: &'a Path,
+    pub journal: Option<&'a Path>,
+    pub output: Option<&'a Path>,
+    pub selection: &'a SelectionOptions,
+    pub flac_to_alac: bool,
+}
+
 pub struct Planned {
     pub plan: ChangePlan,
     pub serialized: Vec<u8>,
@@ -319,6 +425,17 @@ pub fn is_change_plan(path: &Path) -> Result<bool> {
     let saved = saved_plan::unique_value(&saved_plan::read_stable(path)?)
         .context("reading saved JSON plan with unique object keys")?;
     Ok(saved["schema"] == SCHEMA)
+}
+
+/// A saved change plan rebuilt exactly from its snapshot, sources and journal.
+pub struct Loaded {
+    pub plan: ChangePlan,
+    pub action: Action,
+    pub source: PathBuf,
+    pub selection: SelectionOptions,
+    pub flac_to_alac: bool,
+    pub plan_sha256: [u8; 32],
+    pub pinned: Pinned,
 }
 
 fn selectors(value: &Value) -> Result<BTreeSet<String>> {
@@ -333,3 +450,6 @@ fn selectors(value: &Value) -> Result<BTreeSet<String>> {
     }
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests;
