@@ -1121,3 +1121,429 @@ fn write_selection_output(path: &Path, bytes: &[u8]) -> Result<()> {
     .sync_all()?;
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Prepared batch an earlier run never sent is cancelled before the
+    /// next selection, without connecting; an idle or missing journal has
+    /// nothing to settle. A run tries a batch again only when nothing is
+    /// left outstanding and it was not cancelled.
+    #[tokio::test]
+    async fn an_earlier_prepared_batch_is_cancelled_before_selecting() {
+        use crate::engine::state::journal::test_support::{Temp, identity};
+        use crate::engine::state::journal::{PlaylistTarget, RemovalIntent};
+        let engine = crate::engine::Engine::quiet(crate::engine::Config {
+            device: crate::engine::DeviceConfig::default(),
+            deadline: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let t = Temp::new();
+        assert_eq!(
+            settle_unfinished(&t.path(), &identity(), "test", &engine, 1)
+                .await
+                .unwrap(),
+            None
+        );
+        let mut journal = Journal::create(&t.path(), &identity()).unwrap();
+        let id = journal
+            .prepare_removal_batch(&RemovalIntent {
+                coordination: None,
+                compensates: None,
+                compensates_insert_batch: None,
+                operation: vec![5; 40],
+                base_anchor: 14,
+                before_current: [1; 32],
+                before_index: [2; 32],
+                input_receipt: [3; 32],
+                evidence: "/run/unsent".into(),
+                targets: Vec::new(),
+                playlists: vec![PlaylistTarget {
+                    container: 3,
+                    name: "CLI Removal Test 3".into(),
+                }],
+            })
+            .unwrap();
+        drop(journal);
+        // A dry run settles nothing: it names both ways to settle the batch.
+        let error = refuse_unsettled(&t.path(), &identity(), Path::new("/run/snap"), " --wifi")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!(
+                "removal batch {} from an earlier run is unfinished; the same command without --dry-run settles it first, or rustunes resume --snapshot /run/snap --journal ",
+                id.as_i64()
+            )) && error.contains(" --trace-dir NEW_DIRECTORY --wifi settles it alone"),
+            "{error}"
+        );
+        // The deadline must outlast the test, or the control reads as stopped.
+        let control = engine.control(600);
+        assert!(!removal_batch::may_try_again(&t.path(), &identity(), &control).unwrap());
+        assert_eq!(
+            settle_unfinished(&t.path(), &identity(), "test", &engine, 1)
+                .await
+                .unwrap(),
+            Some(BTreeSet::new())
+        );
+        assert!(removal_batch::may_try_again(&t.path(), &identity(), &control).unwrap());
+        let stopped = crate::engine::Engine::quiet(crate::engine::Config {
+            device: crate::engine::DeviceConfig::default(),
+            deadline: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        assert!(
+            !removal_batch::may_try_again(&t.path(), &identity(), &stopped.control(600)).unwrap()
+        );
+        let journal = Journal::open_read_only(&t.path(), &identity()).unwrap();
+        assert_eq!(
+            journal.removal_batch(id).unwrap().state,
+            BatchState::Cancelled
+        );
+        assert!(journal.outstanding_removal_batch().unwrap().is_none());
+        drop(journal);
+        refuse_unsettled(&t.path(), &identity(), Path::new("/run/snap"), "").unwrap();
+        assert_eq!(
+            settle_unfinished(&t.path(), &identity(), "test", &engine, 1)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn a_sync_is_left_the_removals_that_do_not_fill_a_batch() {
+        let none = |_: &[u64]| Ok(false);
+        assert_eq!(left_for_sync(&[1, 2, 3, 4, 5], 2, none).unwrap(), [5]);
+        assert_eq!(left_for_sync(&[1, 2, 3], 5, none).unwrap(), [1, 2, 3]);
+        assert!(left_for_sync(&[1, 2, 3, 4], 2, none).unwrap().is_empty());
+        assert!(
+            left_for_sync(&[1, 2, 3], 5, |tail| Ok(tail.contains(&2)))
+                .unwrap()
+                .is_empty()
+        );
+        // Nothing is asked of an empty tail.
+        assert!(
+            left_for_sync(&[], 5, |_| -> Result<bool> { unreachable!() })
+                .unwrap()
+                .is_empty()
+        );
+    }
+    /// A Prepared session an earlier run never sent is cancelled, both
+    /// halves, through its insert half, without connecting.
+    #[tokio::test]
+    async fn an_earlier_prepared_session_is_cancelled_with_both_halves() {
+        use crate::engine::state::journal::test_support::{Temp, alac_content, identity};
+        use crate::engine::state::journal::{
+            InsertBatchState, InsertIntent, InsertTarget, RemovalIntent, RemovalTarget,
+        };
+        let engine = crate::engine::Engine::quiet(crate::engine::Config {
+            device: crate::engine::DeviceConfig::default(),
+            deadline: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let t = Temp::new();
+        let evidence = t.0.join("session");
+        std::fs::create_dir(&evidence).unwrap();
+        let input = serde_json::to_vec(&json!({"members":[{
+            "source_path":"/library/gone.m4a","album":"0000000000000011","artist":"0000000000000012",
+        }]}))
+        .unwrap();
+        std::fs::write(evidence.join("input.json"), &input).unwrap();
+        let mut journal = Journal::create(&t.path(), &identity()).unwrap();
+        let ids = journal
+            .prepare_session(
+                &InsertIntent {
+                    coordination: None,
+                    operation: vec![5; 40],
+                    base_anchor: 14,
+                    before_current: [1; 32],
+                    before_index: [2; 32],
+                    input_receipt: removal_batch::sha(&input),
+                    evidence: evidence.clone(),
+                    targets: vec![InsertTarget {
+                        content: alac_content(1),
+                        new_album_pid: None,
+                        new_artist_pid: None,
+                        conversion: None,
+                        source: None,
+                    }],
+                },
+                &RemovalIntent {
+                    coordination: None,
+                    compensates: None,
+                    compensates_insert_batch: None,
+                    operation: vec![5; 40],
+                    base_anchor: 14,
+                    before_current: [1; 32],
+                    before_index: [2; 32],
+                    input_receipt: removal_batch::sha(&input),
+                    evidence,
+                    targets: vec![RemovalTarget {
+                        track: 7,
+                        item_pid: 7,
+                        path: None,
+                        file_bytes: None,
+                        file_sha256: None,
+                        binding: None,
+                    }],
+                    playlists: Vec::new(),
+                },
+            )
+            .unwrap();
+        drop(journal);
+        assert_eq!(
+            settle_unfinished(&t.path(), &identity(), "test", &engine, 1)
+                .await
+                .unwrap(),
+            Some(BTreeSet::new())
+        );
+        let journal = Journal::open_read_only(&t.path(), &identity()).unwrap();
+        assert_eq!(
+            journal.removal_batch(ids.removal).unwrap().state,
+            BatchState::Cancelled
+        );
+        assert_eq!(
+            journal.insert_batch(ids.insert).unwrap().state,
+            InsertBatchState::Cancelled
+        );
+        assert!(journal.outstanding_insert_batch().unwrap().is_none());
+    }
+    /// A row may lack audio only as a target of the unfinished insert batch.
+    #[test]
+    fn rows_without_audio_belong_to_the_unfinished_insert_batch() {
+        use crate::engine::state::journal::test_support::{Temp, alac_content, identity};
+        use crate::engine::state::journal::{InsertIntent, InsertTarget};
+        let t = Temp::new();
+        let target = alac_content(1).track_pid;
+        let rows = |tracks: &[u64]| tracks.iter().copied().collect::<BTreeSet<_>>();
+        only_unfinished(&rows(&[]), &t.path(), &identity()).unwrap();
+        assert!(only_unfinished(&rows(&[target]), &t.path(), &identity()).is_err());
+        let mut journal = Journal::create(&t.path(), &identity()).unwrap();
+        let batch = journal
+            .prepare_insert_batch(&InsertIntent {
+                coordination: None,
+                operation: vec![5; 40],
+                base_anchor: 14,
+                before_current: [1; 32],
+                before_index: [2; 32],
+                input_receipt: [3; 32],
+                evidence: "/run/batch".into(),
+                targets: vec![InsertTarget {
+                    content: alac_content(1),
+                    new_album_pid: None,
+                    new_artist_pid: None,
+                    conversion: None,
+                    source: None,
+                }],
+            })
+            .unwrap();
+        journal.start_insert_batch(batch, [8; 32], [1; 21]).unwrap();
+        drop(journal);
+        only_unfinished(&rows(&[target]), &t.path(), &identity()).unwrap();
+        let error = only_unfinished(&rows(&[target, 99]), &t.path(), &identity())
+            .err()
+            .expect("a row no batch explains was accepted");
+        assert!(error.to_string().contains("0000000000000063"), "{error:#}");
+    }
+    /// A file may be missing only for a track an unapplied or outstanding
+    /// removal batch named: its session may have deleted the file before
+    /// the phone rolled it back.
+    #[test]
+    fn taken_files_belong_to_unapplied_or_outstanding_removals() {
+        use crate::engine::state::journal::test_support::{Temp, identity};
+        use crate::engine::state::journal::{RemovalIntent, RemovalTarget};
+        let t = Temp::new();
+        assert!(
+            removal_batch::taken(&t.path(), &identity())
+                .unwrap()
+                .is_empty()
+        );
+        let intent = |track: u64| RemovalIntent {
+            coordination: None,
+            compensates: None,
+            compensates_insert_batch: None,
+            operation: vec![5; 40],
+            base_anchor: 14,
+            before_current: [1; 32],
+            before_index: [2; 32],
+            input_receipt: [3; 32],
+            evidence: "/run/taken".into(),
+            targets: vec![RemovalTarget {
+                track,
+                item_pid: track as i64,
+                path: None,
+                file_bytes: None,
+                file_sha256: None,
+                binding: None,
+            }],
+            playlists: Vec::new(),
+        };
+        let mut journal = Journal::create(&t.path(), &identity()).unwrap();
+        let rolled_back = journal.prepare_removal_batch(&intent(7)).unwrap();
+        journal
+            .start_removal_batch(rolled_back, [8; 32], [1; 21])
+            .unwrap();
+        journal
+            .mark_removal_batch_not_applied(rolled_back, [4; 32])
+            .unwrap();
+        let outstanding = journal.prepare_removal_batch(&intent(9)).unwrap();
+        drop(journal);
+        assert_eq!(
+            removal_batch::taken(&t.path(), &identity()).unwrap(),
+            BTreeSet::from([7, 9])
+        );
+        let mut journal = Journal::open(&t.path(), &identity()).unwrap();
+        journal.cancel_removal_batch(outstanding).unwrap();
+        drop(journal);
+        assert_eq!(
+            removal_batch::taken(&t.path(), &identity()).unwrap(),
+            BTreeSet::from([7])
+        );
+    }
+    #[tokio::test]
+    async fn cancelled_request_never_allocates_evidence_or_asks_for_confirmation() {
+        let engine = crate::engine::Engine::quiet(crate::engine::Config {
+            device: crate::engine::DeviceConfig::default(),
+            deadline: None,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        let root =
+            std::env::temp_dir().join(format!("cancelled-removal-seam-{}", std::process::id()));
+        assert!(!root.exists());
+        let result = run(
+            Options {
+                dry_run: false,
+                snapshot: None,
+                journal: None,
+                state_dir: root.clone(),
+                output: None,
+                host_name: "offline".into(),
+                seconds: 1,
+                batch_size: 100,
+                leave_for_sync: false,
+                pinned: None,
+            },
+            Mode::Delete(vec!["0000000000000001".parse().unwrap()]),
+            None,
+            &engine,
+            &mut |_| panic!("cancelled request must not ask for write confirmation"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!root.exists(), "cancelled request allocated evidence");
+    }
+
+    #[test]
+    fn explicit_selection_rejects_aliases_duplicates_and_zero_before_discovery() {
+        for values in [
+            vec![],
+            vec!["1"],
+            vec!["0000000000000000"],
+            vec!["000000000000000a", "000000000000000A"],
+            vec!["../Music/track.m4a"],
+        ] {
+            let selection = values
+                .into_iter()
+                .map(str::parse)
+                .collect::<Result<Vec<TrackId>, _>>()
+                .map_err(anyhow::Error::from)
+                .and_then(|ids| selection_ids(&ids));
+            assert!(selection.is_err());
+        }
+        assert_eq!(
+            selection_ids(&[
+                "000000000000000a".parse().unwrap(),
+                "000000000000000B".parse().unwrap(),
+            ])
+            .unwrap(),
+            BTreeSet::from([10, 11])
+        );
+    }
+    struct SourceFixture(std::path::PathBuf);
+    impl SourceFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let path = std::env::temp_dir().join(format!(
+                "delete-prune-recheck-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            std::fs::write(
+                path.join("valid.m4a"),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/silence-alac.m4a"
+                )),
+            )
+            .unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for SourceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn explicit_device_mismatch_refuses_saved_removal_scope_without_discovery() {
+        let mut prefs = vec![0; 1232];
+        prefs[..4].copy_from_slice(b"frpd");
+        prefs[4] = 1;
+        prefs[6] = 25;
+        prefs[8] = 1;
+        prefs[12] = 1;
+        prefs[20] = 2;
+        let library = music_protocol::catalogue::identity::parse(&prefs).unwrap();
+        let identity = Identity::new("device-A", &library).unwrap();
+        ensure_selected_device(None, &library, &identity).unwrap();
+        ensure_selected_device(Some("device-A"), &library, &identity).unwrap();
+        assert!(ensure_selected_device(Some("device-B"), &library, &identity).is_err());
+    }
+    #[test]
+    fn selection_output_supports_bare_filename_and_ordinary_parent_without_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "RUSTUNES_SELECTION_OUTPUT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            write_selection_output(Path::new("proposal.json"), b"private proposal").unwrap();
+            assert_eq!(std::fs::read("proposal.json").unwrap(), b"private proposal");
+            assert_eq!(
+                std::fs::metadata("proposal.json")
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert!(write_selection_output(Path::new("proposal.json"), b"overwrite").is_err());
+            assert_eq!(std::fs::read("proposal.json").unwrap(), b"private proposal");
+            return;
+        }
+        let fixture = SourceFixture::new();
+        // Isolate cwd in a child process so other tests cannot observe changes.
+        std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact",concat!(module_path!(), "::selection_output_supports_bare_filename_and_ordinary_parent_without_overwrite").split_once("::").unwrap().1,"--nocapture"])
+            .env(CHILD,"1").current_dir(&fixture.0).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"));
+        write_selection_output(&fixture.0.join("absolute.json"), b"also private").unwrap();
+        assert_eq!(
+            std::fs::metadata(fixture.0.join("absolute.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
