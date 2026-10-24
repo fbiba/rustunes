@@ -7,6 +7,7 @@ use std::path::Path;
 /// explicit cancellation flag to request cancellation during bounded I/O.
 pub enum Event<'a> {
     VerificationStarting,
+    Deletion(super::DeletionEvent<'a>),
     /// `resume` reads the phone's current state to settle the unfinished
     /// operation.
     ReadingCurrentState,

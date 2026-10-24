@@ -420,6 +420,55 @@ pub struct Planned {
     pub serialized: Vec<u8>,
 }
 
+/// Plan a change offline from a complete snapshot; the bytes returned are the
+/// bytes saved.
+pub(crate) fn run(request: Request<'_>, engine: &Engine) -> Result<Planned> {
+    engine.check()?;
+    if let Some(output) = request.output {
+        ensure!(
+            !output.try_exists()?,
+            "plan output already exists; choose a new file"
+        );
+    }
+    engine.emit(Event::ReadingSavedSnapshot)?;
+    let saved = snapshot::open(request.snapshot)?;
+    let identity = Identity::for_saved_device(
+        saved.identity.device_identifier_sha256,
+        &identity::parse(&saved.raw_preferences)?,
+    )?;
+    let journal = request
+        .journal
+        .map(|path| Journal::open_read_only(path, &identity))
+        .transpose()?;
+    let source = std::fs::canonicalize(request.source).context("opening the source")?;
+    let plan = build(
+        request.action,
+        &source,
+        request.selection,
+        request.flac_to_alac,
+        &saved,
+        journal.as_ref().map(|journal| JournalEvidence {
+            journal,
+            identity: &identity,
+        }),
+        engine,
+    )?;
+    let mut serialized = serde_json::to_vec_pretty(&plan)?;
+    serialized.push(b'\n');
+    engine.check()?;
+    if let Some(path) = request.output {
+        private_write(path, &serialized)?;
+        File::open(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?
+        .sync_all()?;
+        engine.emit(Event::PlanSaved(path))?;
+    }
+    Ok(Planned { plan, serialized })
+}
+
 /// Whether the file at `path` is a saved change plan (not an additive one).
 pub fn is_change_plan(path: &Path) -> Result<bool> {
     let saved = saved_plan::unique_value(&saved_plan::read_stable(path)?)
@@ -438,6 +487,80 @@ pub struct Loaded {
     pub pinned: Pinned,
 }
 
+/// Rebuild the saved plan at `plan_path` and require the same bytes.
+pub(crate) fn load(
+    plan_path: &Path,
+    snapshot_path: &Path,
+    journal_path: &Path,
+    engine: &Engine,
+) -> Result<Loaded> {
+    use sha2::Digest;
+    engine.check()?;
+    let bytes = saved_plan::read_stable(plan_path)?;
+    let saved = saved_plan::unique_value(&bytes)
+        .context("reading saved JSON plan with unique object keys")?;
+    ensure!(
+        saved["schema"] == SCHEMA && saved["execution_authorized_by_plan"] == false,
+        "unsupported saved plan schema"
+    );
+    let action = Action::parse(saved["action"].as_str().context("missing plan action")?)?;
+    let source = PathBuf::from(
+        saved["source_root"]
+            .as_str()
+            .context("missing source root")?,
+    );
+    ensure!(source.is_absolute(), "saved source root must be absolute");
+    let scope = &saved["selection"];
+    let selection = SelectionOptions {
+        recursive: scope["recursive"]
+            .as_bool()
+            .context("missing recursive selection")?,
+        include: selectors(&scope["include"])?,
+        exclude: selectors(&scope["exclude"])?,
+    };
+    let flac_to_alac = match saved.get("flac_to_alac") {
+        None => false,
+        Some(value) => value.as_bool().context("invalid FLAC conversion policy")?,
+    };
+    engine.emit(Event::ReadingSavedSnapshot)?;
+    let saved_snapshot = snapshot::open(snapshot_path)?;
+    let identity = Identity::for_saved_device(
+        saved_snapshot.identity.device_identifier_sha256,
+        &identity::parse(&saved_snapshot.raw_preferences)?,
+    )?;
+    let journal = journal_path
+        .join("journal.sqlite")
+        .try_exists()?
+        .then(|| Journal::open_read_only(journal_path, &identity))
+        .transpose()?;
+    let plan = build(
+        action,
+        &source,
+        &selection,
+        flac_to_alac,
+        &saved_snapshot,
+        journal.as_ref().map(|journal| JournalEvidence {
+            journal,
+            identity: &identity,
+        }),
+        engine,
+    )?;
+    ensure!(
+        serde_json::to_value(&plan)? == saved,
+        "saved plan differs from current sources, snapshot, journal or planner; generate a new plan"
+    );
+    let pinned = plan.pinned()?;
+    Ok(Loaded {
+        plan,
+        action,
+        source,
+        selection,
+        flac_to_alac,
+        plan_sha256: sha2::Sha256::digest(&bytes).into(),
+        pinned,
+    })
+}
+
 fn selectors(value: &Value) -> Result<BTreeSet<String>> {
     let values = value.as_array().context("missing source selectors")?;
     ensure!(values.len() <= 4096, "source selector bound exceeded");
@@ -449,6 +572,414 @@ fn selectors(value: &Value) -> Result<BTreeSet<String>> {
         );
     }
     Ok(result)
+}
+
+/// The plan for `action` on `root` and `options` against `saved`. Every input
+/// is saved state or the source files; nothing here contacts the phone.
+pub(crate) fn build(
+    action: Action,
+    root: &Path,
+    options: &SelectionOptions,
+    flac_to_alac: bool,
+    saved: &snapshot::Snapshot,
+    journal: Option<JournalEvidence<'_>>,
+    engine: &Engine,
+) -> Result<ChangePlan> {
+    // Unfinished work leaves no state to plan from; name it and how it ends.
+    if let Some(journal) = journal {
+        let journal = journal.journal;
+        let unfinished = [
+            journal
+                .outstanding_removal_batch()?
+                .map(|b| crate::engine::execution::replace::session_or_removal(&b)),
+            journal
+                .outstanding_insert_batch()?
+                .map(|b| format!("insert batch {}", b.id.as_i64())),
+            journal
+                .outstanding_metadata_batch()?
+                .map(|b| format!("metadata batch {}", b.id.as_i64())),
+        ];
+        if let Some(batch) = unfinished.into_iter().flatten().next() {
+            anyhow::bail!(
+                "{batch} is unfinished; settle it with resume, or by running the command that started it again, then take a fresh snapshot and plan again"
+            );
+        }
+    }
+    let selected = source_collection::select(root, options)?;
+    if matches!(action, Action::RemoveMissing | Action::AddRemove) {
+        ensure!(
+            selected.root() == selected.base_directory(),
+            "--remove-missing needs the synced directory, not a file"
+        );
+    }
+    let mut last = Instant::now();
+    let mut sources = source_collection::inspect_with_progress(&selected, |done, total| {
+        engine.check()?;
+        if done == 0 || done == total || last.elapsed().as_secs() >= 5 {
+            engine.emit(Event::InspectingSources { done, total })?;
+            last = Instant::now();
+        }
+        Ok(())
+    })?;
+    sources.flac_to_alac = flac_to_alac;
+    let candidates = candidates::generate(&sources, &saved.catalog, journal.map(|j| j.journal))?;
+    engine.emit(Event::ComparingSources)?;
+    let sync = additive::build_from_snapshot(
+        &sources,
+        saved,
+        journal,
+        &candidates,
+        // A changed-audio replacement is found by the full comparison, and a
+        // whole-library one matches each source to the track it replaces.
+        matches!(action, Action::AddRemove | Action::ReplaceLibrary),
+    )?;
+    let mut blockers: Vec<String> = sync
+        .journal_blockers
+        .iter()
+        .map(|b| format!("journal: {b}"))
+        .collect();
+    if let Some(journal) = journal
+        && let Some(active) = journal.journal.active_coordination()?
+    {
+        let connection = engine.command_options();
+        let command = match active.kind {
+            CoordinationKind::Clear => Some(format!("clear{connection}")),
+            kind => replace::continuation(kind, &active.intent, &connection),
+        };
+        blockers.push(format!(
+            "coordination {} is Active; finish it first with: rustunes {}",
+            active.id.as_i64(),
+            command.unwrap_or_else(|| "the command that began it".into())
+        ));
+    }
+    let row = |path: &str| sync.sources.iter().find(|r| r.relative_path == path);
+    // The removal: each track, why, and the source that replaces it.
+    let mut removed: BTreeMap<u64, (&'static str, Option<String>, Option<String>)> =
+        BTreeMap::new();
+    let mut source_path_unknown = Vec::new();
+    // Sources a whole-library replacement could not add again.
+    let mut refused = BTreeSet::new();
+    match action {
+        Action::RemoveMissing | Action::AddRemove => {
+            if let Some(journal) = journal {
+                let origins = crate::engine::execution::delete::missing_origins(
+                    journal.journal,
+                    journal.identity,
+                    &selected,
+                    &engine.control(1800),
+                )?;
+                let gone = origins.values().any(|o| matches!(o, Origin::Missing(_)));
+                let removal = removal::build(
+                    &saved.catalog,
+                    &saved.index,
+                    &saved.identity,
+                    Some(journal),
+                    removal::Request::Missing {
+                        sources: gone.then_some(&sources),
+                        origins: &origins,
+                    },
+                )?;
+                blockers.extend(removal.blockers.iter().map(|b| format!("removal: {b}")));
+                for track in &removal.tracks {
+                    match track.decision {
+                        removal::Decision::ProposedRemoval => {
+                            removed.insert(
+                                u64::from_str_radix(&track.track_id, 16)?,
+                                ("source_gone", track.missing_source_path.clone(), None),
+                            );
+                        }
+                        removal::Decision::Blocked => blockers.push(format!(
+                            "removal: {} is blocked ({})",
+                            track.track_id,
+                            track.reasons.join(", ")
+                        )),
+                        removal::Decision::Preserved => {}
+                    }
+                }
+                source_path_unknown = origins
+                    .iter()
+                    .filter_map(|(track, origin)| match origin {
+                        Origin::Unknown(reason) => {
+                            Some(json!({"track_id":format!("{track:016x}"),"reason":reason}))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+            }
+        }
+        Action::ReplaceChanged => {
+            for (track, source) in replace::replacements(&sync)? {
+                let cause = match row(&source).map(|r| &r.decision) {
+                    Some(Decision::Skip {
+                        code: "metadata_update_needs_replacement",
+                        ..
+                    }) => "field_cleared",
+                    _ => "audio_changed",
+                };
+                ensure!(
+                    removed
+                        .insert(
+                            u64::from_str_radix(&track, 16)?,
+                            (cause, None, Some(source))
+                        )
+                        .is_none(),
+                    "track {track} is replaced by two sources"
+                );
+            }
+        }
+        Action::ReplaceLibrary => {
+            for (path, reason) in additive::uninsertable_sources(&sources) {
+                blockers.push(format!(
+                    "source {path} cannot be added, so replacing the library would leave it off the phone; exclude it: {reason}"
+                ));
+                refused.insert(path);
+            }
+            for track in saved.catalog.tracks() {
+                removed.insert(track.sync_id, ("whole_library", None, None));
+            }
+            for source in &sync.sources {
+                if let [only] = &source.matches[..]
+                    && let Some(entry) = removed.get_mut(&u64::from_str_radix(&only.track_id, 16)?)
+                    && entry.2.is_none()
+                {
+                    entry.2 = Some(source.relative_path.clone());
+                }
+            }
+        }
+    }
+    // Each removed track checked against the removal model on this snapshot,
+    // as `delete --dry-run` does; each batch checks it again on fresh state.
+    let ids: Vec<u64> = removed.keys().copied().collect();
+    let mut track_blockers: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    if !ids.is_empty() {
+        let scratch = std::env::temp_dir().join(format!(
+            "rustunes-change-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        crate::engine::state::layout::private_directory(&scratch)?;
+        let qualified =
+            removal_batch::materialize(saved, &scratch.join("sql"), &engine.control(1800))
+                .and_then(|sql| removal_batch::qualify_selection(saved, &sql, &ids, DEFAULT_BATCH));
+        std::fs::remove_dir_all(&scratch)?;
+        let (steps, batches) = qualified?;
+        for (track, step) in ids.iter().zip(steps) {
+            let reasons: Vec<String> = step["blockers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|b| b.as_str().map(str::to_owned))
+                .collect();
+            for reason in &reasons {
+                blockers.push(format!("removal: {track:016x}: {reason}"));
+            }
+            track_blockers.insert(*track, reasons);
+        }
+        for batch in batches {
+            blockers.push(format!(
+                "removal batch {}: {}",
+                batch["batch"],
+                batch["blocker"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+    let removals: Vec<Removal> = removed
+        .iter()
+        .map(|(id, (cause, missing, replaced_by))| {
+            let track = saved
+                .catalog
+                .tracks()
+                .iter()
+                .find(|t| t.sync_id == *id)
+                .with_context(|| format!("track {id:016x} is not in the catalogue"))?;
+            Ok(Removal {
+                track_id: format!("{id:016x}"),
+                title: track.metadata.title.clone(),
+                artist: track.metadata.artist.clone(),
+                album: track.metadata.album.clone(),
+                plays: track.playback.play_count_user,
+                skips: track.playback.skip_count_user,
+                file_bytes: saved
+                    .index
+                    .tracks()
+                    .get(id)
+                    .map(|a| a.fingerprint.file_bytes)
+                    .or_else(|| saved.index.other_audio().get(id).map(|a| a.file_bytes)),
+                cause,
+                missing_source_path: missing.clone(),
+                replaced_by: replaced_by.clone(),
+                blockers: track_blockers.remove(id).unwrap_or_default(),
+            })
+        })
+        .collect::<Result<_>>()?;
+    let replaces: BTreeMap<&str, String> = removals
+        .iter()
+        .filter_map(|r| r.replaced_by.as_deref().map(|s| (s, r.track_id.clone())))
+        .collect();
+    // An MP3 row carries its tags, not projected fields; an empty value is
+    // none, as its projection takes it.
+    let names = |row: &additive::SourceDecision| match (&row.projected, &row.mp3) {
+        (Some(p), _) => [
+            Some(p.title.clone()),
+            Some(p.artist.clone()),
+            Some(p.album.clone()),
+        ],
+        (None, Some(s)) => {
+            [&s.metadata.title, &s.metadata.artist, &s.metadata.album].map(|values| {
+                music_protocol::media::metadata::tag_values(values)
+                    .next()
+                    .map(str::to_owned)
+            })
+        }
+        (None, None) => [None, None, None],
+    };
+    let addition = |row: &additive::SourceDecision| {
+        let [title, artist, album] = names(row);
+        Addition {
+            relative_path: row.relative_path.clone(),
+            file_bytes: row.source_file_bytes,
+            source_file_sha256: row.source_file_sha256.clone(),
+            codec: match &row.mp3 {
+                Some(_) if row.flac_to_alac => "flac → alac",
+                Some(s) => s.codec,
+                None => "alac",
+            },
+            title,
+            artist,
+            album,
+            has_cover: match &row.artwork {
+                ArtworkDecision::PreservedExistingTrack {
+                    source_cover_sha256,
+                    ..
+                } => source_cover_sha256.is_some(),
+                ArtworkDecision::NoSourceCoverPreserveExisting => false,
+                // A changed MP3's cover is decided once its old track is gone.
+                ArtworkDecision::UnavailableUntilSourceValidated => {
+                    row.mp3.as_ref().is_some_and(|s| {
+                        music_protocol::media::mpeg::cover_index(&s.artwork).is_some()
+                    })
+                }
+                _ => true,
+            },
+            cover_left_out: row
+                .validation_issues
+                .iter()
+                .find(|issue| issue.code == "cover_left_out")
+                .map(|issue| issue.message.clone()),
+            replaces: replaces.get(row.relative_path.as_str()).cloned(),
+        }
+    };
+    let mut additions = Vec::new();
+    let mut updates = Vec::new();
+    let mut pending_covers = Vec::new();
+    match action {
+        Action::RemoveMissing | Action::AddRemove => {
+            for row in &sync.sources {
+                match &row.decision {
+                    Decision::Add { .. } => additions.push(addition(row)),
+                    Decision::Update { .. } => updates.push(Update {
+                        relative_path: row.relative_path.clone(),
+                        decision: serde_json::to_value(&row.decision)?,
+                    }),
+                    Decision::Conflict { code, message } => blockers.push(format!(
+                        "conflict: {}: {code}: {message}",
+                        row.relative_path
+                    )),
+                    Decision::Keep | Decision::Skip { .. } => {}
+                }
+                if matches!(row.artwork, ArtworkDecision::PendingOwnedCover { .. }) {
+                    pending_covers.push(row.relative_path.clone());
+                }
+            }
+        }
+        Action::ReplaceChanged => {
+            for removal in &removals {
+                let source = removal
+                    .replaced_by
+                    .as_deref()
+                    .context("replacement source")?;
+                additions.push(addition(row(source).context("replacement source row")?));
+            }
+            additions.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        }
+        // Once every track is gone, each source the replacement can add is
+        // added, whatever the phone held.
+        Action::ReplaceLibrary => {
+            additions.extend(
+                sync.sources
+                    .iter()
+                    .filter(|row| !refused.contains(&row.relative_path))
+                    .map(addition),
+            );
+        }
+    }
+    // A source the replacement adds again is no skip of it.
+    let skipped = sync
+        .sources
+        .iter()
+        .filter(|row| {
+            !replaces.contains_key(row.relative_path.as_str())
+                && (action != Action::ReplaceLibrary || refused.contains(&row.relative_path))
+        })
+        .filter_map(|row| match &row.decision {
+            Decision::Skip {
+                code,
+                reason,
+                message,
+            } => Some(Skipped {
+                relative_path: row.relative_path.clone(),
+                code,
+                reason: reason.clone(),
+                detail: message.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let selection = Scope {
+        recursive: options.recursive,
+        include: options.include.clone(),
+        exclude: options.exclude.clone(),
+        selected_files: selected.files().len(),
+    };
+    let costs = Costs {
+        removal_sessions: removals.len().div_ceil(DEFAULT_BATCH),
+        removal_batch_size: DEFAULT_BATCH,
+        upload_bytes: additions.iter().filter_map(|a| a.file_bytes).sum(),
+        plays_lost: removals.iter().map(|r| u64::from(r.plays)).sum(),
+        skips_lost: removals.iter().map(|r| u64::from(r.skips)).sum(),
+    };
+    Ok(ChangePlan {
+        schema: SCHEMA,
+        action: action.as_str(),
+        flac_to_alac,
+        source_root: root.to_string_lossy().into_owned(),
+        selection,
+        device_sha256: hex(&saved.identity.device_identifier_sha256),
+        library_sha256: hex(&saved.identity.library_identity_sha256),
+        database_sha256: hex(&saved.catalog.source_hashes().database),
+        media_anchor: saved.catalog.persisted_media_anchor(),
+        device_track_count: saved.catalog.tracks().len(),
+        untouched_tracks: saved
+            .catalog
+            .tracks()
+            .len()
+            .saturating_sub(removals.len() + updates.len()),
+        removals,
+        source_path_unknown,
+        additions,
+        updates,
+        skipped,
+        pending_covers,
+        costs,
+        order: ["remove", "sync"],
+        dependencies: DEPENDENCIES,
+        losses: LOSSES,
+        blockers,
+        fresh_state_required_before_execution: true,
+        execution_authorized_by_plan: false,
+    })
 }
 
 #[cfg(test)]

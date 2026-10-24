@@ -19,6 +19,10 @@ pub(crate) mod planning;
 pub(crate) mod state;
 pub(crate) mod verification;
 pub use crate::engine::execution::cover::Options as CoverRequest;
+pub use crate::engine::execution::delete::{
+    Confirmation as DeletionConfirmation, Event as DeletionEvent, Mode as DeletionMode,
+    Options as DeletionRequest, Outcome as DeletionOutcome, ParseTrackIdError, TrackId,
+};
 pub use crate::engine::execution::device::{Config as DeviceConfig, Event as DeviceEvent};
 pub use crate::engine::execution::sync::Options as SyncRequest;
 pub use crate::engine::planning::source_collection::SelectionOptions;
@@ -98,6 +102,12 @@ impl Engine {
     }
     pub fn plan(&self, request: PlanRequest<'_>) -> Result<PlanResult> {
         self.with_observer(|| planning::run(request, self))
+    }
+    /// Plan a sync that removes tracks before adding, offline from a saved
+    /// snapshot (`plan --remove-missing`, `--add-remove`, `--replace-changed`
+    /// or `--replace-library`).
+    pub fn plan_change(&self, request: ChangePlanRequest<'_>) -> Result<ChangePlanned> {
+        self.with_observer(|| planning::change::run(request, self))
     }
     pub fn plan_metadata(&self, request: MetadataPlanRequest<'_>) -> Result<MetadataPlanResult> {
         self.with_observer(|| planning::metadata_intent::run(request, self))
