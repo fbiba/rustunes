@@ -1202,4 +1202,7 @@ fn evidence_plist(evidence: &TransferEvidence) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 use std::path::PathBuf;
