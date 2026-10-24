@@ -112,6 +112,22 @@ impl Engine {
     pub fn plan_metadata(&self, request: MetadataPlanRequest<'_>) -> Result<MetadataPlanResult> {
         self.with_observer(|| planning::metadata_intent::run(request, self))
     }
+    pub async fn delete(
+        &self,
+        request: DeletionRequest,
+        mode: DeletionMode,
+        confirm: &mut impl FnMut(DeletionConfirmation<'_>) -> Result<bool>,
+    ) -> Result<DeletionOutcome> {
+        self.check()?;
+        self.scope(Box::pin(crate::engine::execution::delete::run(
+            request,
+            mode,
+            self.selected_device(),
+            self,
+            confirm,
+        )))
+        .await
+    }
     pub(crate) fn selected_device(&self) -> Option<&str> {
         self.config.device.selected_device()
     }
