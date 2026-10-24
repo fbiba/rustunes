@@ -20,11 +20,16 @@ pub(crate) mod state;
 pub(crate) mod verification;
 pub use crate::engine::execution::cover::Options as CoverRequest;
 pub use crate::engine::execution::device::{Config as DeviceConfig, Event as DeviceEvent};
+pub use crate::engine::execution::sync::Options as SyncRequest;
 pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
 pub use events::Event;
 pub use execution::pull::{
     NOT_IN_LIBRARY, PhoneTrack as PulledTrack, Report as PullResult, Request as PullRequest,
+};
+pub use execution::replace::{
+    Kind as ReplaceKind, Outcome as ReplaceOutcome, Preview as ReplacePreview,
+    Removal as ReplaceRemoval, Request as ReplaceRequest,
 };
 pub use planning::change::{
     Action as ChangeAction, ChangePlan, Pinned as ChangePins, Planned as ChangePlanned,
@@ -108,6 +113,26 @@ impl Engine {
     pub async fn verify(&self, request: VerificationRequest<'_>) -> Result<VerificationResult> {
         self.check()?;
         self.scope(Box::pin(verification::run(request, self))).await
+    }
+    // Keep concrete workflow state off the caller's stack before wrapping it in
+    // task-local scopes. Ordinary frontend futures may compose several calls.
+    /// Remove tracks and add the sources again as one replacement
+    /// coordination (`sync --replace-library` or `--replace-changed`).
+    pub async fn replace(
+        &self,
+        request: ReplaceRequest<'_>,
+        confirm: &mut impl FnMut(ReplacePreview<'_>) -> Result<bool>,
+    ) -> Result<ReplaceOutcome> {
+        self.check()?;
+        self.scope(Box::pin(crate::engine::execution::replace::run(
+            request, self, confirm,
+        )))
+        .await
+    }
+    pub async fn sync(&self, request: SyncRequest<'_>) -> Result<SyncResult> {
+        self.check()?;
+        self.scope(Box::pin(crate::engine::execution::sync::run(request, self)))
+            .await
     }
     /// Write the journal from a fresh capture, carrying an earlier journal
     /// forward (`rustunes pull`). Nothing is sent to the phone.

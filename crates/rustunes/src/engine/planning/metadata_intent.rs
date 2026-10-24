@@ -286,4 +286,34 @@ mod tests {
         assert_eq!(parsed.patch.composer, SourceFieldRequest::Clear);
         assert_eq!(parsed.patch.genre, SourceFieldRequest::Preserve);
     }
+
+    #[test]
+    fn metadata_request_parser_rejects_ambiguous_missing_extra_and_wrong_schema() {
+        let request = MetadataRequestDocument::new(SourceMetadataPatch {
+            year: SourceFieldRequest::Set(2025),
+            ..Default::default()
+        });
+        let value = serde_json::to_value(&request).unwrap();
+        for variant in 0..5 {
+            let mut changed = value.clone();
+            match variant {
+                0 => {
+                    changed["patch"].as_object_mut().unwrap().remove("genre");
+                }
+                1 => changed["execution_authorized"] = serde_json::json!(true),
+                2 => changed["unknown"] = serde_json::json!(2),
+                3 => changed["schema"] = serde_json::json!("another-schema"),
+                _ => changed["patch"]["year"] = serde_json::json!({"action":"set","value":null}),
+            }
+            assert!(parse_request(&serde_json::to_vec(&changed).unwrap()).is_err());
+        }
+        let raw = serde_json::to_string(&request).unwrap();
+        let duplicate = raw.replace("\"year\":", "\"year\":{\"action\":\"preserve\"},\"year\":");
+        assert_ne!(raw, duplicate);
+        assert!(parse_request(duplicate.as_bytes()).is_err());
+        let nested = raw.replace("\"value\":2025", "\"value\":2025,\"value\":2024");
+        assert_ne!(raw, nested);
+        assert!(parse_request(nested.as_bytes()).is_err());
+        assert!(parse_request(&vec![b' '; MAX_REQUEST + 1]).is_err());
+    }
 }

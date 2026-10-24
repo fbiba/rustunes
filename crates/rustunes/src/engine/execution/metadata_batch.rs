@@ -394,6 +394,88 @@ pub enum SetOutcome {
     },
 }
 
+/// Plan the edit against a fresh capture (or a saved snapshot, for a dry run),
+/// show it through `confirm`, and send it as one metadata batch. The capture
+/// that plans the edit is the batch's before-state.
+pub(crate) async fn set(
+    o: SetOptions<'_>,
+    control: impl Fn() -> Control,
+    show: impl FnOnce(&[TrackUpdate], &Path) -> Result<()>,
+    confirm: impl FnOnce(usize) -> Result<bool>,
+) -> Result<SetOutcome> {
+    ensure!(!o.requests.is_empty(), "no metadata edit requested");
+    let directory = crate::engine::state::layout::new_run(o.state)?;
+    if let Some(path) = o.snapshot {
+        ensure!(o.dry_run, "a saved snapshot can only plan a dry run");
+        let saved = snapshot::open(path)?;
+        let sql = removal_batch::materialize(&saved, &directory.join("sql"), &control())?;
+        let planned = plan(&sql.tables, &saved.catalog, &o.requests)?;
+        return preview(&planned, &directory, show);
+    }
+    let control = control();
+    let (identity, before) =
+        removal_batch::capture_fresh(&directory.join("edit"), &control).await?;
+    let journal_path = match o.journal {
+        Some(path) => std::path::absolute(path)?,
+        None => {
+            crate::engine::execution::pull::current_journal(
+                o.state,
+                &before.snapshot,
+                None,
+                false,
+                &directory,
+                &control,
+            )
+            .await?
+        }
+    };
+    // Unfinished work stops a dry run too, before planning, naming the
+    // `resume` that settles it.
+    if journal_path.try_exists()? {
+        crate::engine::execution::replace::ensure_no_unfinished_attempt(
+            &journal_path,
+            &identity,
+            o.state,
+            &directory.join("edit").join("snapshot"),
+            o.connection,
+        )?;
+    }
+    let planned = plan(&before.sql.tables, &before.current.catalog, &o.requests)?;
+    let outcome = preview(&planned, &directory, show)?;
+    if o.dry_run || matches!(outcome, SetOutcome::Unchanged) {
+        return Ok(outcome);
+    }
+    if !confirm(planned.updates.len())? {
+        return Ok(SetOutcome::Cancelled);
+    }
+    let mut journal = if journal_path.join("journal.sqlite").try_exists()? {
+        Journal::open(&journal_path, &identity)?
+    } else {
+        Journal::create(&journal_path, &identity)?
+    };
+    let settled = run(
+        &mut journal,
+        &identity,
+        &before,
+        &planned,
+        None,
+        o.host_name,
+        &control,
+    )
+    .await
+    .with_context(|| format!("evidence: {}", directory.display()))?;
+    ensure!(
+        settled.state == MetadataBatchState::Verified,
+        "the phone did not apply the edit (batch {} is {}); evidence: {}",
+        settled.batch.as_i64(),
+        settled.state.as_str(),
+        settled.evidence.display()
+    );
+    Ok(SetOutcome::Applied {
+        updated: settled.updated,
+    })
+}
+
 fn preview(
     planned: &Planned,
     run: &Path,
