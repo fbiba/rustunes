@@ -28,6 +28,7 @@ pub use crate::engine::execution::sync::Options as SyncRequest;
 pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
 pub use events::Event;
+pub use execution::change::{Outcome as ChangeApplyOutcome, Request as ChangeApplyRequest};
 pub use execution::pull::{
     NOT_IN_LIBRARY, PhoneTrack as PulledTrack, Report as PullResult, Request as PullRequest,
 };
@@ -159,6 +160,20 @@ impl Engine {
         self.check()?;
         self.scope(Box::pin(crate::engine::execution::sync::run(request, self)))
             .await
+    }
+    /// Apply a saved plan: rebuild it exactly, then run its removal, if it
+    /// has one, and the sync after it from fresh captures, each step pinned
+    /// to the plan. `confirm` sees the plan before anything is removed.
+    pub async fn apply_change(
+        &self,
+        request: ChangeApplyRequest<'_>,
+        confirm: &mut impl FnMut(&ChangePlan) -> Result<bool>,
+    ) -> Result<ChangeApplyOutcome> {
+        self.check()?;
+        self.scope(Box::pin(crate::engine::execution::change::run(
+            request, self, confirm,
+        )))
+        .await
     }
     /// Write the journal from a fresh capture, carrying an earlier journal
     /// forward (`rustunes pull`). Nothing is sent to the phone.

@@ -1,6 +1,7 @@
 //! Execution mechanisms for the synchronization engine.
 
 pub(crate) mod apply;
+pub(crate) mod change;
 pub(crate) mod cover;
 pub(crate) mod delete;
 pub(crate) mod device;
