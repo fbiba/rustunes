@@ -26,6 +26,9 @@ pub use crate::engine::execution::delete::{
 pub use crate::engine::execution::device::{Config as DeviceConfig, Event as DeviceEvent};
 pub use crate::engine::execution::sync::Options as SyncRequest;
 pub use crate::engine::planning::source_collection::SelectionOptions;
+pub use crate::engine::recovery::resume::{
+    Kind as RecoveryKind, Options as RecoveryRequest, Report as RecoveryResult,
+};
 pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
 pub use events::Event;
 pub use execution::change::{Outcome as ChangeApplyOutcome, Request as ChangeApplyRequest};
