@@ -1,3 +1,5 @@
+pub(crate) mod completions;
+pub(crate) mod config;
 use crate::engine;
 use crate::engine::execution::device;
 use crate::engine::planning::additive;
@@ -473,6 +475,55 @@ enum DeviceCommand {
     },
 }
 
+/// The fingerprint cache for every index pass in this run.
+/// Without a resolvable state directory, passes copy every file as before.
+pub(crate) fn fingerprint_cache(
+    full_readback: bool,
+) -> Option<crate::engine::state::audio_index::cache::Config> {
+    use crate::engine::state::audio_index::cache::{Config, Mode};
+    let directory = fingerprint_cache_directory().ok()?;
+    Some(Config::new(
+        directory,
+        if full_readback {
+            Mode::Refresh
+        } else {
+            Mode::Reuse
+        },
+    ))
+}
+
+fn fingerprint_cache_directory() -> Result<PathBuf> {
+    Ok(default_state_directory()?.join("fingerprint-cache"))
+}
+
+/// The sources a command plans from, read ahead while a Wi-Fi phone is found.
+fn sources_to_warm(command: &Command) -> Option<(PathBuf, source_collection::SelectionOptions)> {
+    match command {
+        Command::Sync { recursive, .. } => Some((
+            config::library().ok()?,
+            source_collection::SelectionOptions {
+                recursive: *recursive,
+                ..Default::default()
+            },
+        )),
+        Command::Push {
+            path,
+            recursive,
+            include,
+            exclude,
+            ..
+        } => Some((
+            path.clone().or_else(|| config::library().ok())?,
+            source_collection::SelectionOptions {
+                recursive: *recursive,
+                include: include.iter().cloned().collect(),
+                exclude: exclude.iter().cloned().collect(),
+            },
+        )),
+        _ => None,
+    }
+}
+
 /// Bonjour, waking the phone, and holding it awake (taken again if it was
 /// already falling asleep).
 const WIFI_DISCOVERY: Duration = Duration::from_secs(90);
@@ -482,6 +533,35 @@ const MAX_BATCH: u64 = crate::engine::planning::change::MAX_BATCH as u64;
 /// A session's operations by default: all one operation file holds, as
 /// sessions of 499 insertions and of 499 removals were verified on the phone.
 const DEFAULT_BATCH: u64 = crate::engine::planning::change::DEFAULT_BATCH as u64;
+
+/// USB unless --wifi or --wifi-address chose Wi-Fi.
+fn device_config(cli: &Cli) -> Result<engine::DeviceConfig> {
+    let config = usb_config(cli.device.clone())?;
+    Ok(if cli.wifi || cli.wifi_address.is_some() {
+        config.over_wifi(cli.wifi_address, wifi_memory())
+    } else {
+        config
+    })
+}
+/// Where the phone's last Wi-Fi address is remembered.
+pub(crate) fn wifi_memory() -> Option<PathBuf> {
+    default_state_directory()
+        .ok()
+        .map(|state| state.join("wifi"))
+}
+/// Where a run locks each phone it reaches, whatever `--state-dir` says, so
+/// that runs with different state directories also take turns.
+fn phone_locks() -> Option<PathBuf> {
+    default_state_directory()
+        .ok()
+        .map(|state| state.join("locks"))
+}
+fn usb_config(selected: Option<String>) -> Result<engine::DeviceConfig> {
+    Ok(
+        engine::DeviceConfig::new(selected, std::env::var_os("USBMUXD_SOCKET_ADDRESS"))?
+            .locked_in(phone_locks()),
+    )
+}
 
 /// The plan's actions, counts and blockers, as a `plan` report: what the
 /// terminal shows of it. The complete plan is the file at `plan_file`.
@@ -560,4 +640,301 @@ pub(crate) fn plan_report(result: &engine::PlanResult) -> serde_json::Value {
         "preserved_unmatched_device_tracks": plan.preserved_unmatched_device_tracks.len(),
         "excluded_sources": result.source_exclusions,
     })
+}
+
+/// The `catalog` columns, as a `catalog` report.
+fn catalog_json(catalog: &music_protocol::catalogue::sqlite::Catalog) -> serde_json::Value {
+    let tracks: Vec<_> = catalog
+        .tracks()
+        .iter()
+        .map(|track| {
+            let meta = &track.metadata;
+            serde_json::json!({
+                "wire_id": (track.sync_id as i64).to_string(),
+                "title": meta.title,
+                "artist": meta.artist,
+                "album": meta.album,
+                "album_artist": meta.album_artist,
+                "track_number": meta.track_number,
+                "track_count": meta.track_count,
+                "disc_number": meta.disc_number,
+                "disc_count": meta.disc_count,
+                "year": meta.year,
+                "duration_ms": meta.total_time_ms,
+                "size_bytes": meta.file_size,
+                "path": track.afc_path,
+            })
+        })
+        .collect();
+    serde_json::json!({"track_count": tracks.len(), "tracks": tracks})
+}
+
+/// A property list value as JSON; data is base64, a date its XML text.
+fn plist_json(value: &plist::Value) -> serde_json::Value {
+    use plist::Value;
+    match value {
+        Value::Array(items) => items.iter().map(plist_json).collect(),
+        Value::Dictionary(entries) => entries
+            .iter()
+            .map(|(key, value)| (key.clone(), plist_json(value)))
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+        Value::Boolean(value) => (*value).into(),
+        Value::Data(bytes) => serde_json::json!({"base64": base64(bytes)}),
+        Value::Date(date) => date.to_xml_format().into(),
+        Value::Real(value) => (*value).into(),
+        Value::Integer(value) => value
+            .as_signed()
+            .map(serde_json::Value::from)
+            .or_else(|| value.as_unsigned().map(serde_json::Value::from))
+            .unwrap_or_default(),
+        Value::String(text) => text.as_str().into(),
+        Value::Uid(uid) => uid.get().into(),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, byte)| n | u32::from(*byte) << (16 - 8 * i));
+        for i in 0..4 {
+            text.push(if i <= chunk.len() {
+                ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    text
+}
+
+/// The plan as the terminal shows it, or its JSON document if `json`.
+pub(crate) fn write_plan(
+    out: &mut impl Write,
+    result: &engine::PlanResult,
+    json: bool,
+    add_only: bool,
+) -> Result<()> {
+    let plan = &result.plan;
+    let bytes = &result.serialized;
+    let adds = result.additions;
+    let keeps = result.matched;
+    let updates = result.updates;
+    let conflicts = result.conflicts;
+    // Only a plan that skips says so: the line is otherwise unchanged.
+    let skipped = match result.skipped {
+        0 => String::new(),
+        n => format!(", {n} skipped"),
+    };
+    if json {
+        out.write_all(bytes)?;
+    } else {
+        if add_only {
+            writeln!(
+                out,
+                "Add-only policy: preserve existing audio and metadata; finish only this tool's pending covers."
+            )?;
+        }
+        writeln!(
+            out,
+            "Additive plan: {adds} additions, {keeps} matched, {updates} updates, {conflicts} conflicts{skipped}, 0 deletions"
+        )?;
+        write_artwork_recent_disclosure(out, plan)?;
+        writeln!(
+            out,
+            "Saved snapshot revision {}; execution requires fresh device checks.",
+            plan.media_anchor
+        )?;
+        for source in &plan.sources {
+            match &source.decision {
+                additive::Decision::Add { track_id, path, .. } => {
+                    let converted = if source.flac_to_alac {
+                        " (FLAC → ALAC)"
+                    } else {
+                        ""
+                    };
+                    writeln!(
+                        out,
+                        "ADD {:?} → {track_id} at {path}{converted}",
+                        source.relative_path
+                    )?;
+                    for issue in source
+                        .validation_issues
+                        .iter()
+                        .filter(|issue| issue.code == "cover_left_out")
+                    {
+                        writeln!(out, "  {}", issue.message)?;
+                    }
+                }
+                additive::Decision::Conflict { code, message } => {
+                    writeln!(
+                        out,
+                        "CONFLICT {:?}: {}",
+                        source.relative_path,
+                        additive::skip::reason(source, code, message, &plan.sources)
+                    )?;
+                }
+                additive::Decision::Skip { reason, .. } => {
+                    writeln!(out, "SKIP {:?}: {reason}", source.relative_path)?;
+                }
+                additive::Decision::Update { track_id, changes } => {
+                    writeln!(out, "UPDATE {:?} → {track_id}", source.relative_path)?;
+                    for change in changes {
+                        writeln!(
+                            out,
+                            "  {}: {} → {}",
+                            change.field, change.current, change.desired
+                        )?;
+                    }
+                }
+                additive::Decision::Keep => {
+                    if source.mp3.is_some() {
+                        write_mpeg_keep(out, &source.relative_path, &source.matches)?;
+                    }
+                    if let additive::ArtworkDecision::PendingOwnedCover { bytes, .. } =
+                        source.artwork
+                    {
+                        writeln!(
+                            out,
+                            "COVER {:?}: finish pending cover ({bytes} bytes)",
+                            source.relative_path
+                        )?;
+                    }
+                }
+            }
+            if let Some(bytes) = source.cover_resent(add_only) {
+                writeln!(
+                    out,
+                    "COVER {:?}: send the cover again ({bytes} bytes); no journal record proves the phone's",
+                    source.relative_path
+                )?;
+            }
+        }
+        let resent = plan
+            .sources
+            .iter()
+            .filter(|source| source.cover_resent(add_only).is_some())
+            .count();
+        if resent > 0 {
+            writeln!(
+                out,
+                "Covers sent again: {resent}, one phone session each; `rustunes pull` first keeps those it reads back as the expected image."
+            )?;
+        }
+        for blocker in &plan.journal_blockers {
+            writeln!(out, "BLOCKED: {blocker}")?;
+        }
+        writeln!(
+            out,
+            "Preserve {} unmatched device tracks; excluded {} source entries.",
+            plan.preserved_unmatched_device_tracks.len(),
+            result.source_exclusions
+        )?;
+        writeln!(
+            out,
+            "Artwork status and complete field differences are included in --json or --output."
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_mpeg_keep(
+    out: &mut impl Write,
+    relative_path: &str,
+    matches: &[additive::ExistingMatch],
+) -> std::io::Result<()> {
+    let (file, ownership) = match matches {
+        [matched] if matched.match_basis == Some("owned_mpeg_frame_identity") => (
+            "the file this tool sent (same encoded audio)",
+            matched.ownership,
+        ),
+        [matched] if matched.match_basis == Some("flac_conversion") => {
+            ("the ALAC this tool converted from it", matched.ownership)
+        }
+        [matched] => ("exact existing audio file", matched.ownership),
+        _ => ("exact existing audio file", "not established"),
+    };
+    writeln!(
+        out,
+        "KEEP {relative_path:?}: {file}; ownership: {ownership}; catalogue metadata and artwork preserved."
+    )
+}
+
+async fn connected_provider() -> Result<device::DeviceProvider> {
+    timeout(Duration::from_secs(15), device::provider())
+        .await
+        .context("timed out discovering the device")?
+}
+
+/// Whether a syslog capture keeps this line: one from a music process (Music,
+/// musicd, medialibraryd) or the sync stack (ATC, AirTraffic, ATAirlock).
+fn relevant_syslog(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    // Avoid Watch/batch and unrelated camera settings that list the Music app.
+    let prefix = lower.split('<').next().unwrap_or(&lower);
+    let music_process = prefix
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| matches!(word, "music" | "musicd" | "medialibraryd"));
+    music_process
+        || lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|word| word == "atc")
+        || lower.contains("airtraffic")
+        || lower.contains("atairlock")
+}
+
+pub(crate) fn write_artwork_recent_disclosure(
+    out: &mut impl std::io::Write,
+    plan: &additive::Plan,
+) -> Result<()> {
+    if !plan.artwork_import_recent_skip_resets.is_empty() {
+        writeln!(
+            out,
+            "Artwork import may reset recent-play counters on {} tracks and recent-skip counters on {} tracks; verification requires both recent counters unchanged or reset all to zero. Lifetime counts, dates and all other statistics must stay unchanged.",
+            plan.artwork_import_recent_play_resets.len(),
+            plan.artwork_import_recent_skip_resets.len()
+        )?;
+        for (kind, resets) in [
+            ("PLAY", &plan.artwork_import_recent_play_resets),
+            ("SKIP", &plan.artwork_import_recent_skip_resets),
+        ] {
+            for reset in resets {
+                writeln!(
+                    out,
+                    "RECENT {kind} {}: {} -> {}",
+                    reset["track_id"], reset["before"], reset["after"]
+                )?;
+            }
+        }
+    } else if !plan.artwork_import_recent_play_resets.is_empty() {
+        writeln!(
+            out,
+            "Artwork import may reset recent-play counters on {} tracks; lifetime counts must stay unchanged.",
+            plan.artwork_import_recent_play_resets.len()
+        )?;
+        for reset in &plan.artwork_import_recent_play_resets {
+            writeln!(
+                out,
+                "RECENT PLAY {}: {} -> {}",
+                reset["track_id"], reset["before"], reset["after"]
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn default_state_directory() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(path);
+        anyhow::ensure!(path.is_absolute(), "XDG_STATE_HOME must be absolute");
+        return Ok(path.join("rustunes"));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").context("set --state-dir or HOME")?);
+    anyhow::ensure!(home.is_absolute(), "HOME must be absolute; use --state-dir");
+    Ok(home.join(".local/state/rustunes"))
 }
