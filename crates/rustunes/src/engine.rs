@@ -13,6 +13,7 @@ use std::{
 use tokio::time::Instant;
 
 mod events;
+pub mod model;
 mod observation;
 pub use observation::Observation;
 pub(crate) mod planning;
