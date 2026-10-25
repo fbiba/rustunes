@@ -1,4 +1,5 @@
 //! iPhone Music synchronization application and engine.
+pub mod cli;
 pub mod engine;
 
 #[cfg(test)]

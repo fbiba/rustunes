@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 music-protocol = { path = "../music-protocol" }
 anyhow.workspace = true
+clap.workspace = true
 idevice.workspace = true
 libc.workspace = true
 lofty.workspace = true
