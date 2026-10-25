@@ -26,6 +26,118 @@ pub struct Options<'a> {
     pub selected_device: Option<&'a str>,
 }
 
+pub async fn run(options: Options<'_>, engine: &crate::engine::Engine) -> Result<Report> {
+    engine.check()?;
+    // A new explicit invocation gets one budget; phase collection never renews it.
+    let outer_control = engine.control(1800);
+    // A batch is settled from the journal, whose record names its evidence:
+    // the snapshot only identifies the phone, and may be the capture of the
+    // run that met the batch, with the rows it left without audio.
+    let any = crate::engine::state::audio_index::Absent {
+        any_unfilled: true,
+        gone: true,
+        ..crate::engine::state::audio_index::Absent::NONE
+    };
+    let saved = snapshot::open_allowing_with_control(options.snapshot, any, &outer_control)?;
+    let library = identity::parse(&saved.raw_preferences)?;
+    let identity = Identity::for_saved_device(saved.identity.device_identifier_sha256, &library)?;
+    if let Some(selected) = options.selected_device {
+        let selected = Identity::new(selected, &library)?;
+        anyhow::ensure!(
+            selected.device_digest() == identity.device_digest(),
+            "selected device differs from recovery snapshot"
+        );
+    }
+    let journal = Journal::open_read_only(options.journal, &identity)?;
+    let journal_path = options.journal;
+    if let Some(batch) = journal.outstanding_removal_batch()? {
+        // A session's removal half settles with its insert half.
+        if let Some(insert) = batch.with_insert_batch {
+            let insert = journal.insert_batch(insert)?;
+            drop(journal);
+            return resume_insert_batch(journal_path, &identity, insert, &outer_control).await;
+        }
+        drop(journal);
+        return resume_batch(journal_path, &identity, batch, &outer_control).await;
+    }
+    if let Some(batch) = journal.outstanding_insert_batch()? {
+        drop(journal);
+        return resume_insert_batch(journal_path, &identity, batch, &outer_control).await;
+    }
+    if let Some(batch) = journal.outstanding_metadata_batch()? {
+        drop(journal);
+        return resume_metadata_batch(journal_path, &identity, batch, &outer_control).await;
+    }
+    // Every other route judges the phone against the snapshot too: each row
+    // must hold its audio, as in the capture of the run that started it.
+    anyhow::ensure!(
+        saved.index.unfilled().is_empty() && saved.index.gone().is_empty(),
+        "no batch is unfinished, and {} holds catalogue rows without audio; resume a single attempt with the snapshot of the run that started it",
+        options.snapshot.display()
+    );
+    // An attempt outstanding while a coordination is Active is that
+    // coordination's own: it began on a quiescent journal and has owned it
+    // since. Settling or cancelling the attempt acts under its permit, as the
+    // coordination's own run would; the coordination stays Active.
+    let _permit = if journal.outstanding_attempt()?.is_some()
+        && let Some(active) = journal.active_coordination()?
+    {
+        Some(Journal::open(journal_path, &identity)?.enter_coordination(active.id)?)
+    } else {
+        None
+    };
+    // A Started insert or cover is first observed fresh: what the phone holds
+    // now, not the given snapshot, decides whether it was never applied, left
+    // a row without audio, or goes to its own route under `trace/recovery`.
+    let recovery_trace;
+    let (journal, options) = if options.cancel_prepared.is_none()
+        && let Some(attempt) = journal.outstanding()?
+        && attempt.state == crate::engine::state::journal::AttemptState::ReconciliationRequired
+    {
+        drop(journal);
+        match observed::observe(
+            journal_path,
+            &identity,
+            &attempt,
+            &saved,
+            options.run_dir,
+            options.trace,
+            &outer_control,
+        )
+        .await?
+        {
+            observed::Observed::Settled(report) => return Ok(report),
+            observed::Observed::Locationless => {
+                return compensate_insert(
+                    journal_path,
+                    &identity,
+                    &attempt,
+                    &options.trace.join("compensation"),
+                    &outer_control,
+                )
+                .await;
+            }
+            observed::Observed::Applied => {}
+        }
+        recovery_trace = options.trace.join("recovery");
+        (
+            Journal::open_read_only(journal_path, &identity)?,
+            Options {
+                trace: &recovery_trace,
+                ..options
+            },
+        )
+    } else {
+        (journal, options)
+    };
+    outer_control.check()?;
+    journal.ensure_identity(&identity)?;
+    if options.cancel_prepared.is_some() && journal.outstanding()?.is_none() {
+        anyhow::bail!("journal has no outstanding attempt to cancel");
+    }
+    Box::pin(continue_run(options, engine, &identity, journal)).await
+}
+
 /// An unfinished removal batch: a Prepared batch was never sent and is
 /// cancelled; a Started one is observed and settled, never resent.
 async fn resume_batch(
@@ -318,3 +430,6 @@ pub struct Report {
     pub successful: bool,
 }
 mod observed;
+
+#[cfg(test)]
+mod tests;

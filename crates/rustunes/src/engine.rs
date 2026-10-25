@@ -132,6 +132,22 @@ impl Engine {
         )))
         .await
     }
+    pub async fn recover<'a>(&'a self, mut request: RecoveryRequest<'a>) -> Result<RecoveryResult> {
+        self.check()?;
+        if let Some(selected) = self.selected_device() {
+            ensure!(
+                request
+                    .selected_device
+                    .is_none_or(|value| value == selected),
+                "recovery device differs from engine configuration"
+            );
+            request.selected_device = Some(selected);
+        }
+        self.scope(Box::pin(crate::engine::recovery::resume::run(
+            request, self,
+        )))
+        .await
+    }
     pub(crate) fn selected_device(&self) -> Option<&str> {
         self.config.device.selected_device()
     }
