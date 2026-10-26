@@ -16,6 +16,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod events;
+#[cfg(test)]
+mod tests;
+
 /// Names the record format; a change that could break a reader renames it.
 pub(super) const SCHEMA: &str = "rustunes.messages";
 
@@ -153,6 +157,26 @@ pub(super) enum Level {
     Warning,
 }
 
+/// A fact worth showing: `code` names it for programs, `message` is the
+/// sentence the terminal shows, and `fields` (an object) its details.
+pub(super) fn notice(
+    code: &'static str,
+    level: Level,
+    message: impl Into<String>,
+    fields: Value,
+) -> Result<()> {
+    let mut record = json!({
+        "code": code,
+        "level": match level {
+            Level::Info => "info",
+            Level::Warning => "warning",
+        },
+        "message": message.into(),
+    });
+    merge(&mut record, fields);
+    write("notice", record)
+}
+
 /// The command's own result data, as `--json` prints it where it has one.
 pub(super) fn report(kind: &'static str, report: &impl serde::Serialize) -> Result<()> {
     write(
@@ -182,6 +206,27 @@ pub(super) fn outcome(outcome: &'static str) {
     if let Some(sink) = SINK.get() {
         sink.state.lock().unwrap_or_else(|e| e.into_inner()).outcome = Some(outcome);
     }
+}
+
+/// Ask on stdin: write a `confirm` record, then read one line. `yes` or `y`
+/// confirms; anything else, or the end of stdin, declines.
+pub(super) fn confirm(code: &'static str, prompt: String, fields: Value) -> Result<bool> {
+    let mut record = json!({
+        "code": code,
+        "prompt": prompt,
+        "default": "no",
+        "respond": "one line on stdin: yes or no",
+    });
+    merge(&mut record, fields);
+    write("confirm", record)?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading the answer to a confirm record from stdin")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// One update of a progress stream.
@@ -413,4 +458,143 @@ impl Estimate {
 fn round(value: f64, places: i32) -> f64 {
     let scale = 10f64.powi(places);
     (value * scale).round() / scale
+}
+
+/// Copy `extra`'s fields into `record`.
+fn merge(record: &mut Value, extra: Value) {
+    if let (Value::Object(record), Value::Object(extra)) = (record, extra) {
+        record.extend(extra);
+    }
+}
+
+/// Write the `result` record for the command's end, and the exit code to
+/// leave with: an error becomes code 1 and is not printed again.
+pub(super) fn finish(result: Result<ExitCode>) -> ExitCode {
+    let code = exit_code(&result);
+    let outcome = SINK
+        .get()
+        .and_then(|sink| sink.state.lock().unwrap_or_else(|e| e.into_inner()).outcome);
+    let mut fields = json!({
+        "ok": code == 0,
+        "exit_code": code,
+        "outcome": match (&result, outcome) {
+            (Err(_), _) => "failed",
+            (Ok(_), Some(outcome)) => outcome,
+            (Ok(_), None) if code == 0 => "completed",
+            (Ok(_), None) => "incomplete",
+        },
+    });
+    if let Err(error) = &result {
+        fields["error"] = error_json(error);
+    }
+    match write("result", fields) {
+        Ok(()) => ExitCode::from(code),
+        // stdout is gone; stderr is all that is left to tell.
+        Err(_) => {
+            if let Err(error) = result {
+                eprintln!("Error: {error:?}");
+            }
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// The code a command's end leaves with, as the `result` record gives it.
+pub(super) fn exit_code(result: &Result<ExitCode>) -> u8 {
+    match result {
+        Ok(code) if *code == ExitCode::SUCCESS => 0,
+        Ok(code) if *code == ExitCode::from(3) => 3,
+        Ok(_) => 1,
+        Err(_) => 1,
+    }
+}
+
+/// A command line clap refused, with `--message-format json` in it: `start`
+/// and `result` records around clap's message, and exit code 2.
+pub(super) fn usage_error(error: &clap::Error) -> ExitCode {
+    let text = error.render().to_string();
+    let written = enable("", json!({}), None).and_then(|()| {
+        write(
+            "result",
+            json!({
+                "ok": false,
+                "exit_code": 2,
+                "outcome": "usage_error",
+                "error": {"message": text.trim_end(), "causes": []},
+            }),
+        )
+    });
+    if written.is_err() {
+        eprint!("{text}");
+    }
+    ExitCode::from(2)
+}
+
+/// An error's message and the chain of its causes.
+pub(super) fn error_json(error: &anyhow::Error) -> Value {
+    let mut chain = error.chain().map(ToString::to_string);
+    json!({
+        "message": chain.next().unwrap_or_default(),
+        "causes": chain.collect::<Vec<_>>(),
+    })
+}
+
+/// Whether the raw command line asks for `--message-format json`, read before
+/// clap so that a line clap refuses still gets records.
+pub(super) fn requested(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter().skip(1).map(|a| a.to_string_lossy());
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return false;
+        }
+        if arg == "--message-format=json"
+            || (arg == "--message-format" && args.next().is_some_and(|v| v == "json"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The subcommand path ("library list") and the options the command line
+/// gave, by clap id; flags are true, other values strings or lists of them.
+pub(super) fn operation(command: &clap::Command, matches: &clap::ArgMatches) -> (String, Value) {
+    let mut names = Vec::new();
+    let mut options = Map::new();
+    let (mut command, mut matches) = (command, matches);
+    loop {
+        for arg in command.get_arguments() {
+            let id = arg.get_id().as_str();
+            if options.contains_key(id)
+                || matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine)
+            {
+                continue;
+            }
+            let value = if arg.get_action().takes_values() {
+                let values: Vec<Value> = matches
+                    .get_raw(id)
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.to_string_lossy().into_owned().into())
+                    .collect();
+                match (arg.get_action(), &values[..]) {
+                    (clap::ArgAction::Append, _) => values.into(),
+                    (_, [one]) => one.clone(),
+                    _ => values.into(),
+                }
+            } else {
+                true.into()
+            };
+            options.insert(id.to_owned(), value);
+        }
+        let Some((name, sub)) = matches.subcommand() else {
+            break;
+        };
+        let Some(next) = command.find_subcommand(name) else {
+            break;
+        };
+        names.push(name.to_owned());
+        (command, matches) = (next, sub);
+    }
+    (names.join(" "), options.into())
 }

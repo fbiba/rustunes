@@ -530,6 +530,34 @@ enum DeviceCommand {
     },
 }
 
+/// The command line, and under `--message-format json` the operation it
+/// names. A line clap refuses exits here, or with records and code 2 under
+/// `--message-format json`.
+fn parse() -> std::result::Result<(Cli, Option<(String, serde_json::Value)>), ExitCode> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let mut command = Cli::command();
+    command.build();
+    let matches = match command.clone().try_get_matches_from(&args) {
+        Ok(matches) => matches,
+        Err(error)
+            if machine::requested(&args)
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp
+                        | clap::error::ErrorKind::DisplayVersion
+                        | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) =>
+        {
+            return Err(machine::usage_error(&error));
+        }
+        Err(error) => error.exit(),
+    };
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let operation =
+        (cli.message_format == MessageFormat::Json).then(|| machine::operation(&command, &matches));
+    Ok((cli, operation))
+}
+
 /// The fingerprint cache for every index pass in this run.
 /// Without a resolvable state directory, passes copy every file as before.
 pub(crate) fn fingerprint_cache(
@@ -1096,6 +1124,155 @@ async fn device_info(
     Ok(())
 }
 
+async fn probe(
+    provider: &device::DeviceProvider,
+    duration: Duration,
+    trace_dir: PathBuf,
+    ping: bool,
+) -> Result<()> {
+    fs::create_dir_all(&trace_dir).context("creating trace directory")?;
+    let mut client = timeout(Duration::from_secs(20), framing::Atc::connect(provider))
+        .await
+        .context("timed out starting com.apple.atc")?
+        .context("starting com.apple.atc")?;
+    let deadline = Instant::now() + duration;
+    if ping {
+        let mut dictionary = plist::Dictionary::new();
+        dictionary.insert("Session".into(), 1.into());
+        dictionary.insert("Command".into(), "Ping".into());
+        timeout(
+            duration,
+            client.send_plist(&plist::Value::Dictionary(dictionary), &trace_dir, 0),
+        )
+        .await
+        .context("timed out sending probe Ping; intended outgoing trace retained")??;
+        say(
+            "atc_connected",
+            "com.apple.atc connected; one probe Ping sent, receiving telemetry only".into(),
+            serde_json::json!({"ping_sent": true}),
+        )?;
+    } else {
+        say(
+            "atc_connected",
+            "com.apple.atc connected; receiving only, no ATC messages sent".into(),
+            serde_json::json!({"ping_sent": false}),
+        )?;
+    }
+    let mut received = Vec::new();
+    let mut pong_session = None;
+    let mut frames = 0;
+    let mut sync_allowed = false;
+    let mut pong = false;
+    while frames < 64 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let frame = match timeout(remaining, client.read_frame()).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => {
+                if !client.partial_frame().is_empty() {
+                    private_write(
+                        &trace_dir.join(format!("{frames:03}-partial.atc")),
+                        client.partial_frame(),
+                    )?;
+                }
+                return Err(error.context("receiving ATC startup frame; partial bytes retained"));
+            }
+            // Dropping the client after timeout avoids reusing a partially read frame.
+            Err(_) => {
+                if !client.partial_frame().is_empty() {
+                    private_write(
+                        &trace_dir.join(format!("{frames:03}-partial.atc")),
+                        client.partial_frame(),
+                    )?;
+                }
+                break;
+            }
+        };
+        private_write(&trace_dir.join(format!("{frames:03}-received.atc")), &frame)?;
+        let value: plist::Value = plist::from_bytes(&frame[4..])
+            .context("decoding received ATC plist; exact raw frame retained")?;
+        let mut xml = Vec::new();
+        plist::to_writer_xml(&mut xml, &value).context("serializing received ATC plist")?;
+        private_write(&trace_dir.join(format!("{frames:03}-received.plist")), &xml)?;
+        let command = value
+            .as_dictionary()
+            .and_then(|dict| dict.get("Command"))
+            .and_then(plist::Value::as_string)
+            .context("ATC frame has no string Command")?;
+        let line = format!(
+            "ATC received: {command} ({} payload bytes)",
+            frame.len() - 4
+        );
+        if machine::enabled() {
+            machine::progress(
+                machine::Progress::new("receive", "frames", frames + 1, None)
+                    .current(
+                        serde_json::json!({"command": command, "payload_bytes": frame.len() - 4}),
+                    )
+                    .message(line),
+            )?;
+        } else {
+            println!("{line}");
+        }
+        received.push(serde_json::json!({"command": command, "payload_bytes": frame.len() - 4}));
+        frames += 1;
+        if command == "SyncAllowed" {
+            sync_allowed = true;
+        }
+        if ping && command == "Pong" {
+            pong = true;
+            let session = value
+                .as_dictionary()
+                .and_then(|dict| dict.get("Session"))
+                .and_then(plist::Value::as_signed_integer);
+            pong_session = session;
+            let line = match session {
+                Some(session) => format!("Pong reply Session: {session}"),
+                None => "Pong reply Session: unavailable".into(),
+            };
+            say("pong", line, serde_json::json!({"session": session}))?;
+        }
+        if sync_allowed && (!ping || pong) {
+            break;
+        }
+    }
+    let line = format!("Received {frames} frame(s); SyncAllowed observed: {sync_allowed}");
+    if machine::enabled() {
+        // The pass ends on its count, which the throttle may have held back.
+        machine::progress(
+            machine::Progress::new("receive", "frames", frames, Some(frames)).message(line.clone()),
+        )?;
+        machine::report(
+            "probe",
+            &serde_json::json!({
+                "frames": received,
+                "sync_allowed": sync_allowed,
+                "ping_sent": ping,
+                "pong": ping.then_some(pong),
+                "pong_session": pong_session,
+                "trace_dir": trace_dir,
+                "message": line,
+            }),
+        )?;
+    } else {
+        println!("{line}");
+    }
+    if !sync_allowed {
+        bail!("SyncAllowed not observed; raw received frames retained, no sync initiated");
+    }
+    if ping {
+        if !machine::enabled() {
+            println!("Pong observed: {pong}");
+        }
+        if !pong {
+            bail!("Pong not observed; raw received frames retained, no sync initiated");
+        }
+    }
+    Ok(())
+}
+
 async fn syslog(
     provider: &device::DeviceProvider,
     duration: Duration,
@@ -1157,6 +1334,17 @@ async fn syslog(
         println!("{line}");
     }
     Ok(())
+}
+
+/// Print `line` on stdout, or under `--message-format json` write it as a
+/// notice named `code`.
+fn say(code: &'static str, line: String, fields: serde_json::Value) -> Result<()> {
+    if machine::enabled() {
+        machine::notice(code, machine::Level::Info, line, fields)
+    } else {
+        println!("{line}");
+        Ok(())
+    }
 }
 
 /// Whether a syslog capture keeps this line: one from a music process (Music,
