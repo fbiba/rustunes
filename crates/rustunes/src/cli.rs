@@ -1,5 +1,7 @@
 pub(crate) mod completions;
 pub(crate) mod config;
+mod logging;
+mod progress;
 use crate::engine;
 use crate::engine::execution::device;
 use crate::engine::planning::additive;
@@ -711,6 +713,13 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     text
+}
+
+fn render_plan(result: &engine::PlanResult, json: bool, add_only: bool) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    write_plan(&mut out, result, json, add_only)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// The plan as the terminal shows it, or its JSON document if `json`.

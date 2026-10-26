@@ -33,3 +33,4 @@ symphonia-bundle-mp3 = { version = "=0.5.4", default-features = false, features 
 symphonia-core = { version = "=0.5.4", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "net"] }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt"] }
