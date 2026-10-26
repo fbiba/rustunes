@@ -268,3 +268,48 @@ pub(super) fn notice(level: machine::Level, line: &str) {
         machine::Level::Warning => tracing::warn!(target: SHOWN, "{line}"),
     }
 }
+
+/// An engine event's line, as the terminal shows it. Results are logged as
+/// the lines they print on stdout; a plan and a removal's selection are not,
+/// as the run directory and the evidence keep them.
+pub(super) fn event(event: &Event<'_>) {
+    if floods(event) {
+        return;
+    }
+    let line = match event {
+        Event::SyncFinished(result) => Some(progress::finished(result).join("\n")),
+        Event::ApplyFinished(result) => Some(progress::applied(result)),
+        Event::CoverFinished(result) => Some(progress::covered(result)),
+        Event::Deletion(delete::Event::Completed {
+            removed,
+            deleted_playlists,
+            left,
+            evidence,
+        }) => Some(deletion::completed_line(
+            *removed,
+            *deleted_playlists,
+            *left,
+            *evidence,
+        )),
+        Event::Deletion(event) => deletion::line(event),
+        other => progress::line(other).ok().flatten(),
+    };
+    if let Some(line) = line.filter(|line| !line.is_empty()) {
+        tracing::info!(target: SHOWN, "{line}");
+    }
+}
+
+/// Progress reported once per chunk, and the per-track lines of a cached
+/// pass, which would flood the log.
+fn floods(event: &Event<'_>) -> bool {
+    progress::thinned(event)
+        || matches!(
+            event,
+            Event::Observation(
+                Observation::CopyingTrackAudio { .. } | Observation::InspectingSource { .. }
+            )
+        )
+}
+
+#[cfg(test)]
+mod tests;

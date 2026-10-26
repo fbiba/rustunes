@@ -10,6 +10,8 @@ mod machine;
 mod metadata_set;
 mod progress;
 mod pull;
+mod recovery;
+mod replace;
 mod source_inspection;
 pub(crate) mod source_scan;
 mod source_validation;
@@ -762,6 +764,26 @@ fn usb_config(selected: Option<String>) -> Result<engine::DeviceConfig> {
             .locked_in(phone_locks()),
     )
 }
+fn configured_engine() -> Result<engine::Engine> {
+    Ok(configured_engine_output(usb_config(None)?, false))
+}
+fn configured_engine_output(device: engine::DeviceConfig, deletion_json: bool) -> engine::Engine {
+    engine::Engine::new(
+        engine::Config {
+            device,
+            deadline: None,
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        move |event| {
+            logging::event(&event);
+            match event {
+                _ if machine::enabled() => machine::event(&event),
+                engine::Event::Deletion(event) => deletion::event(event, deletion_json),
+                other => progress::write(other),
+            }
+        },
+    )
+}
 
 async fn verify_command(
     engine: &engine::Engine,
@@ -855,6 +877,38 @@ async fn verify_command(
         }
     }
     Ok(success)
+}
+
+pub(crate) fn plan_command(
+    path: &std::path::Path,
+    saved: &std::path::Path,
+    journal_path: Option<&std::path::Path>,
+    output: Option<&std::path::Path>,
+    json: bool,
+    options: &source_collection::SelectionOptions,
+    add_only: bool,
+    flac_to_alac: bool,
+) -> Result<bool> {
+    let engine = configured_engine()?;
+    let result = engine.plan(engine::PlanRequest {
+        source: path,
+        snapshot: saved,
+        journal: journal_path,
+        output,
+        selection: options,
+        add_only,
+        flac_to_alac,
+    })?;
+    if machine::enabled() {
+        if !result.ready() {
+            machine::outcome("blocked");
+        }
+        machine::report("plan", &plan_report(&result))?;
+        machine::report_bytes("plan_document", &result.serialized)?;
+    } else {
+        render_plan(&result, json, add_only)?;
+    }
+    Ok(result.ready())
 }
 
 /// The plan's actions, counts and blockers, as a `plan` report: what the

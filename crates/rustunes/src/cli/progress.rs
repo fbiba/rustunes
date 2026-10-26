@@ -5,6 +5,40 @@ use crate::engine::{
 };
 use anyhow::Result;
 
+/// Terminal output for an engine event. `configured_engine_output` sends
+/// `--message-format json` output and deletion events elsewhere first.
+pub(crate) fn write(event: Event<'_>) -> Result<()> {
+    if thinned(&event) {
+        return Ok(());
+    }
+    // Progress only `--message-format json` reports.
+    if let Event::Observation(
+        Observation::CapturingCatalogue
+        | Observation::CopyingTrackAudio { .. }
+        | Observation::InspectingSource { .. }
+        | Observation::SourcesInspected { .. },
+    ) = event
+    {
+        return Ok(());
+    }
+    if let Some(line) = line(&event)? {
+        eprintln!("{line}");
+        return Ok(());
+    }
+    match event {
+        Event::PlanReady(result) => super::render_plan(result, false, result.add_only)?,
+        Event::SyncFinished(result) => {
+            for line in finished(result) {
+                println!("{line}");
+            }
+        }
+        Event::ApplyFinished(result) => println!("{}", applied(&result)),
+        Event::CoverFinished(result) => println!("{}", covered(&result)),
+        _ => {}
+    }
+    Ok(())
+}
+
 /// A cached pass's per-track line that is not printed: one line per track
 /// would flood the terminal and the log.
 pub(super) fn thinned(event: &Event<'_>) -> bool {
@@ -17,6 +51,156 @@ pub(super) fn thinned(event: &Event<'_>) -> bool {
             ..
         }) if completed % 50 != 0 && completed != total
     )
+}
+
+/// The progress line an event prints on stderr, if it prints one there.
+pub(super) fn line(event: &Event<'_>) -> Result<Option<String>> {
+    Ok(Some(match event {
+        Event::VerificationStarting => {
+            "Capturing current device state before read-only verification".into()
+        }
+        Event::Observation(observation) => observation_line(observation),
+        Event::Device(device::Event::DeviceDetected(transport)) => match transport {
+            device::Transport::Usb => "USB device detected (identifier omitted)".into(),
+            device::Transport::Wifi(address) => {
+                format!("Wi-Fi device detected at {address} (identifier omitted)")
+            }
+        },
+        Event::Device(device::Event::PairingRecordAvailable) => {
+            "Existing pairing record available".into()
+        }
+        Event::RunEvidence(path) => format!("Run evidence: {}", path.display()),
+        Event::ReadingDeviceSnapshot => {
+            "Reading device catalogue and audio identities for an exact comparison".into()
+        }
+        Event::ReadingSavedSnapshot => "Planning from the device snapshot".into(),
+        Event::ReadingCurrentState => {
+            "Reading current device state to reconcile the unfinished operation".into()
+        }
+        Event::InspectingSources { done, total } => {
+            format!("Inspected {done}/{total} selected sources")
+        }
+        Event::ComparingSources => {
+            "Comparing audio identities, metadata, artwork and destination reservations...".into()
+        }
+        Event::PlanSaved(path) => format!("Plan saved to {}", path.display()),
+        Event::SyncBlocked(holds) => blocked(holds),
+        Event::CheckingCover { number, total } => format!("Checking cover {number}/{total}"),
+        Event::AdditionStarted {
+            number,
+            total,
+            source,
+        } => format!("Adding {number}/{total}: {source:?}"),
+        Event::AudioInsertionVerified => {
+            "Verified audio and catalogue; embedded cover upload remains a separate step.".into()
+        }
+        Event::SyncContinuing { remaining } => format!(
+            "Batched additions done; planning again for {remaining} remaining action(s), one per session."
+        ),
+        Event::SyncResuming(reason) => {
+            format!("{reason}; planning again from a fresh capture for the rest.")
+        }
+        Event::FlacRefused { source, reason } => format!("Not sending {source:?}: {reason}"),
+        Event::ConvertingFlacs { directory } => format!(
+            "Converting FLACs to ALAC with FFmpeg in {}, a few at a time, ahead of their batches.",
+            directory.display()
+        ),
+        Event::CoverLeftOut(source) => format!(
+            "Leaving out the cover of {source:?}: its album on the phone shows another image, which push leaves as it is."
+        ),
+        Event::InsertBatchVerified {
+            inserted,
+            total,
+            removed: 0,
+        } => {
+            format!("Verified insert batch: {inserted}/{total} new tracks on the phone.")
+        }
+        Event::InsertBatchVerified {
+            inserted,
+            total,
+            removed,
+        } => format!(
+            "Verified insert batch: its session removed {removed} track(s), and {inserted}/{total} new tracks are on the phone."
+        ),
+        Event::UpdatesScheduled { tracks, sessions } => format!(
+            "Metadata updates of {tracks} track(s) fit in {sessions} metadata session(s); each is planned again from a fresh capture."
+        ),
+        Event::UpdatesRefused(reason) => {
+            format!("Metadata updates refused before any phone write:\n{reason}")
+        }
+        Event::MetadataBatchVerified { session, sessions } => {
+            format!("Verified metadata session {session}/{sessions}.")
+        }
+        Event::ReplacementPhase {
+            coordination,
+            phase,
+        } => format!("Replacement {coordination}: {phase}."),
+        Event::ReplacementRemoved { removed, total } => {
+            format!("Verified removal batch: {removed}/{total} tracks removed.")
+        }
+        Event::RefreshingBeforeSession => "Read-only catalogue drift before session; refreshing once with the same insertion intent.".into(),
+        Event::ArtworkRecentCountResets { plays, skips } => {
+            if !skips.is_empty() {
+                format!(
+                    "Artwork import may reset both recent-play and recent-skip counts to zero across the whole library; lifetime counts, dates and every other statistic must remain unchanged. Recent plays: {}; recent skips: {}",
+                    serde_json::to_string(plays)?,
+                    serde_json::to_string(skips)?
+                )
+            } else if !plays.is_empty() {
+                format!(
+                    "Artwork import may clear recent-play counters (lifetime counts and other statistics must remain unchanged): {}",
+                    serde_json::to_string(plays)?
+                )
+            } else {
+                return Ok(None);
+            }
+        }
+        Event::ArtworkStarted { track_id } => {
+            format!("Updating artwork for {track_id:016x}; preserving its verified audio file")
+        }
+        Event::JournalCarried {
+            earlier,
+            journal,
+            carried,
+            matched,
+            unbound,
+            gone,
+            covers_proven,
+            covers_unproven,
+            unfinished,
+        } => {
+            let mut text = format!(
+                "Carried the journal forward from {}: {carried} tracks carried, {matched} matched to library files, {unbound} left unbound, {gone} no longer on the phone",
+                earlier.display()
+            );
+            if let Some(covers) = super::pull::covers_text(*covers_proven, *covers_unproven) {
+                text.push('\n');
+                text.push_str(&covers);
+            }
+            if !unfinished.is_empty() {
+                text.push_str(&format!(
+                    "\nThe earlier journal had {}, which this version cannot resume; the new journal holds what the phone shows now",
+                    unfinished.join(" and ")
+                ));
+            }
+            text.push_str(&format!("\nJournal: {}", journal.display()));
+            text
+        }
+        Event::PullingTrack { number, title, .. } => {
+            format!("Copying phone track {number}: {title}")
+        }
+        // Byte counts and starts that only `--message-format json` reports.
+        Event::Uploading { .. }
+        | Event::TracksPulled { .. }
+        | Event::InsertBatchStarted { .. }
+        | Event::RemovalBatchStarted { .. } => return Ok(None),
+        // Results print on stdout, and the other renderers own their lines.
+        Event::Deletion(_)
+        | Event::PlanReady(_)
+        | Event::SyncFinished(_)
+        | Event::ApplyFinished(_)
+        | Event::CoverFinished(_) => return Ok(None),
+    }))
 }
 
 /// What a sync that sent nothing says: what holds it, and what to do.

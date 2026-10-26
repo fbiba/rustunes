@@ -261,6 +261,32 @@ fn render_selection(descriptor: &Value, path: &Path, json: bool) -> Result<()> {
     }
     Ok(())
 }
+/// The progress line a removal event prints on stderr, if it prints one there.
+pub(super) fn line(event: &Event<'_>) -> Option<String> {
+    Some(match event {
+        Event::InspectingSources { done, total } => format!("Inspected {done}/{total} sources"),
+        Event::Evidence(path) => format!("Removal evidence: {}", path.display()),
+        Event::Blocked => "Removal blocked; nothing was removed.".into(),
+        Event::Held { tracks: 0, .. } => "Nothing to remove.".into(),
+        Event::Held { tracks, sources } => format!(
+            "Holding the removal of {}: rustunes couldn't read {}, and that could be one of their files, moved. Nothing is removed this run; fix or move out the unreadable file, then sync again.",
+            match tracks {
+                1 => "1 track whose file left the library".to_owned(),
+                n => format!("{n} tracks whose files left the library"),
+            },
+            sources.join(", ")
+        ),
+        Event::DryRunComplete => "Dry run complete; nothing was removed.".into(),
+        Event::Cancelled => "Removal cancelled; nothing was removed.".into(),
+        Event::Step { number, total } => format!(
+            "Removal batch {number}/{total} verified: catalogue, surviving audio and removed files"
+        ),
+        Event::Settled { batch, state } => format!(
+            "Removal batch {batch} from an earlier run settled: {state}; no operation was sent again"
+        ),
+        Event::Selection { .. } | Event::Completed { .. } => return None,
+    })
+}
 /// What a finished removal prints on stdout.
 fn removals(n: usize) -> String {
     match n {
@@ -296,6 +322,53 @@ pub(super) fn completed_line(
             evidence.display()
         ),
     }
+}
+pub(super) fn event(event: Event<'_>, json: bool) -> Result<()> {
+    if super::machine::enabled() {
+        return super::machine::deletion(&event);
+    }
+    if let Some(line) = line(&event) {
+        eprintln!("{line}");
+        return Ok(());
+    }
+    match event {
+        Event::Selection { descriptor, path } => render_selection(descriptor, path, json)?,
+        Event::Completed {
+            removed: 0,
+            deleted_playlists: 0,
+            evidence: None,
+            ..
+        } => {
+            if json {
+                println!("{{\"event\":\"completed\",\"removed\":0}}");
+            } else {
+                println!("{}", completed_line(0, 0, 0, None));
+            }
+        }
+        Event::Completed {
+            removed,
+            deleted_playlists,
+            left,
+            evidence,
+        } => {
+            let evidence = evidence.context("completed removal evidence absent")?;
+            if json {
+                serde_json::to_writer(
+                    std::io::stdout().lock(),
+                    &json!({"event":"completed","removed":removed,
+                        "deleted_playlists":deleted_playlists,"left_for_sync":left,"evidence":evidence}),
+                )?;
+                println!();
+            } else {
+                println!(
+                    "{}",
+                    completed_line(removed, deleted_playlists, left, Some(evidence))
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]

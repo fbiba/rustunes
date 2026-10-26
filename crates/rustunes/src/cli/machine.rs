@@ -17,6 +17,7 @@ use std::{
 };
 
 mod events;
+pub(super) use events::{deletion, event};
 #[cfg(test)]
 mod tests;
 
