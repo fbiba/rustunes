@@ -13,6 +13,64 @@ use crate::engine::planning::source_collection::{
     self, Selection, SelectionOptions, SourceCollection,
 };
 
+/// Print one complete source report. False means an empty selection, inspection
+/// failures or unresolved audio duplicate groups; it never authorizes syncing.
+pub fn run(
+    root: &Path,
+    options: &SelectionOptions,
+    selection_only: bool,
+    json: bool,
+) -> Result<bool> {
+    let selection = source_collection::select(root, options)?;
+    let collection = if selection_only {
+        None
+    } else {
+        let mut last = std::time::Instant::now();
+        Some(source_collection::inspect_with_progress(
+            &selection,
+            |done, total| {
+                if super::machine::enabled() {
+                    return super::machine::progress(
+                        super::machine::Progress::new(
+                            "inspect_sources",
+                            "files",
+                            done,
+                            Some(total),
+                        )
+                        .message(format!("Inspected {done}/{total} source files")),
+                    );
+                }
+                if done == 0 || done == total || last.elapsed().as_secs() >= 5 {
+                    eprintln!("Inspected {done}/{total} source files");
+                    last = std::time::Instant::now();
+                }
+                Ok(())
+            },
+        )?)
+    };
+    let report = report(&selection, collection.as_ref())?;
+    let success = report["success"]
+        .as_bool()
+        .context("source report missing success state")?;
+    if super::machine::enabled() {
+        if !success {
+            super::machine::outcome("findings");
+        }
+        super::machine::report("scan", &report)?;
+        return Ok(success);
+    }
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    if json {
+        serde_json::to_writer_pretty(&mut stdout, &report)?;
+        stdout.write_all(b"\n")?;
+    } else {
+        stdout.write_all(human(&report)?.as_bytes())?;
+    }
+    stdout.flush()?;
+    Ok(success)
+}
+
 fn path_text(path: &Path) -> Result<&str> {
     path.to_str().context("source report requires UTF-8 paths")
 }

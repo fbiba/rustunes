@@ -4,6 +4,7 @@ pub(crate) mod config;
 pub(crate) mod device_view;
 pub(crate) mod library_view;
 mod logging;
+mod machine;
 mod progress;
 mod source_inspection;
 pub(crate) mod source_scan;
@@ -617,6 +618,100 @@ fn usb_config(selected: Option<String>) -> Result<engine::DeviceConfig> {
     )
 }
 
+async fn verify_command(
+    engine: &engine::Engine,
+    saved: &std::path::Path,
+    journal_path: &std::path::Path,
+    trace: &std::path::Path,
+    tracks: Vec<u64>,
+    seconds: u64,
+    json: bool,
+) -> Result<bool> {
+    let report = engine
+        .verify(engine::VerificationRequest {
+            snapshot: saved,
+            journal: journal_path,
+            trace,
+            tracks,
+            seconds,
+        })
+        .await?;
+    let success = report.verification_completed && report.status != "complete_with_findings";
+    if machine::enabled() {
+        if report.status == "complete_with_findings" {
+            machine::outcome("findings");
+        }
+        machine::report("verification", &report)?;
+        return Ok(success);
+    }
+    if json {
+        serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+        println!();
+    } else {
+        let verified = report
+            .tracks
+            .iter()
+            .filter(|t| t.audio_status == crate::engine::verification::journal::AudioStatus::VerifiedTransferredContainer)
+            .count();
+        println!(
+            "Verified {verified}/{} transferred audio files; {} bytes selected.",
+            report.selected_bindings, report.planned_audio_bytes
+        );
+        for row in &report.tracks {
+            if let Some(finding) = row.finding {
+                println!("{}: {finding}", row.track_id);
+            }
+            if !matches!(
+                row.artwork.registration,
+                "not_journaled" | "track_registration_matches"
+            ) {
+                println!(
+                    "{}: artwork registration {}",
+                    row.track_id, row.artwork.registration
+                );
+            }
+            if let Some(reason) = &row.artwork.permanent_cache_failure {
+                println!(
+                    "{}: artwork verification failed: {}",
+                    row.track_id,
+                    serde_json::to_string(reason)?
+                );
+            }
+        }
+        let proofs = || {
+            report
+                .tracks
+                .iter()
+                .filter_map(|t| t.artwork.permanent_cache_proof.as_ref())
+        };
+        let covers = proofs().count();
+        let small = proofs().filter(|p| p.derivative.is_none()).count();
+        let empty = proofs()
+            .filter(|p| p.derivative.is_some() && !p.derivative_entropy_decode_verified)
+            .count();
+        if empty == 0 && small == 0 {
+            println!(
+                "Verified {covers} journaled track covers and decoded derivatives. Shared album covers are reported separately; source metadata is not reconstructed."
+            );
+        } else {
+            let too_small = match small {
+                0 => String::new(),
+                n => format!(", {n} too small for the phone to make a rendition"),
+            };
+            println!(
+                "Verified {covers} journaled track covers: {} with decoded derivatives, {empty} whose rendition the phone left empty{too_small}. Shared album covers are reported separately; source metadata is not reconstructed.",
+                covers - empty - small
+            );
+        }
+        if report.outstanding_attempt_present {
+            println!(
+                "An unfinished journal attempt still requires reconciliation; verify does not change its state."
+            );
+        }
+    }
+    Ok(success)
+}
+
 /// The plan's actions, counts and blockers, as a `plan` report: what the
 /// terminal shows of it. The complete plan is the file at `plan_file`.
 pub(crate) fn plan_report(result: &engine::PlanResult) -> serde_json::Value {
@@ -694,6 +789,24 @@ pub(crate) fn plan_report(result: &engine::PlanResult) -> serde_json::Value {
         "preserved_unmatched_device_tracks": plan.preserved_unmatched_device_tracks.len(),
         "excluded_sources": result.source_exclusions,
     })
+}
+
+/// Write a report: under `--message-format json` as a `report` record of
+/// what `write` prints as JSON; otherwise what it prints, as JSON if `json`.
+fn render(
+    kind: &'static str,
+    json: bool,
+    write: impl FnOnce(bool, &mut Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    if machine::enabled() {
+        return machine::report_from(kind, |out| write(true, out));
+    }
+    let mut out = Vec::new();
+    write(json, &mut out)?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&out)?;
+    stdout.flush()?;
+    Ok(())
 }
 
 /// The `catalog` columns, as a `catalog` report.
@@ -930,6 +1043,120 @@ async fn connected_provider() -> Result<device::DeviceProvider> {
     timeout(Duration::from_secs(15), device::provider())
         .await
         .context("timed out discovering the device")?
+}
+
+async fn device_info(
+    provider: &device::DeviceProvider,
+    json: bool,
+    domain: Option<&str>,
+) -> Result<()> {
+    let pairing = provider.get_pairing_file().await?;
+    let mut lockdown = LockdownClient::connect(provider)
+        .await
+        .context("connecting to Lockdown")?;
+    lockdown
+        .start_session(&pairing)
+        .await
+        .context("starting existing paired Lockdown session")?;
+    if let Some(domain) = domain {
+        let value = lockdown
+            .get_value(None, Some(domain))
+            .await
+            .with_context(|| format!("reading Lockdown domain {domain}"))?;
+        if machine::enabled() {
+            return machine::report(
+                "lockdown_domain",
+                &serde_json::json!({"domain": domain, "value": plist_json(&value)}),
+            );
+        }
+        let mut out = std::io::stdout().lock();
+        value.to_writer_xml(&mut out)?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    let mut details = std::collections::BTreeMap::new();
+    for key in ["ProductType", "ProductVersion", "BuildVersion"] {
+        let value = lockdown
+            .get_value(Some(key), None)
+            .await
+            .with_context(|| format!("reading Lockdown {key}"))?;
+        let text = value.as_string().context("expected string device detail")?;
+        details.insert(key, text.to_owned());
+    }
+    let report = serde_json::json!({"schema":"rustunes.device-info","details":details,"paired_session_established":true,"phone_writes":0});
+    if machine::enabled() {
+        machine::report("device_info", &report)?;
+    } else if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for (key, value) in details {
+            println!("{key}: {}", serde_json::to_string(&value)?);
+        }
+    }
+    Ok(())
+}
+
+async fn syslog(
+    provider: &device::DeviceProvider,
+    duration: Duration,
+    output: PathBuf,
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = private_file(&output)?;
+    let mut client = timeout(
+        Duration::from_secs(20),
+        SyslogRelayClient::connect(provider),
+    )
+    .await
+    .context("timed out starting device syslog")?
+    .context("starting device syslog")?;
+    let deadline = Instant::now() + duration;
+    let mut count = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let line = match timeout(remaining, client.next()).await {
+            Ok(result) => result.context("reading device syslog")?,
+            Err(_) => break,
+        };
+        if relevant_syslog(&line) {
+            writeln!(file, "{line}")?;
+            count += 1;
+            if machine::enabled() {
+                let elapsed =
+                    duration.saturating_sub(deadline.saturating_duration_since(Instant::now()));
+                machine::progress(
+                    machine::Progress::new(
+                        "receive",
+                        "seconds",
+                        elapsed.as_secs() as usize,
+                        Some(duration.as_secs() as usize),
+                    )
+                    .current(serde_json::json!({"lines": count}))
+                    .message(format!("Captured {count} relevant syslog line(s)")),
+                )?;
+            }
+        }
+    }
+    let line = format!("Captured {count} relevant syslog line(s); private file retained");
+    if machine::enabled() {
+        let seconds = duration.as_secs() as usize;
+        machine::progress(
+            machine::Progress::new("receive", "seconds", seconds, Some(seconds))
+                .current(serde_json::json!({"lines": count}))
+                .message(line.clone()),
+        )?;
+        machine::report(
+            "syslog",
+            &serde_json::json!({"lines": count, "output": output, "message": line}),
+        )?;
+    } else {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// Whether a syslog capture keeps this line: one from a music process (Music,

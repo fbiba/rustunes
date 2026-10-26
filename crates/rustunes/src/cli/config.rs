@@ -70,6 +70,48 @@ pub(super) fn library() -> Result<PathBuf> {
     )
 }
 
+/// `config library [DIR]`: set the library directory, or print it.
+pub(super) fn set_library(directory: Option<&Path>) -> Result<()> {
+    let file = path()?;
+    let mut settings = read(&file)?;
+    let Some(directory) = directory else {
+        if super::machine::enabled() {
+            return super::machine::report(
+                "config",
+                &serde_json::json!({"file": file, "library": settings.library, "changed": false}),
+            );
+        }
+        match &settings.library {
+            Some(library) => println!("{}", library.display()),
+            None => eprintln!(
+                "No library directory is set; set one with `rustunes config library DIR`."
+            ),
+        }
+        return Ok(());
+    };
+    let library =
+        fs::canonicalize(directory).with_context(|| format!("opening {}", directory.display()))?;
+    ensure!(
+        library.is_dir(),
+        "{} is not a directory; `push` sends a single file",
+        library.display()
+    );
+    library
+        .to_str()
+        .context("the library directory's path is not UTF-8")?;
+    settings.library = Some(library.clone());
+    write(&file, &settings)?;
+    if super::machine::enabled() {
+        return super::machine::report(
+            "config",
+            &serde_json::json!({"file": file, "library": library, "changed": true}),
+        );
+    }
+    println!("Library directory: {}", library.display());
+    println!("`rustunes sync` now mirrors it to the phone.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
