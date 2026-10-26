@@ -1,5 +1,8 @@
+mod cache_view;
 pub(crate) mod completions;
 pub(crate) mod config;
+pub(crate) mod device_view;
+pub(crate) mod library_view;
 mod logging;
 mod progress;
 mod source_inspection;
@@ -88,6 +91,25 @@ enum MessageFormat {
 }
 
 #[derive(Subcommand)]
+enum MetadataCommand {
+    /// Plan a complete typed metadata request against saved owned audio; never execute.
+    Plan {
+        #[arg(value_parser = library_view::parse_id)]
+        track: u64,
+        /// Complete Preserve/Set/Clear JSON request.
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        journal: PathBuf,
+        /// Save the nonauthorizing intent to a new private file.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigCommand {
     /// Set the library directory `sync` mirrors and `push` and `pull` default to; without DIR, print it.
     Library { directory: Option<PathBuf> },
@@ -95,6 +117,11 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Edit explicit fields of a track on the phone, or plan a typed metadata request.
+    Metadata {
+        #[command(subcommand)]
+        action: MetadataCommand,
+    },
     /// Discover USB devices and inspect the selected paired phone.
     Device {
         #[command(subcommand)]
@@ -241,6 +268,23 @@ enum Command {
         /// Inspect the current device and report the exact artwork proposal without writes or reservations.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Read back verified journal audio and check current device catalogue registrations.
+    Verify {
+        /// Complete snapshot identifying the device and library; current state is captured again.
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        journal: PathBuf,
+        #[arg(long)]
+        trace_dir: PathBuf,
+        /// Verify only these journal track IDs; repeat to select more.
+        #[arg(long, value_parser = library_view::parse_id)]
+        track: Vec<u64>,
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=1800))]
+        seconds: u64,
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect local verified transfers and unfinished work without connecting to the phone.
     Status {
@@ -455,6 +499,11 @@ enum LibraryCommand {
         /// Exact album label.
         #[arg(long)]
         album: Option<String>,
+    },
+    /// Show metadata and device location for a track ID from library list.
+    Show {
+        #[arg(value_parser = library_view::parse_id)]
+        id: u64,
     },
     /// Show track, album, artist, size and artwork registration totals.
     Stats,
