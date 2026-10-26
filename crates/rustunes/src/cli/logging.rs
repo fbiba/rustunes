@@ -8,6 +8,7 @@
 //! A run that fails, with an error or a panic, keeps its log in
 //! `logs/failed` as well, where later runs do not rotate it away, and prints
 //! the last lines of it the terminal did not show, then where it is.
+use super::{deletion, machine, progress};
 use crate::engine::{Event, Observation, execution::delete, state::layout};
 use music_protocol::protocol::trace::private_file;
 
@@ -46,6 +47,60 @@ static FAILED: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// The last [`RECENT`] lines of the log the terminal did not show, unless
 /// `--verbose` printed them.
 static RECENT_LINES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+/// Start this run's log. Only an unreadable `RUSTUNES_LOG` fails; without a
+/// usable state directory the run goes without a file. `verbose` counts `-v`.
+pub(super) fn start(verbose: u8) -> Result<()> {
+    let filter = filter(verbose, std::env::var("RUSTUNES_LOG"))?;
+    let (file, unopened) = match open() {
+        Ok((path, file)) => {
+            let _ = PATH.set(path);
+            let layer = fmt::layer()
+                .with_writer(Arc::new(file))
+                .with_ansi(false)
+                .with_filter(filter.clone());
+            (Some(layer), None)
+        }
+        Err(error) => (None, Some(error)),
+    };
+    let unshown = filter.with_target(SHOWN, LevelFilter::OFF);
+    let (stderr, recent) = if verbose > 0 {
+        let layer = fmt::layer()
+            .with_writer(io::stderr)
+            .with_ansi(false)
+            .with_filter(unshown);
+        (Some(layer), None)
+    } else {
+        let layer = fmt::layer()
+            .with_writer(|| Recent(Vec::new()))
+            .with_ansi(false)
+            .without_time()
+            .with_filter(unshown);
+        (None, Some(layer))
+    };
+    let _ = tracing_subscriber::registry()
+        .with(file)
+        .with(stderr)
+        .with(recent)
+        .try_init();
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(target: SHOWN, "{info}\n{backtrace}");
+        keep();
+        default(info);
+        dump();
+    }));
+    if let Some(error) = unopened {
+        tracing::warn!("This run has no log file: {error:#}");
+    }
+    tracing::info!(target: "rustunes", "{}", platform());
+    let args: Vec<_> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    tracing::info!(target: "rustunes", "Command line: {args:?}");
+    Ok(())
+}
 
 /// One line of the log, added to [`RECENT_LINES`] once it is written.
 struct Recent(Vec<u8>);
@@ -173,4 +228,43 @@ fn keep() -> Option<&'static Path> {
             Some(kept)
         })
         .as_deref()
+}
+
+/// After a failure, outside `--message-format json`: the last lines of the
+/// log the terminal did not show, then where the log is kept. `--verbose`
+/// printed those lines already, and the `start` record names the log.
+pub(super) fn dump() {
+    if machine::enabled() {
+        return;
+    }
+    let recent = std::mem::take(&mut *RECENT_LINES.lock().unwrap_or_else(|e| e.into_inner()));
+    if !recent.is_empty() {
+        eprintln!("Last lines of the log not shown above:");
+        for line in recent {
+            eprintln!("  {line}");
+        }
+    }
+    if let Some(path) = keep().or(path()) {
+        eprintln!("Log of this run: {}", path.display());
+    }
+}
+
+/// The command's end: the error it failed with, which keeps the log, or its
+/// exit code.
+pub(super) fn finished(result: &Result<ExitCode>) {
+    match result {
+        Err(error) => {
+            tracing::error!(target: SHOWN, "{error:?}");
+            keep();
+        }
+        Ok(_) => tracing::info!("Finished with exit code {}", machine::exit_code(result)),
+    }
+}
+
+/// A notice's line, as the terminal shows it.
+pub(super) fn notice(level: machine::Level, line: &str) {
+    match level {
+        machine::Level::Info => tracing::info!(target: SHOWN, "{line}"),
+        machine::Level::Warning => tracing::warn!(target: SHOWN, "{line}"),
+    }
 }

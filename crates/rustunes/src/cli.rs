@@ -1,11 +1,15 @@
 mod cache_view;
+mod change_plan;
 pub(crate) mod completions;
 pub(crate) mod config;
+mod deletion;
 pub(crate) mod device_view;
 pub(crate) mod library_view;
 mod logging;
 mod machine;
+mod metadata_set;
 mod progress;
+mod pull;
 mod source_inspection;
 pub(crate) mod source_scan;
 mod source_validation;
@@ -108,6 +112,30 @@ enum MetadataCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Edit a track's fields on the phone in one verified native session.
+    Set {
+        #[arg(value_parser = library_view::parse_id)]
+        track: u64,
+        #[command(flatten)]
+        fields: metadata_set::Fields,
+        /// Plan against this saved snapshot instead of the phone (dry runs only).
+        #[arg(long, requires = "dry_run")]
+        snapshot: Option<PathBuf>,
+        #[arg(long)]
+        journal: Option<PathBuf>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Show the edit without sending it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Send without an interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, default_value = "rustunes")]
+        host_name: String,
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=1800))]
+        seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,6 +150,27 @@ enum Command {
     Metadata {
         #[command(subcommand)]
         action: MetadataCommand,
+    },
+    /// Remove absent tracks inserted by this tool for the exact source directory.
+    Prune {
+        path: PathBuf,
+        /// Read the files in subfolders too, as for tracks sent with `--recursive`; without it only the files directly in the directory are read.
+        #[arg(long)]
+        recursive: bool,
+        #[command(flatten)]
+        options: deletion::Options,
+    },
+    /// Remove exact track IDs in verified batches, with a saved plan.
+    Delete {
+        #[arg(required = true, value_name = "TRACK_ID")]
+        ids: Vec<String>,
+        #[command(flatten)]
+        options: deletion::Options,
+    },
+    /// Remove every track in verified batches, then delete every ordinary playlist (smart, folder and phone-made playlists stay); running it again continues an unfinished Clear.
+    Clear {
+        #[command(flatten)]
+        options: deletion::Options,
     },
     /// Discover USB devices and inspect the selected paired phone.
     Device {
@@ -558,6 +607,43 @@ fn parse() -> std::result::Result<(Cli, Option<(String, serde_json::Value)>), Ex
     Ok((cli, operation))
 }
 
+/// A notice: a record under `--message-format json`, else its line on
+/// stderr. Either way the line goes to the log.
+fn notice(
+    code: &'static str,
+    level: machine::Level,
+    line: impl Into<String>,
+    fields: serde_json::Value,
+) -> Result<()> {
+    let line = line.into();
+    logging::notice(level, &line);
+    if machine::enabled() {
+        machine::notice(code, level, line, fields)
+    } else {
+        eprintln!("{line}");
+        Ok(())
+    }
+}
+
+/// The state directory a command can add runs to. Once it has run, the runs
+/// there no journal needs are removed and the finished ones trimmed.
+fn run_state(command: &Command) -> Option<PathBuf> {
+    let chosen = match command {
+        Command::Sync { state_dir, .. }
+        | Command::Push { state_dir, .. }
+        | Command::Pull { state_dir, .. }
+        | Command::Apply { state_dir, .. }
+        | Command::Metadata {
+            action: MetadataCommand::Set { state_dir, .. },
+        } => state_dir.clone(),
+        Command::Prune { options, .. }
+        | Command::Delete { options, .. }
+        | Command::Clear { options } => options.state_dir().map(std::path::Path::to_path_buf),
+        _ => return None,
+    };
+    chosen.map(Ok).unwrap_or_else(default_state_directory).ok()
+}
+
 /// The fingerprint cache for every index pass in this run.
 /// Without a resolvable state directory, passes copy every file as before.
 pub(crate) fn fingerprint_cache(
@@ -616,6 +702,37 @@ const MAX_BATCH: u64 = crate::engine::planning::change::MAX_BATCH as u64;
 /// A session's operations by default: all one operation file holds, as
 /// sessions of 499 insertions and of 499 removals were verified on the phone.
 const DEFAULT_BATCH: u64 = crate::engine::planning::change::DEFAULT_BATCH as u64;
+
+/// Commands that open phone services; the rest work from local files.
+fn reaches_phone(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Metadata {
+            action: MetadataCommand::Set { .. },
+        } | Command::Prune { .. }
+            | Command::Delete { .. }
+            | Command::Clear { .. }
+            | Command::Device {
+                view: DeviceCommand::Info { .. },
+            }
+            | Command::Resume { .. }
+            | Command::Sync { .. }
+            | Command::Push { .. }
+            | Command::Pull { .. }
+            | Command::Artwork { .. }
+            | Command::Verify { .. }
+            | Command::Apply {
+                check_only: false,
+                ..
+            }
+            | Command::Snapshot { .. }
+            | Command::Library { .. }
+            | Command::Catalog { .. }
+            | Command::DeviceInfo
+            | Command::Probe { .. }
+            | Command::Syslog { .. }
+    )
+}
 
 /// USB unless --wifi or --wifi-address chose Wi-Fi.
 fn device_config(cli: &Cli) -> Result<engine::DeviceConfig> {
@@ -1404,6 +1521,9 @@ pub(crate) fn write_artwork_recent_disclosure(
     Ok(())
 }
 
+#[cfg(test)]
+mod metadata_intent_tests;
+
 fn default_state_directory() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
         let path = PathBuf::from(path);
@@ -1413,4 +1533,24 @@ fn default_state_directory() -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("set --state-dir or HOME")?);
     anyhow::ensure!(home.is_absolute(), "HOME must be absolute; use --state-dir");
     Ok(home.join(".local/state/rustunes"))
+}
+
+async fn remove(
+    options: deletion::Options,
+    mode: engine::DeletionMode,
+    engine: &engine::Engine,
+) -> Result<bool> {
+    let yes = options.yes();
+    let state = options
+        .state_dir()
+        .map(std::path::Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(default_state_directory)?;
+    let request = options.into_request(state);
+    Ok(engine
+        .delete(request, mode, &mut |selection| {
+            deletion::confirm_selection(selection, yes)
+        })
+        .await?
+        .ready())
 }
