@@ -1111,6 +1111,9 @@ pub(super) fn link_step(c: &Connection, coordination: CoordinationId, work: Work
     Ok(())
 }
 
+#[cfg(test)]
+mod tests;
+
 /// Prepare `intent` in `tx`, as `Journal::prepare_removal_batch` does; with
 /// `session`, as the removal half of that Prepared insert batch's session.
 pub(super) fn prepare_removal(
