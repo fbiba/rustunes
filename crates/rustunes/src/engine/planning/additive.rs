@@ -170,6 +170,15 @@ mod managed_audio;
 pub use managed_audio::ManagedAudioReplacement;
 pub(crate) use managed_audio::source_paths;
 
+#[cfg(test)]
+pub(crate) async fn check_managed_audio_ordinary_entrypoint<F, Fut>(run: F)
+where
+    F: FnOnce(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    managed_audio_tests::ordinary_audio_entrypoint_fixture(run).await;
+}
+
 #[derive(Serialize)]
 pub struct SourceDecision {
     pub relative_path: String,
@@ -2136,3 +2145,6 @@ fn hex(value: &[u8; 32]) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod managed_audio_tests;

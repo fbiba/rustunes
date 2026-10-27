@@ -1043,6 +1043,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn managed_audio_plan_ordinary_sync_dry_and_saved_loader_share_internal_context() {
+        crate::engine::planning::additive::check_managed_audio_ordinary_entrypoint(
+            |source, state, snapshot| async move {
+                crate::engine::offline_test_engine(Path::new("/nonexistent/usbmuxd"))
+                    .sync(Options {
+                        source: &source,
+                        state: &state,
+                        snapshot: Some(&snapshot),
+                        journal: None,
+                        selection: &Default::default(),
+                        host_name: "offline-test",
+                        dry_run: true,
+                        seconds: 5,
+                        add_only: false,
+                        batch_size: 1,
+                        flac_to_alac: false,
+                        pinned: None,
+                        library: None,
+                        removals: &[],
+                    })
+                    .await
+                    .map(|result| result.ready())
+            },
+        )
+        .await;
+    }
+
     use super::*;
     use crate::{
         engine::planning::additive::{ExistingMatch, SourceDecision},
