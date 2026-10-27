@@ -2133,3 +2133,6 @@ fn wire(value: u64) -> String {
 fn hex(value: &[u8; 32]) -> String {
     value.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(test)]
+pub(crate) mod tests;
