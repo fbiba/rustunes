@@ -4,6 +4,7 @@ pub(crate) mod completions;
 pub(crate) mod config;
 mod deletion;
 pub(crate) mod device_view;
+pub(crate) mod journal_view;
 pub(crate) mod library_view;
 mod logging;
 mod machine;
@@ -581,6 +582,33 @@ enum DeviceCommand {
     },
 }
 
+pub async fn run() -> Result<ExitCode> {
+    let (cli, operation) = match parse() {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(code),
+    };
+    let logged = logging::start(cli.verbose);
+    // The command's future is large; it lives on the heap, not main's stack.
+    let run = Box::pin(async move {
+        logged?;
+        run_parsed(cli).await
+    });
+    if let Some((name, options)) = operation {
+        machine::enable(&name, options, logging::path())?;
+        let result = run.await;
+        logging::finished(&result);
+        return Ok(machine::finish(result));
+    }
+    let result = run.await;
+    logging::finished(&result);
+    result.or_else(|error| {
+        // As main would print it, then what the log adds.
+        eprintln!("Error: {error:?}");
+        logging::dump();
+        Ok(ExitCode::FAILURE)
+    })
+}
+
 /// The command line, and under `--message-format json` the operation it
 /// names. A line clap refuses exits here, or with records and code 2 under
 /// `--message-format json`.
@@ -607,6 +635,114 @@ fn parse() -> std::result::Result<(Cli, Option<(String, serde_json::Value)>), Ex
     let operation =
         (cli.message_format == MessageFormat::Json).then(|| machine::operation(&command, &matches));
     Ok((cli, operation))
+}
+
+async fn run_parsed(cli: Cli) -> Result<ExitCode> {
+    // Converting needs FFmpeg: find it before anything else, the phone
+    // included.
+    if matches!(
+        cli.command,
+        Command::Sync {
+            flac_to_alac: true,
+            ..
+        } | Command::Push {
+            flac_to_alac: true,
+            ..
+        } | Command::Plan {
+            flac_to_alac: true,
+            ..
+        }
+    ) {
+        crate::engine::execution::flac_to_alac::require_ffmpeg()?;
+    }
+    let deletion_json = match &cli.command {
+        Command::Prune { options, .. }
+        | Command::Delete { options, .. }
+        | Command::Clear { options } => options.json(),
+        _ => false,
+    };
+    let engine = configured_engine_output(device_config(&cli)?, deletion_json);
+    let cache = fingerprint_cache(cli.full_readback);
+    if let Ok(state) = default_state_directory() {
+        source_reads::persist(state.join("source-cache"), !cli.full_readback);
+    }
+    let find_first = (cli.wifi || cli.wifi_address.is_some()) && reaches_phone(&cli.command);
+    if find_first && machine::enabled() {
+        machine::phase("find_device", Some("Finding the phone over Wi-Fi".into()))?;
+    }
+    if find_first && let Some((path, options)) = sources_to_warm(&cli.command) {
+        // Finding and holding the phone takes seconds of waiting; the sources
+        // planning will hash are read meanwhile.
+        std::thread::spawn(move || {
+            if let Ok(selection) = source_collection::select(&path, &options) {
+                source_reads::warm(selection.files().iter().map(|s| s.path()));
+            }
+        });
+    }
+    let runs_in = run_state(&cli.command);
+    let dispatched = async {
+        if find_first {
+            // Waking and holding a Wi-Fi phone takes longer than the bounds
+            // later operations allow for discovery; they reuse what it found.
+            timeout(WIFI_DISCOVERY, device::provider())
+                .await
+                .context("timed out finding the phone over Wi-Fi")??;
+        }
+        dispatch(cli, &engine).await.map_err(|error| {
+            if device::phone_slept() {
+                error.context(
+                    "the phone went to sleep during this Wi-Fi command and closed its connections; try again, and if it keeps happening, unlock the phone and keep its screen on",
+                )
+            } else {
+                error
+            }
+        })
+    };
+    let (result, counts) =
+        crate::engine::state::audio_index::cache::scope_counted(cache, engine.scope(dispatched))
+            .await;
+    for (cache, (reused, stored), line) in counts.lines() {
+        notice(
+            "cache_counts",
+            machine::Level::Info,
+            line,
+            serde_json::json!({"cache": cache, "reused": reused, "stored": stored}),
+        )?;
+    }
+    if let Some((reused, stored)) = source_reads::report() {
+        notice(
+            "cache_counts",
+            machine::Level::Info,
+            format!("Source cache: {reused} reads reused, {stored} stored"),
+            serde_json::json!({"cache": "source_reads", "reused": reused, "stored": stored}),
+        )?;
+    }
+    if result.is_ok()
+        && let Some(state) = runs_in
+    {
+        let (code, level, line, fields) = match layout::prune_runs(&state) {
+            Ok(pruned) if pruned == layout::Pruned::default() => return result,
+            Ok(pruned) => (
+                "runs_pruned",
+                machine::Level::Info,
+                format!(
+                    "Freed {} MB of earlier runs: {} no journal needs removed, {} finished trimmed to what planning reads",
+                    pruned.bytes / 1_000_000,
+                    pruned.removed,
+                    pruned.trimmed
+                ),
+                serde_json::json!({"removed": pruned.removed, "trimmed": pruned.trimmed, "bytes": pruned.bytes}),
+            ),
+            Err(error) => (
+                "runs_kept",
+                machine::Level::Warning,
+                format!("Earlier runs not pruned: {error:#}"),
+                serde_json::json!({"error": format!("{error:#}")}),
+            ),
+        };
+        notice(code, level, line, fields)?;
+    }
+    result
 }
 
 /// A notice: a record under `--message-format json`, else its line on
@@ -783,6 +919,770 @@ fn configured_engine_output(device: engine::DeviceConfig, deletion_json: bool) -
             }
         },
     )
+}
+
+async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
+    match cli.command {
+        Command::Cache { action } => {
+            let directory = fingerprint_cache_directory()?;
+            match action {
+                CacheCommand::Stats { unseen_days, json } => {
+                    let statistics = crate::engine::state::audio_index::cache::statistics(
+                        &directory,
+                        unseen_days,
+                    )?;
+                    render("cache_statistics", json, |json, out| {
+                        cache_view::statistics(&statistics, json, out)
+                    })?
+                }
+                CacheCommand::Prune {
+                    unseen_days,
+                    dry_run,
+                    json,
+                } => {
+                    let removed = crate::engine::state::audio_index::cache::prune(
+                        &directory,
+                        unseen_days,
+                        dry_run,
+                    )?;
+                    if dry_run {
+                        machine::outcome("dry_run");
+                    }
+                    render("cache_prune", json, |json, out| {
+                        cache_view::prune(removed, unseen_days, dry_run, json, out)
+                    })?
+                }
+            }
+        }
+        Command::Prune {
+            path,
+            recursive,
+            options,
+        } => {
+            let mode = engine::DeletionMode::Prune {
+                source: path,
+                recursive,
+            };
+            if !remove(options, mode, engine).await? {
+                return Ok(ExitCode::from(3));
+            }
+        }
+        Command::Delete { ids, options } => {
+            let ids = ids
+                .iter()
+                .map(|id| id.parse())
+                .collect::<Result<Vec<engine::TrackId>, _>>()?;
+            if !remove(options, engine::DeletionMode::Delete(ids), engine).await? {
+                return Ok(ExitCode::from(3));
+            }
+        }
+        Command::Clear { options } => {
+            if !remove(options, engine::DeletionMode::Clear, engine).await? {
+                return Ok(ExitCode::from(3));
+            }
+        }
+        Command::Device {
+            view: DeviceCommand::List { json },
+        } => {
+            if machine::enabled() {
+                let mut out = Vec::new();
+                device_view::list(true, &mut out).await?;
+                machine::report_bytes("devices", &out)?;
+            } else {
+                device_view::list(json, &mut std::io::stdout().lock()).await?;
+            }
+        }
+        Command::Device {
+            view: DeviceCommand::Info { json, domain },
+        } => {
+            let provider = connected_provider().await?;
+            timeout(
+                Duration::from_secs(20),
+                device_info(&provider, json, domain.as_deref()),
+            )
+            .await
+            .context("timed out reading paired device information")??;
+        }
+        Command::Resume {
+            snapshot,
+            journal,
+            run_dir,
+            trace_dir,
+            cancel_prepared,
+            json,
+        } => {
+            let request = engine::RecoveryRequest {
+                snapshot: &snapshot,
+                journal: &journal,
+                run_dir: run_dir.as_deref(),
+                trace: &trace_dir,
+                cancel_prepared,
+                selected_device: cli.device.as_deref(),
+            };
+            let report = engine.recover(request).await?;
+            let success = recovery::render(&report, json)?;
+            return Ok(if success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            });
+        }
+        Command::Completions { shell } => {
+            if machine::enabled() {
+                let mut script = Vec::new();
+                completions::bash(Cli::command(), &mut script)?;
+                machine::report(
+                    "completions",
+                    &serde_json::json!({"shell": shell, "script": String::from_utf8(script)?}),
+                )?;
+            } else {
+                completions::bash(Cli::command(), &mut std::io::stdout().lock())?;
+            }
+        }
+        Command::Sync {
+            replace_library,
+            replace_changed,
+            yes,
+            state_dir,
+            journal,
+            dry_run,
+            host_name,
+            seconds,
+            batch_size,
+            flac_to_alac,
+            recursive,
+        } => {
+            let library = config::library()?;
+            let state = state_dir.map(Ok).unwrap_or_else(default_state_directory)?;
+            let selection = source_collection::SelectionOptions {
+                recursive,
+                ..Default::default()
+            };
+            if replace_changed || replace_library {
+                let success = replace::run(
+                    engine::ReplaceRequest {
+                        kind: if replace_library {
+                            engine::ReplaceKind::Library
+                        } else {
+                            engine::ReplaceKind::Changed
+                        },
+                        source: &library,
+                        state: &state,
+                        journal: journal.as_deref(),
+                        selection: &selection,
+                        host_name: &host_name,
+                        seconds,
+                        batch_size: batch_size as usize,
+                        dry_run,
+                        flac_to_alac,
+                        pinned: None,
+                    },
+                    yes,
+                    engine,
+                )
+                .await?;
+                return Ok(if success {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(3)
+                });
+            }
+            // Removal goes first: what it frees is not planned again, and a
+            // source re-encoded under a new name then adds cleanly. What does
+            // not fill a batch is left to the sync, whose first insert batch
+            // removes it in its session before the new tracks.
+            let removal = engine
+                .delete(
+                    engine::DeletionRequest {
+                        dry_run,
+                        snapshot: None,
+                        journal: journal.clone(),
+                        state_dir: state.clone(),
+                        output: None,
+                        host_name: host_name.clone(),
+                        seconds,
+                        batch_size: batch_size as usize,
+                        leave_for_sync: true,
+                        pinned: None,
+                    },
+                    engine::DeletionMode::Missing {
+                        source: library.clone(),
+                        selection: selection.clone(),
+                    },
+                    &mut |selection| deletion::confirm_mirror(selection, yes),
+                )
+                .await?;
+            let removal_ready = removal.ready();
+            // Held removals wait for an unreadable source; the rest goes on.
+            let held = matches!(removal, engine::DeletionOutcome::Held { .. });
+            let left = match &removal {
+                engine::DeletionOutcome::Completed { left, .. } => left.clone(),
+                _ => Vec::new(),
+            };
+            // A dry run goes on to preview the sync as well.
+            if !removal_ready && !held && !dry_run {
+                let line = "Nothing was sent. To send the library's new tracks without removing any, run `rustunes push`.";
+                notice(
+                    "nothing_sent",
+                    machine::Level::Warning,
+                    line,
+                    serde_json::json!({}),
+                )?;
+                return Ok(ExitCode::from(3));
+            }
+            let result = engine
+                .sync(engine::SyncRequest {
+                    source: &library,
+                    state: &state,
+                    snapshot: None,
+                    journal: journal.as_deref(),
+                    selection: &selection,
+                    host_name: &host_name,
+                    dry_run,
+                    seconds,
+                    add_only: false,
+                    batch_size: batch_size as usize,
+                    flac_to_alac,
+                    pinned: None,
+                    library: Some(&library),
+                    removals: &left,
+                })
+                .await?;
+            // A source dropped while it was sent, or a removal left waiting,
+            // is a sync that did not finish its work; a planned skip is not.
+            return Ok(if removal_ready && result.ready() && result.sent_all() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            });
+        }
+        Command::Push {
+            path,
+            state_dir,
+            snapshot,
+            journal,
+            dry_run,
+            host_name,
+            seconds,
+            batch_size,
+            flac_to_alac,
+            recursive,
+            include,
+            exclude,
+        } => {
+            let library = config::load()?.library;
+            let path = match path {
+                Some(path) => path,
+                None => config::library()?,
+            };
+            let state = state_dir.map(Ok).unwrap_or_else(default_state_directory)?;
+            let selection = source_collection::SelectionOptions {
+                recursive,
+                include: include.into_iter().collect(),
+                exclude: exclude.into_iter().collect(),
+            };
+            // Tracks are matched to the library when the journal is carried
+            // forward first; without one, to the directory pushed.
+            let matched = library
+                .clone()
+                .or_else(|| path.is_dir().then(|| path.clone()));
+            let result = engine
+                .sync(engine::SyncRequest {
+                    source: &path,
+                    state: &state,
+                    snapshot: snapshot.as_deref(),
+                    journal: journal.as_deref(),
+                    selection: &selection,
+                    host_name: &host_name,
+                    dry_run,
+                    seconds,
+                    add_only: true,
+                    batch_size: batch_size as usize,
+                    flac_to_alac,
+                    pinned: None,
+                    library: matched.as_deref(),
+                    removals: &[],
+                })
+                .await?;
+            return Ok(if result.ready() && result.sent_all() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            });
+        }
+        Command::Pull {
+            tracks,
+            into,
+            recursive,
+            dry_run,
+            state_dir,
+            seconds,
+            json,
+        } => {
+            let library = config::load()?.library;
+            let into = match (tracks, into) {
+                (false, _) => None,
+                (true, Some(directory)) => Some(directory),
+                (true, None) => Some(library.clone().context(
+                    "pull --tracks copies into the library directory; set it with `rustunes config library DIR`, or name another with --into DIR",
+                )?),
+            };
+            let state = state_dir.map(Ok).unwrap_or_else(default_state_directory)?;
+            let report = engine
+                .pull(engine::PullRequest {
+                    state: &state,
+                    library: library.as_deref(),
+                    recursive,
+                    dry_run,
+                    seconds,
+                    tracks_into: into.as_deref(),
+                })
+                .await?;
+            pull::render(&report, library.is_some(), json)?;
+        }
+        Command::Config {
+            setting: ConfigCommand::Library { directory },
+        } => config::set_library(directory.as_deref())?,
+        Command::Artwork {
+            file,
+            snapshot,
+            journal,
+            trace_dir,
+            host_name,
+            dry_run,
+        } => {
+            engine
+                .cover(engine::CoverRequest {
+                    file: &file,
+                    snapshot: &snapshot,
+                    journal: &journal,
+                    trace: &trace_dir,
+                    host_name: &host_name,
+                    dry_run,
+                    expected_source: None,
+                    preserve_album: None,
+                    pending_cover_only: false,
+                })
+                .await?;
+        }
+        Command::Verify {
+            snapshot,
+            journal,
+            trace_dir,
+            track,
+            seconds,
+            json,
+        } => {
+            let success = verify_command(
+                engine, &snapshot, &journal, &trace_dir, track, seconds, json,
+            )
+            .await?;
+            return Ok(if success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            });
+        }
+        Command::Metadata {
+            action:
+                MetadataCommand::Plan {
+                    track,
+                    request,
+                    snapshot,
+                    journal,
+                    output,
+                },
+        } => {
+            let result = engine.plan_metadata(engine::MetadataPlanRequest {
+                track,
+                request: &request,
+                snapshot: &snapshot,
+                journal: &journal,
+                output: output.as_deref(),
+            })?;
+            if machine::enabled() {
+                machine::report_bytes("metadata_plan", &result.serialized)?;
+            } else {
+                std::io::stdout().lock().write_all(&result.serialized)?;
+            }
+        }
+        Command::Metadata {
+            action:
+                MetadataCommand::Set {
+                    track,
+                    fields,
+                    snapshot,
+                    journal,
+                    state_dir,
+                    dry_run,
+                    yes,
+                    host_name,
+                    seconds,
+                },
+        } => {
+            let state = state_dir.map(Ok).unwrap_or_else(default_state_directory)?;
+            let request = metadata_set::Request {
+                request: fields.request(track),
+                snapshot,
+                journal,
+                state,
+                host_name,
+                seconds,
+                dry_run,
+                yes,
+            };
+            if !engine.scope(metadata_set::run(request, engine)).await? {
+                return Ok(ExitCode::from(3));
+            }
+        }
+        Command::Status {
+            snapshot,
+            journal,
+            json,
+        } => {
+            let saved = snapshot::open(&snapshot)?;
+            let library = identity::parse(&saved.raw_preferences)?;
+            let identity = crate::engine::state::journal::Identity::for_saved_device(
+                saved.identity.device_identifier_sha256,
+                &library,
+            )?;
+            let journal =
+                crate::engine::state::journal::Journal::open_read_only(&journal, &identity)?;
+            render("journal_status", json, |json, out| {
+                journal_view::write(&journal, json, out, &engine.command_options())
+            })?;
+        }
+        Command::Apply {
+            plan,
+            snapshot,
+            journal,
+            trace_dir,
+            host_name,
+            check_only,
+            dry_run,
+            yes,
+            batch_size,
+            state_dir,
+            seconds,
+        } => {
+            let state = state_dir.map(Ok).unwrap_or_else(default_state_directory)?;
+            let outcome = engine
+                .apply_change(
+                    engine::ChangeApplyRequest {
+                        plan: &plan,
+                        snapshot: &snapshot,
+                        journal: &journal,
+                        trace: &trace_dir,
+                        state: &state,
+                        host_name: &host_name,
+                        seconds,
+                        batch_size: batch_size as usize,
+                        check_only,
+                        dry_run,
+                    },
+                    &mut |plan| change_plan::confirm(plan, yes),
+                )
+                .await?;
+            change_plan::outcome(outcome)?;
+            return Ok(if outcome == engine::ChangeApplyOutcome::Cancelled {
+                ExitCode::from(3)
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
+        Command::Plan {
+            path,
+            add_only,
+            flac_to_alac,
+            replace_library,
+            replace_changed,
+            remove_missing,
+            add_remove,
+            snapshot,
+            journal,
+            output,
+            json,
+            recursive,
+            include,
+            exclude,
+        } => {
+            let path = match path {
+                Some(path) => path,
+                None => config::library()?,
+            };
+            let options = source_collection::SelectionOptions {
+                recursive,
+                include: include.into_iter().collect(),
+                exclude: exclude.into_iter().collect(),
+            };
+            let add_only = add_only || add_remove;
+            let change = if replace_library {
+                Some(engine::ChangeAction::ReplaceLibrary)
+            } else if replace_changed {
+                Some(engine::ChangeAction::ReplaceChanged)
+            } else if remove_missing || add_remove {
+                Some(if add_only {
+                    engine::ChangeAction::AddRemove
+                } else {
+                    engine::ChangeAction::RemoveMissing
+                })
+            } else {
+                None
+            };
+            let success = tokio::task::spawn_blocking(move || {
+                if let Some(action) = change {
+                    return change_plan::plan(
+                        engine::ChangePlanRequest {
+                            action,
+                            source: &path,
+                            snapshot: &snapshot,
+                            journal: journal.as_deref(),
+                            output: output.as_deref(),
+                            selection: &options,
+                            flac_to_alac,
+                        },
+                        json,
+                    );
+                }
+                plan_command(
+                    &path,
+                    &snapshot,
+                    journal.as_deref(),
+                    output.as_deref(),
+                    json,
+                    &options,
+                    add_only,
+                    flac_to_alac,
+                )
+            })
+            .await
+            .context("planning task failed")??;
+            return Ok(if success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            });
+        }
+        Command::Snapshot { directory, seconds } => {
+            audio_capture::capture(&directory, Duration::from_secs(seconds), device::provider)
+                .await?;
+            let line = format!("Complete snapshot saved to {}", directory.display());
+            if machine::enabled() {
+                machine::report(
+                    "snapshot",
+                    &serde_json::json!({"directory": directory, "message": line}),
+                )?;
+            } else {
+                eprintln!("{line}");
+            }
+        }
+        Command::Library {
+            view,
+            json,
+            trace_dir,
+            snapshot,
+        } => {
+            let view = match view {
+                LibraryCommand::List {
+                    query,
+                    artist,
+                    album,
+                } => library_view::View::List(library_view::Filter {
+                    query,
+                    artist,
+                    album,
+                }),
+                LibraryCommand::Show { id } => library_view::View::Show(id),
+                LibraryCommand::Stats => library_view::View::Stats,
+            };
+            let catalog = if let Some(directory) = snapshot {
+                let line = "Reading saved snapshot; no live device check";
+                if machine::enabled() {
+                    machine::phase("read_snapshot", Some(line.into()))?;
+                } else {
+                    eprintln!("{line}");
+                }
+                crate::engine::state::snapshot::open(&directory)?.catalog
+            } else {
+                catalogue_capture::read(trace_dir.as_deref(), device::provider).await?
+            };
+            let kind = match view {
+                library_view::View::List(_) => "library_list",
+                library_view::View::Show(_) => "library_track",
+                library_view::View::Stats => "library_stats",
+            };
+            if machine::enabled() {
+                machine::report_from(kind, |out| library_view::write(&catalog, &view, true, out))?;
+            } else {
+                let mut output = std::io::stdout().lock();
+                library_view::write(&catalog, &view, json, &mut output)?;
+                output.flush()?;
+            }
+        }
+        Command::Catalog { output, trace_dir } if machine::enabled() => {
+            if let Some(output) = &output {
+                catalogue_capture::export(
+                    Some(output),
+                    trace_dir.as_deref(),
+                    &mut std::io::sink(),
+                    device::provider,
+                )
+                .await?;
+                machine::report("catalog", &serde_json::json!({"output": output}))?;
+            } else {
+                let catalog =
+                    catalogue_capture::read(trace_dir.as_deref(), device::provider).await?;
+                machine::report("catalog", &catalog_json(&catalog))?;
+            }
+        }
+        Command::Catalog { output, trace_dir } => {
+            catalogue_capture::export(
+                output.as_deref(),
+                trace_dir.as_deref(),
+                &mut std::io::stdout().lock(),
+                device::provider,
+            )
+            .await?;
+        }
+        Command::Inspect { file, json } => {
+            let json = json || machine::enabled();
+            let other = if music_protocol::media::mpeg::is_other_audio(&file) {
+                music_protocol::media::mpeg::read(&file)?
+            } else {
+                match metadata::read(&file) {
+                    Ok(alac) if json => {
+                        #[derive(serde::Serialize)]
+                        struct Alac<'a> {
+                            codec: &'static str,
+                            duplicate_outer_atoms: Vec<String>,
+                            metadata: &'a metadata::Metadata,
+                        }
+                        let report = Alac {
+                            codec: "alac",
+                            duplicate_outer_atoms: alac.duplicate_outer_atoms(),
+                            metadata: &alac,
+                        };
+                        if machine::enabled() {
+                            machine::report("source", &report)?;
+                        } else {
+                            println!("{}", serde_json::to_string_pretty(&report)?);
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    Ok(alac) => {
+                        println!("{alac}");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    // An M4A that is not ALAC may be AAC.
+                    Err(error) => music_protocol::media::mpeg::read(&file)
+                        .map_err(|other| source_collection::refused_m4a(error, &other))?,
+                }
+            };
+            if machine::enabled() {
+                machine::report("source", &other)?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mut output = std::io::stdout().lock();
+            if json {
+                serde_json::to_writer_pretty(&mut output, &other)?;
+                writeln!(output)?;
+            } else {
+                source_inspection::write_text(&other, &mut output)?;
+            }
+            output.flush()?;
+        }
+        Command::Validate { file, json, decode } => {
+            if decode {
+                let line = "Validating source and decoding audio with FFmpeg...";
+                if machine::enabled() {
+                    machine::phase("decode", Some(line.into()))?;
+                } else {
+                    eprintln!("{line}");
+                }
+            }
+            let report = tokio::task::spawn_blocking(move || {
+                crate::engine::planning::source_validation::inspect(&file, decode)
+            })
+            .await
+            .context("local validation task failed")?;
+            if machine::enabled() {
+                if !report.supported_by_current_profile {
+                    machine::outcome("unsupported");
+                }
+                machine::report("validation", &report)?;
+                return Ok(if report.supported_by_current_profile {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(3)
+                });
+            }
+            let mut output = std::io::stdout().lock();
+            if json {
+                serde_json::to_writer_pretty(&mut output, &report)?;
+                writeln!(output)?;
+            } else {
+                source_validation::write_text(&report, &mut output)?;
+            }
+            output.flush()?;
+            return Ok(if report.supported_by_current_profile {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            });
+        }
+        Command::Scan {
+            path,
+            selection_only,
+            recursive,
+            include,
+            exclude,
+            json,
+        } => {
+            let options = source_collection::SelectionOptions {
+                recursive,
+                include: include.into_iter().collect(),
+                exclude: exclude.into_iter().collect(),
+            };
+            if !selection_only {
+                let line = "Inspecting selected audio sources and hashing audio...";
+                if machine::enabled() {
+                    machine::phase("inspect_sources", Some(line.into()))?;
+                } else {
+                    eprintln!("{line}");
+                }
+            }
+            let scanning = engine.clone();
+            let success = tokio::task::spawn_blocking(move || {
+                scanning.with_observer(|| source_scan::run(&path, &options, selection_only, json))
+            })
+            .await
+            .context("source scan task failed")??;
+            return Ok(if success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            });
+        }
+        Command::DeviceInfo => {
+            let provider = connected_provider().await?;
+            timeout(Duration::from_secs(20), device_info(&provider, false, None))
+                .await
+                .context("timed out reading paired Lockdown device information")??;
+        }
+        Command::Probe {
+            seconds,
+            trace_dir,
+            ping,
+        } => {
+            let provider = connected_provider().await?;
+            probe(&provider, Duration::from_secs(seconds), trace_dir, ping).await?;
+        }
+        Command::Syslog { seconds, output } => {
+            let provider = connected_provider().await?;
+            syslog(&provider, Duration::from_secs(seconds), output).await?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn verify_command(
