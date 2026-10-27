@@ -1830,6 +1830,9 @@ fn decode_content_as(bytes: &[u8], stored_identity: bool) -> Result<Content> {
 }
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 pub(crate) mod test_support;
 
 pub(crate) mod mpeg_insert;
