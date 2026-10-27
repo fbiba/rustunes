@@ -2477,6 +2477,8 @@ pub(crate) fn write_artwork_recent_disclosure(
 
 #[cfg(test)]
 mod metadata_intent_tests;
+#[cfg(test)]
+mod tests;
 
 fn default_state_directory() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
