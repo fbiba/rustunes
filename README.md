@@ -142,9 +142,9 @@ cargo install --locked --git https://github.com/fbiba/rustunes.git rustunes
 cargo install --locked --path crates/rustunes
 ```
 
-### From crates.io (coming soon)
+### From crates.io
 
-rustunes is not published on crates.io yet. Once it is, installing will be:
+Cargo builds rustunes and installs it into `~/.cargo/bin`:
 
 ```bash
 cargo install --locked rustunes
