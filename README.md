@@ -1,6 +1,6 @@
 <h1 align="center">rustunes</h1>
 
-<p align="center"><em>Demo video coming soon</em></p>
+https://github.com/user-attachments/assets/8350b85a-0c21-402b-bded-077573885e0d
 
 <p align="center">
   Sync your music to the stock iPhone Music app from Linux, over USB or Wi-Fi.<br>
