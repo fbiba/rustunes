@@ -9,7 +9,7 @@ readme.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-music-protocol = { path = "../music-protocol" }
+music-protocol = { path = "../music-protocol", version = "0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
 idevice.workspace = true
