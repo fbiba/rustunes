@@ -33,11 +33,11 @@ use crate::{
     engine::execution::device,
     engine::execution::native_artwork,
     engine::execution::native_insert::{
-        BoundSource, Control, FreshState, create_trace, durable_write, sync_trace,
+        self, BoundSource, Control, FreshState, create_trace, durable_write, sync_trace,
     },
     engine::planning::collections::{CandidateIds, Planner},
     engine::planning::source_collection::mp3::preparation::PreparedSource,
-    engine::recovery::retained::playback::{Window, between_runs},
+    engine::recovery::retained::playback::{self, Window, between_runs},
     engine::state::audio_index::Absent,
     engine::state::current,
     engine::state::journal::{
@@ -47,6 +47,10 @@ use crate::{
     },
     engine::state::snapshot::{self, Snapshot},
     engine::verification::artwork::{TrackArtworkExpectation, TrackCheck},
+    engine::verification::sql_tables::{
+        Capture,
+        reader::{self, Budget},
+    },
     engine::{
         execution::{
             cover, flac_to_alac, insert,
@@ -1929,10 +1933,10 @@ async fn settle_with(
             })
         })
         .collect();
-    let permanent_covers = if checks.is_empty() {
-        Vec::new()
+    let covers = if checks.is_empty() {
+        None
     } else {
-        verify_covers(&after, &run, identity, &checks, &locationless, control)
+        Some(verify_covers(&after, &run, identity, &checks, &locationless, control)
             .await
             .with_context(|| {
                 format!(
@@ -1940,7 +1944,7 @@ async fn settle_with(
                     batch.id.as_i64(),
                     run.display()
                 )
-            })?
+            })?)
     };
     let mut receipt = json!({
         "schema":"rustunes.insert-batch-verification","batch":batch.id.as_i64(),
@@ -1962,8 +1966,26 @@ async fn settle_with(
                 .collect::<Vec<_>>()
         );
     }
-    if !permanent_covers.is_empty() {
-        receipt["permanent_covers"] = serde_json::to_value(&permanent_covers)?;
+    if let Some(covers) = &covers {
+        if !covers.proofs.is_empty() {
+            receipt["permanent_covers"] = serde_json::to_value(&covers.proofs)?;
+        }
+        if let Some(drift) = &covers.drift {
+            receipt["cover_readback_repeated"] = json!({
+                "capture":covers.capture,"first_readback_refused":drift,
+            });
+        }
+        if let Some(revisions) = &covers.housekeeping {
+            let evidence = serde_json::to_vec_pretty(&json!({
+                "schema":"rustunes.cover-capture-housekeeping","capture":covers.capture,
+                "entity_revisions":revisions,"other_sql_exact":true,
+            }))?;
+            durable_write(&run, "housekeeping-before-covers.json", &evidence)?;
+            receipt["housekeeping_before_covers"] = json!({
+                "evidence_sha256":hex(&sha(&evidence)),"capture":covers.capture,
+                "entity_revision_changes":revisions.len(),
+            });
+        }
     }
     if let Some(removal) = &removal {
         receipt["session_removal"] = json!({
@@ -2019,9 +2041,24 @@ async fn settle_with(
     })
 }
 
+/// The covers' proofs and the capture they were read over.
+struct CoverReadback {
+    proofs: Vec<crate::engine::verification::artwork::VerifiedTrackArtworkBytes>,
+    /// The capture's directory under the run.
+    capture: &'static str,
+    /// The phone's revision housekeeping the capture showed since `after`.
+    housekeeping: Option<Vec<serde_json::Value>>,
+    /// Why a first readback was abandoned.
+    drift: Option<String>,
+}
+
 /// Read back each bound target's permanent cover over a capture of the same
 /// after state, as `verify` does: the exact original and a decodable
-/// derivative. Proofs come back in `checks` order.
+/// derivative. Proofs come back in `checks` order. The capture's catalogue
+/// may differ from `after` only by the phone's revision housekeeping. If the
+/// phone's state drifts during the readback (seen when its housekeeping
+/// landed there), the state is captured once more under the same rule and
+/// the readback starts again over that capture.
 async fn verify_covers(
     after: &Snapshot,
     run: &Path,
@@ -2029,10 +2066,64 @@ async fn verify_covers(
     checks: &[TrackCheck],
     locationless: &BTreeSet<u64>,
     control: &Control,
-) -> Result<Vec<crate::engine::verification::artwork::VerifiedTrackArtworkBytes>> {
+) -> Result<CoverReadback> {
     cover::require_decoder()?;
+    let first = "current";
+    let (current, housekeeping) = cover_capture(after, run, first, identity, control).await?;
+    let drift = match read_covers(
+        &current,
+        run,
+        "artwork-group",
+        checks,
+        locationless,
+        control,
+    )
+    .await
+    {
+        Ok(proofs) => {
+            return Ok(CoverReadback {
+                proofs,
+                capture: first,
+                housekeeping,
+                drift: None,
+            });
+        }
+        Err(error) if native_insert::is_state_read_drift(&error) => format!("{error:#}"),
+        Err(error) => return Err(error),
+    };
+    let again = "current-again";
+    let (current, housekeeping) = cover_capture(after, run, again, identity, control)
+        .await
+        .with_context(|| format!("after the phone's state drifted during the readback: {drift}"))?;
+    let proofs = read_covers(
+        &current,
+        run,
+        "artwork-again-group",
+        checks,
+        locationless,
+        control,
+    )
+    .await?;
+    Ok(CoverReadback {
+        proofs,
+        capture: again,
+        housekeeping,
+        drift: Some(drift),
+    })
+}
+
+/// Captures the phone's state with artwork under `run/name`. Its catalogue
+/// is `after`'s, or differs from it only by the phone's revision
+/// housekeeping, which comes back with it.
+async fn cover_capture(
+    after: &Snapshot,
+    run: &Path,
+    name: &str,
+    identity: &Identity,
+    control: &Control,
+) -> Result<(current::Current, Option<Vec<serde_json::Value>>)> {
     let current = current::capture_with_artwork_controlled(
-        &run.join("current"),
+        &run.join(name),
         identity,
         control.deadline,
         Arc::clone(&control.cancelled),
@@ -2042,13 +2133,31 @@ async fn verify_covers(
         current.catalog.source_hashes(),
         after.catalog.source_hashes(),
     );
-    ensure!(
-        a.database == b.database
-            && a.database_bytes == b.database_bytes
-            && a.wal == b.wal
-            && a.wal_bytes == b.wal_bytes,
-        "the phone's catalogue changed after the batch was observed"
-    );
+    let housekeeping = if a.database == b.database
+        && a.database_bytes == b.database_bytes
+        && a.wal == b.wal
+        && a.wal_bytes == b.wal_bytes
+    {
+        None
+    } else {
+        Some(
+            revision_housekeeping(after, &current, run, name, control)
+                .context("the phone's catalogue changed after the batch was observed")?,
+        )
+    };
+    Ok((current, housekeeping))
+}
+
+/// Reads back the covers of `checks` over `current`, group by group, each
+/// group traced under `run/<prefix>-NNNN`.
+async fn read_covers(
+    current: &current::Current,
+    run: &Path,
+    prefix: &str,
+    checks: &[TrackCheck],
+    locationless: &BTreeSet<u64>,
+    control: &Control,
+) -> Result<Vec<crate::engine::verification::artwork::VerifiedTrackArtworkBytes>> {
     let mut proofs = Vec::with_capacity(checks.len());
     while proofs.len() < checks.len() {
         control.check()?;
@@ -2061,9 +2170,9 @@ async fn verify_covers(
             cancelled: Arc::clone(&control.cancelled),
         };
         let group = crate::engine::verification::artwork::verify_track_group(
-            &current,
+            current,
             &checks[done..],
-            &run.join(format!("artwork-group-{done:04}")),
+            &run.join(format!("{prefix}-{done:04}")),
             &group_control,
             locationless,
             device::provider,
@@ -2079,6 +2188,35 @@ async fn verify_covers(
         proofs.extend(group);
     }
     Ok(proofs)
+}
+
+/// The cover capture `captured`, retained under `run/name`, differs from the
+/// observed `after` state only by the phone's revision housekeeping.
+fn revision_housekeeping(
+    after: &Snapshot,
+    captured: &current::Current,
+    run: &Path,
+    name: &str,
+    control: &Control,
+) -> Result<Vec<serde_json::Value>> {
+    let observed =
+        removal_batch::materialize(after, &run.join(format!("{name}-sql-after")), control)?;
+    let directory = run.join(name).join("catalog");
+    let database = directory.join("MediaLibrary.sqlitedb");
+    let wal = directory.join("MediaLibrary.sqlitedb-wal");
+    let hashes = captured.catalog.source_hashes();
+    let mut budget =
+        Budget::new_cancellable_until(control.deadline.into_std(), Arc::clone(&control.cancelled));
+    let captured = reader::materialize(
+        Capture {
+            database: &database,
+            database_sha256: hashes.database,
+            wal: hashes.wal.map(|hash| (wal.as_path(), hash)),
+        },
+        &run.join(format!("{name}-sql")),
+        &mut budget,
+    )?;
+    playback::verify_revision_housekeeping(&observed, &captured, &budget)
 }
 
 /// The journal names the collections the batch created; every target must be

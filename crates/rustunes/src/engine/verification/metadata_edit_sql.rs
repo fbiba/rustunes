@@ -28,7 +28,9 @@
 //!   before an album an earlier update had revised). The block
 //!   starts directly above the previous maximum revision. The anchor advances by one,
 //!   last-synced and the hero revision equal the highest new revision and the
-//!   generation id changes.
+//!   generation id changes. A created group may take the id of a group
+//!   deleted earlier; its tombstone then becomes its live revision row (seen
+//!   for an album artist).
 //! * Every nonzero recent play or skip counter may reset to zero, the
 //!   maintenance date may advance, and an entry the phone added itself may
 //!   have its state filled in as a synced track's (`fill_phone_entries` in
@@ -36,7 +38,10 @@
 //! * A later run's capture (`verify_later`) may also hold what the phone did
 //!   since the session: plays and skips, Playback History, its own
 //!   renumbering of live items above the session's block and superseded
-//!   statistics revisions (`Window::LaterRun`).
+//!   statistics revisions (`Window::LaterRun`). The run's own capture may
+//!   hold that renumbering of every live item and those superseded
+//!   statistics revisions too, but no listening (seen when the phone
+//!   renumbered its library during an edit's run).
 //! * An album the edit leaves alone that is still at keep_local_status 0 (an
 //!   insert batch killed before its session ended leaves its new album so)
 //!   may be evaluated: status 2, every other cell equal, its live revision
@@ -45,7 +50,7 @@
 //!
 //! Any other difference refuses; the caller keeps the full delta for review.
 use crate::{
-    engine::recovery::retained::playback::Window,
+    engine::recovery::retained::playback::{self, Window},
     engine::verification::sql_tables::reader::{Budget, Cell, Row, Table},
     engine::{
         planning::metadata_edit::{Class, Edit, Tables, conform, grouping_key},
@@ -63,6 +68,8 @@ const GENERATION: &str = "MLSyncClientGenerationID";
 const HERO: &str = "MLArtistHeroImageImportDatabaseRevision";
 const MAINTENANCE: &str = "MLMaintenanceTaskOperationDate";
 const ITEM_REVISION_CLASS: i64 = 0;
+/// `entity_revision.deleted` of a deleted entity.
+const TOMBSTONE: i64 = 2;
 const SCHEMA: &str = "rustunes.metadata-edit-sql";
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -119,6 +126,9 @@ pub(crate) struct MetadataEditReceipt {
     /// session (`verify_later`).
     #[serde(skip_serializing_if = "Option::is_none")]
     between_runs_playback: Option<serde_json::Value>,
+    /// The phone's revision housekeeping the run's own capture showed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_housekeeping: Option<serde_json::Value>,
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct KeepLocalEvaluation {
@@ -362,9 +372,21 @@ impl Model<'_> {
                     .context("revisions")?;
                 ensure!(t.rows.insert(row, 1).is_none(), "revision row exists");
             }
+            [old] if fresh => {
+                // A created group may take the id of one deleted earlier; the
+                // phone then revives that group's tombstone as its live row.
+                ensure!(
+                    t.rows.get(old) == Some(&1) && t.at(old, "deleted")? == &int(TOMBSTONE),
+                    "new entity {entity} (class {class}) has a revision row that is not a tombstone"
+                );
+                let mut row = old.clone();
+                row[rev] = int(revision);
+                row[t.column("deleted")?] = int(0);
+                typed::replace(&mut self.expected, "entity_revision", old, row)?;
+            }
             [old] => {
                 ensure!(
-                    !fresh && t.rows.get(old) == Some(&1) && t.at(old, "deleted")? == &int(0),
+                    t.rows.get(old) == Some(&1) && t.at(old, "deleted")? == &int(0),
                     "entity {entity} revision row is not a single live row"
                 );
                 let mut row = old.clone();
@@ -1281,6 +1303,19 @@ fn model_session(
     // The session's own block is above every earlier revision, so the
     // phone's renumbering since lies above the model's highest revision.
     let between_runs_playback = window.absorb(&mut model.expected, after, &Budget::new())?;
+    // The run's own capture may hold the phone's revision housekeeping. When
+    // that does not explain entity_revision, the model is left as it was and
+    // the difference is reported below with every other one.
+    let (run_housekeeping, not_housekeeping) = match window {
+        Window::SameRun => {
+            match playback::absorb_revision_housekeeping(&mut model.expected, after, &Budget::new())
+            {
+                Ok(absorbed) => (absorbed, None),
+                Err(error) => (None, Some(error)),
+            }
+        }
+        Window::LaterRun => (None, None),
+    };
 
     let mismatches: Vec<_> = model
         .expected
@@ -1290,8 +1325,11 @@ fn model_session(
         .collect();
     ensure!(
         mismatches.is_empty(),
-        "unmodelled metadata edit rows:\n{}",
-        mismatches.join("\n")
+        "unmodelled metadata edit rows:\n{}{}",
+        mismatches.join("\n"),
+        not_housekeeping
+            .map(|e| format!("\nnot the phone's revision housekeeping: {e:#}"))
+            .unwrap_or_default()
     );
     Ok(MetadataEditReceipt {
         schema: SCHEMA,
@@ -1306,6 +1344,7 @@ fn model_session(
         keep_local_evaluations,
         filled_phone_entries,
         between_runs_playback,
+        run_housekeeping,
     })
 }
 

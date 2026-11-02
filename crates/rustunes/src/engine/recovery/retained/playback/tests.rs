@@ -543,6 +543,98 @@ fn revision_bookkeeping_refuses_uncovered_stats_tombstone_foreign_or_flag_change
     }
 }
 
+/// The phone's own revision housekeeping moments after an import, with no
+/// listening: both live items' full records renumbered above every revision,
+/// and item 1's statistics revision dropped as superseded.
+fn housekeeping_fixture() -> (BTreeMap<String, Table>, BTreeMap<String, Table>) {
+    let (mut a, _) = fixture();
+    let revisions = &mut a.get_mut("entity_revision").unwrap().rows;
+    revisions.insert(vec![i(4), i(1), i(0), i(0), i(0)], 1);
+    revisions.insert(vec![i(5), i(2), i(0), i(0), i(0)], 1);
+    revisions.insert(vec![i(3), i(90), i(2), i(0), i(0)], 1);
+    let mut b = a.clone();
+    let revisions = &mut b.get_mut("entity_revision").unwrap().rows;
+    revisions.remove(&vec![i(4), i(1), i(0), i(0), i(0)]);
+    revisions.insert(vec![i(14), i(1), i(0), i(0), i(0)], 1);
+    revisions.remove(&vec![i(5), i(2), i(0), i(0), i(0)]);
+    revisions.insert(vec![i(15), i(2), i(0), i(0), i(0)], 1);
+    revisions.remove(&vec![i(10), i(1), i(0), i(0), i(1)]);
+    (a, b)
+}
+#[test]
+fn revision_housekeeping_accepts_renumbered_live_items_and_superseded_stats() {
+    let (a, b) = housekeeping_fixture();
+    let changes = revision_housekeeping(&a, &b, &Budget::new()).unwrap();
+    let meanings: Vec<_> = changes.iter().map(|c| c["meaning"].clone()).collect();
+    assert_eq!(
+        meanings,
+        [
+            "live_item_full_record_revision_advanced",
+            "stats_revision_superseded_by_full_record",
+            "live_item_full_record_revision_advanced",
+        ]
+    );
+    assert!(
+        revision_housekeeping(&a, &a, &Budget::new())
+            .unwrap()
+            .is_empty()
+    );
+}
+#[test]
+fn revision_housekeeping_refuses_listening_and_every_other_change() {
+    for invalid in 0..9 {
+        let (a, mut b) = housekeeping_fixture();
+        match invalid {
+            0 => change(&mut b, "item_stats", "item_pid", 2, "play_count_user", i(5)),
+            1 => change(
+                &mut b,
+                "container_item",
+                "container_item_pid",
+                102,
+                "position",
+                i(2),
+            ),
+            2 => change(&mut b, "other", "id", 1, "value", s("changed")),
+            _ => {}
+        }
+        let revisions = &mut b.get_mut("entity_revision").unwrap().rows;
+        match invalid {
+            0..=2 => {}
+            3 => {
+                // A fresh statistics revision is listening, not housekeeping.
+                revisions.insert(vec![i(16), i(2), i(0), i(0), i(1)], 1);
+            }
+            4 => {
+                revisions.remove(&vec![i(11), i(9), i(0), i(1), i(0)]);
+                revisions.insert(vec![i(16), i(9), i(0), i(1), i(0)], 1);
+            }
+            5 => {
+                // Renumbered below a revision the earlier capture holds.
+                revisions.remove(&vec![i(14), i(1), i(0), i(0), i(0)]);
+                revisions.insert(vec![i(9), i(1), i(0), i(0), i(0)], 1);
+            }
+            6 => {
+                // A statistics revision dropped without its item renumbered.
+                revisions.remove(&vec![i(14), i(1), i(0), i(0), i(0)]);
+                revisions.insert(vec![i(4), i(1), i(0), i(0), i(0)], 1);
+            }
+            7 => {
+                revisions.remove(&vec![i(3), i(90), i(2), i(0), i(0)]);
+            }
+            8 => {
+                // Item 2 left out of the renumbering.
+                revisions.remove(&vec![i(15), i(2), i(0), i(0), i(0)]);
+                revisions.insert(vec![i(5), i(2), i(0), i(0), i(0)], 1);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            revision_housekeeping(&a, &b, &Budget::new()).is_err(),
+            "case {invalid}"
+        );
+    }
+}
+
 #[test]
 fn refuses_missing_nonadvancing_deleted_or_unrelated_revisions() {
     for (field, value) in [

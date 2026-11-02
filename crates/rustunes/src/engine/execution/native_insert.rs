@@ -367,6 +367,13 @@ impl std::fmt::Display for StateReadDrift {
 }
 impl std::error::Error for StateReadDrift {}
 
+/// Whether `error` came from a guarded read finding the phone's state files
+/// changed (a size or digest drift), and not from a malformed, missing or
+/// oversized one.
+pub(crate) fn is_state_read_drift(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<StateReadDrift>())
+}
+
 /// Only the deferred engine's closed, read-only pre-session branch constructs
 /// this error. A Ready-session or unknown failure cannot grant refresh authority.
 #[derive(Debug)]

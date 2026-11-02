@@ -311,6 +311,15 @@ impl Phone {
         );
         self.revision
     }
+    /// A created group's revision over the tombstone of a deleted one.
+    pub(crate) fn revive(&mut self, class: i64, pid: i64) -> i64 {
+        self.revision += 1;
+        self.sql += &format!(
+            "UPDATE entity_revision SET revision={},deleted=0 WHERE entity_pid={pid} AND class={class} AND revision_type=0;",
+            self.revision
+        );
+        self.revision
+    }
     /// A new revision for an existing entity.
     pub(crate) fn revise(&mut self, class: i64, pid: i64) -> i64 {
         self.revision += 1;
@@ -809,6 +818,75 @@ fn artist_move_of_a_representative_creates_a_group_and_hands_over() {
     let receipt = verify(&before, &after, &operation(&updates), ANCHOR_BEFORE).unwrap();
     assert_simulated(&before, &after, &updates);
     assert_eq!(receipt.updates[0].representatives[0].after, 5);
+}
+
+/// Both captures hold a revision row of item artist 80 at revision 18, the
+/// library's highest: a tombstone, or with `deleted` 0 a live row.
+fn artist_80_revision(world: &World, deleted: i64) {
+    for path in [&world.fixture.before, &world.fixture.after] {
+        Connection::open(path)
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO entity_revision(revision,entity_pid,deleted,class,revision_type)VALUES(18,80,{deleted},2,0);"
+            ))
+            .unwrap();
+    }
+}
+
+/// Track 2 moves to a new artist, which the phone creates as row 80.
+fn move_to_artist_80(world: &World, revive: bool) -> (Tables, Tables, Vec<TrackUpdate>) {
+    let before = world.before();
+    let updates = vec![update(
+        1002,
+        &[
+            ("artist", text("Newcomer")),
+            ("sort_artist", text("Newcomer")),
+        ],
+    )];
+    let mut phone = Phone::new();
+    phone.revision = 18;
+    let (order, section) = phone.name("Newcomer");
+    phone.sql(&format!(
+        "INSERT INTO item_artist(item_artist_pid,item_artist,sort_item_artist,grouping_key,representative_item_pid)
+            VALUES(80,'Newcomer','Newcomer',X'{}',2);
+         UPDATE item_artist SET representative_item_pid=5 WHERE item_artist_pid=12;
+         UPDATE item SET item_artist_pid=80,item_artist_order={order},item_artist_order_section={section} WHERE item_pid=2;
+         UPDATE item_search SET search_artist={order},search_album_artist={order} WHERE item_pid=2;",
+        gk_hex("Newcomer")
+    ));
+    if revive {
+        phone.revive(2, 80);
+    } else {
+        phone.revise(2, 80);
+    }
+    phone.revise(0, 2);
+    let after = world.after(&phone.finish());
+    (before, after, updates)
+}
+
+#[test]
+fn a_new_group_may_revive_the_tombstone_of_a_deleted_one() {
+    let world = World::new();
+    artist_80_revision(&world, 2);
+    let (before, after, updates) = move_to_artist_80(&world, true);
+    let receipt = verify(&before, &after, &operation(&updates), ANCHOR_BEFORE).unwrap();
+    assert_simulated(&before, &after, &updates);
+    assert_eq!(receipt.updates[0].representatives[0].after, 5);
+}
+
+#[test]
+fn a_new_group_over_a_live_row_or_a_tombstone_left_deleted_is_refused() {
+    let world = World::new();
+    artist_80_revision(&world, 2);
+    let (before, after, updates) = move_to_artist_80(&world, false);
+    assert!(verify(&before, &after, &operation(&updates), ANCHOR_BEFORE).is_err());
+    let world = World::new();
+    artist_80_revision(&world, 0);
+    let (before, after, updates) = move_to_artist_80(&world, true);
+    assert!(
+        failure(verify(&before, &after, &operation(&updates), ANCHOR_BEFORE))
+            .contains("has a revision row that is not a tombstone")
+    );
 }
 
 #[test]
@@ -1619,6 +1697,95 @@ fn a_later_run_absorbs_listening_and_renumbering_after_the_edit() {
     let same = verify(&before, &after, &operation(&updates), ANCHOR_BEFORE).unwrap();
     let later = verify_later(&before, &after, &operation(&updates), ANCHOR_BEFORE).unwrap();
     assert_eq!(later, same);
+}
+
+/// The phone's revision housekeeping during the run: every live item
+/// renumbered above the session's block, and item 3's statistics revision
+/// dropped as superseded.
+const RUN_HOUSEKEEPING: &str = "
+    UPDATE entity_revision SET revision=revision+20 WHERE class=0 AND revision_type=0 AND deleted=0;
+    DELETE FROM entity_revision WHERE entity_pid=3 AND class=0 AND revision_type=1;";
+
+/// The title edit of track 2 with `extra` after it, in a library where item 3
+/// has a statistics revision (18, the highest).
+fn run_title_edit(extra: &str) -> (World, Tables, Tables, Vec<TrackUpdate>) {
+    let world = World::new();
+    for path in [&world.fixture.before, &world.fixture.after] {
+        Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO entity_revision(revision,entity_pid,deleted,class,revision_type)VALUES(18,3,0,0,1);",
+            )
+            .unwrap();
+    }
+    let before = world.before();
+    let updates = vec![update(
+        1002,
+        &[
+            ("title", text("Track Two")),
+            ("sort_name", text("Two, Track")),
+        ],
+    )];
+    let mut phone = Phone::new();
+    phone.revision = 18;
+    let (shown, _) = phone.name("Track Two");
+    let (sorted, section) = phone.name("Two, Track");
+    phone.sql(&format!(
+        "UPDATE item_extra SET title='Track Two',sort_title='Two, Track' WHERE item_pid=2;
+         UPDATE item SET title_order={sorted},title_order_section={section} WHERE item_pid=2;
+         UPDATE item_search SET search_title={shown} WHERE item_pid=2;"
+    ));
+    phone.revise(0, 2);
+    let after = world.after(&format!("{}{extra}", phone.finish()));
+    (world, before, after, updates)
+}
+
+#[test]
+fn the_runs_own_capture_absorbs_revision_housekeeping() {
+    let (_world, before, after, updates) = run_title_edit(RUN_HOUSEKEEPING);
+    let receipt = verify(&before, &after, &operation(&updates), ANCHOR_BEFORE).unwrap();
+    assert_eq!(receipt.updated(), 1);
+    let receipt = serde_json::to_value(&receipt).unwrap();
+    let meanings: Vec<_> = receipt["run_housekeeping"]["entity_revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["meaning"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        meanings
+            .iter()
+            .filter(|m| *m == "live_item_full_record_revision_advanced")
+            .count(),
+        5
+    );
+    assert!(meanings.contains(&"stats_revision_superseded_by_full_record".to_owned()));
+    verify_later(&before, &after, &operation(&updates), ANCHOR_BEFORE).unwrap();
+    let (_world, before, after, updates) = run_title_edit("");
+    let receipt = verify(&before, &after, &operation(&updates), ANCHOR_BEFORE).unwrap();
+    assert!(serde_json::to_value(&receipt).unwrap()["run_housekeeping"].is_null());
+}
+
+#[test]
+fn the_runs_own_capture_refuses_listening_and_other_revision_changes() {
+    for sql in [
+        // A completed play, with its statistics revision.
+        "UPDATE item_stats SET play_count_user=101,has_been_played=1,date_played=750282000.5 WHERE item_pid=2;
+         INSERT INTO entity_revision(revision,entity_pid,deleted,class,revision_type)VALUES(60,2,0,0,1)",
+        // Not above the session's block: not the phone's renumbering.
+        "UPDATE entity_revision SET revision=19 WHERE entity_pid=4 AND class=0 AND revision_type=0",
+        // A group's revision is not renumbered by housekeeping.
+        "UPDATE entity_revision SET revision=50 WHERE class=3 AND entity_pid=31",
+        // A statistics revision dropped though its item kept its number.
+        "UPDATE entity_revision SET revision=3 WHERE entity_pid=3 AND class=0 AND revision_type=0",
+    ] {
+        let (_world, before, after, updates) =
+            run_title_edit(&format!("{RUN_HOUSEKEEPING}{sql};"));
+        assert!(
+            verify(&before, &after, &operation(&updates), ANCHOR_BEFORE).is_err(),
+            "{sql}"
+        );
+    }
 }
 
 #[test]

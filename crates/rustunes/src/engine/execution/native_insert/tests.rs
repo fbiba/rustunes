@@ -562,6 +562,41 @@ async fn production_missing_cdb_binding_never_invokes_connector_or_creates_trace
 }
 
 #[test]
+fn a_readback_drift_is_recognised_through_its_context() {
+    let attrs = BTreeMap::from([
+        ("st_ifmt".into(), "S_IFREG".into()),
+        ("st_size".into(), "2492632".into()),
+        ("st_mtime".into(), "1718023843000000000".into()),
+    ]);
+    let expected = ExpectedFile {
+        bytes: 2484392,
+        sha256: [1; 32],
+    };
+    let drift = guard_size(&attrs, &expected, "MediaLibrary.sqlitedb-wal", MAX_CATALOG)
+        .unwrap_err()
+        .context("permanent cover of track 0000000000000001");
+    assert!(is_state_read_drift(&drift));
+    let digest = guard_hash([2; 32], &expected, "MediaLibrary.sqlitedb-wal")
+        .unwrap_err()
+        .context("permanent cover");
+    assert!(is_state_read_drift(&digest));
+    let mut malformed = attrs;
+    malformed.insert("st_size".into(), "not-a-number".into());
+    let refused = guard_size(
+        &malformed,
+        &expected,
+        "MediaLibrary.sqlitedb-wal",
+        MAX_CATALOG,
+    )
+    .unwrap_err()
+    .context("permanent cover");
+    assert!(!is_state_read_drift(&refused));
+    assert!(!is_state_read_drift(&anyhow::anyhow!(
+        "state read drift in MediaLibrary.sqlitedb-wal: regular file size changed"
+    )));
+}
+
+#[test]
 fn state_drift_classification_excludes_malformed_oversized_and_ready_errors() {
     let attrs = BTreeMap::from([
         ("st_ifmt".into(), "S_IFREG".into()),

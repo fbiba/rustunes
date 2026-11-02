@@ -290,6 +290,133 @@ pub(super) fn verify_views(a: &Snapshot, b: &Snapshot, budget: &Budget) -> Resul
     verify_tables(&a.tables, &b.tables, budget)
 }
 
+/// SQL evidence only, for two captures of one run moments apart. Right after
+/// an import the phone may renumber every live item's full-record revision
+/// above every revision `a` holds and drop the statistics revisions that renumbering
+/// supersedes (observed on iOS 27.2, seconds after an insert batch). Those are
+/// the only accepted differences: no listening, and every other row of every
+/// table must be exact. Returns the revision changes; no authority follows.
+pub(crate) fn verify_revision_housekeeping(
+    a: &Snapshot,
+    b: &Snapshot,
+    budget: &Budget,
+) -> Result<Vec<Value>> {
+    budget.check()?;
+    ensure!(
+        a.layout_qualified()? && b.version == a.version && a.schema == b.schema,
+        "the catalogue's full SQL schema is unsupported or changed"
+    );
+    revision_housekeeping(&a.tables, &b.tables, budget)
+}
+
+fn revision_housekeeping(
+    a: &BTreeMap<String, Table>,
+    b: &BTreeMap<String, Table>,
+    budget: &Budget,
+) -> Result<Vec<Value>> {
+    ensure!(a.keys().eq(b.keys()), "the catalogue's tables differ");
+    for (name, old) in a {
+        budget.check()?;
+        let new = &b[name];
+        ensure!(
+            old.columns == new.columns && old.definitions == new.definitions,
+            "the catalogue's table definition differs: {name}"
+        );
+        ensure!(
+            name == "entity_revision" || old.rows == new.rows,
+            "the catalogue changed in {name}"
+        );
+    }
+    housekeeping_revisions(a, b, budget)
+}
+
+/// Absorbs into `expected`, a model of a run's own write, the phone's
+/// revision housekeeping during that run: the rule of
+/// `verify_revision_housekeeping` applied to entity_revision alone, so
+/// renumbered revisions must lie above the model's highest (seen on iOS 27.2
+/// during a metadata edit's run). No listening. Every other table is left for
+/// the caller's exact comparison. Returns `None` when entity_revision already
+/// equals the model; on refusal `expected` is unchanged.
+pub(crate) fn absorb_revision_housekeeping(
+    expected: &mut BTreeMap<String, Table>,
+    observed: &BTreeMap<String, Table>,
+    budget: &Budget,
+) -> Result<Option<Value>> {
+    budget.check()?;
+    let (model, actual) = (
+        expected
+            .get("entity_revision")
+            .context("missing table entity_revision")?,
+        observed
+            .get("entity_revision")
+            .context("missing table entity_revision")?,
+    );
+    ensure!(
+        model.columns == actual.columns && model.definitions == actual.definitions,
+        "the catalogue's table definition differs: entity_revision"
+    );
+    if model.rows == actual.rows {
+        return Ok(None);
+    }
+    let changes = housekeeping_revisions(expected, observed, budget)?;
+    let actual = actual.clone();
+    expected.insert("entity_revision".into(), actual);
+    Ok(Some(json!({
+        "schema":"rustunes.run-revision-housekeeping","entity_revisions":changes,
+    })))
+}
+
+/// `check_revisions` with no listening: only live items' renumbered
+/// full-record revisions and the statistics revisions they supersede. The
+/// phone renumbers every live item at once (every time it was seen, 398 to
+/// 428 items), so a renumbering that leaves one out is refused.
+fn housekeeping_revisions(
+    a: &BTreeMap<String, Table>,
+    b: &BTreeMap<String, Table>,
+    budget: &Budget,
+) -> Result<Vec<Value>> {
+    let table = |tables: &BTreeMap<String, Table>, name: &str| {
+        tables
+            .get(name)
+            .cloned()
+            .with_context(|| format!("missing table {name}"))
+    };
+    let items = keyed(&table(a, "item")?, "item_pid")?;
+    let revisions = table(a, "entity_revision")?;
+    let changes = check_revisions(
+        None,
+        &revisions,
+        &table(b, "entity_revision")?,
+        &BTreeMap::new(),
+        &items,
+        None,
+        budget,
+    )?;
+    let mut live = BTreeSet::new();
+    for row in revisions.rows.keys() {
+        let entity = num(&revisions, row, "entity_pid")?;
+        if num(&revisions, row, "class")? == 0
+            && num(&revisions, row, "revision_type")? == 0
+            && num(&revisions, row, "deleted")? == 0
+            && items.contains_key(&entity)
+        {
+            live.insert(entity);
+        }
+    }
+    let renumbered: BTreeSet<i64> = changes
+        .iter()
+        .filter(|c| c["meaning"] == "live_item_full_record_revision_advanced")
+        .filter_map(|c| c["entity_pid"].as_i64())
+        .collect();
+    ensure!(
+        changes.is_empty() || renumbered == live,
+        "the phone renumbered {} of {} live items, not all of them",
+        renumbered.len(),
+        live.len()
+    );
+    Ok(changes)
+}
+
 fn verify_tables(
     a: &BTreeMap<String, Table>,
     b: &BTreeMap<String, Table>,
