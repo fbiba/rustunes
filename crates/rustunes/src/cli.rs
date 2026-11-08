@@ -688,7 +688,9 @@ async fn run_parsed(cli: Cli) -> Result<ExitCode> {
                 .await
                 .context("timed out finding the phone over Wi-Fi")??;
         }
-        dispatch(cli, &engine).await.map_err(|error| {
+        // Boxed: the commands nest futures deeper than the compiler's layout
+        // query limit allows when the binary lays out the whole run.
+        Box::pin(dispatch(cli, &engine)).await.map_err(|error| {
             if device::phone_slept() {
                 error.context(
                     "the phone went to sleep during this Wi-Fi command and closed its connections; try again, and if it keeps happening, unlock the phone and keep its screen on",
