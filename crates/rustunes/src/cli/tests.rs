@@ -50,17 +50,28 @@ fn nested_help_and_completions_need_no_local_state() {
         let help = Cli::try_parse_from(args).err().unwrap();
         assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
     }
-    let mut output = Vec::new();
-    super::completions::bash(Cli::command(), &mut output).unwrap();
-    let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("'cache:prune') key='cache/prune'"));
-    let prune_options = output
-        .lines()
-        .find(|line| line.contains("'cache/prune') opts="))
+    use super::completions::{Shell, script};
+    let bash = script(Shell::Bash, Cli::command()).unwrap();
+    let mut lines = bash.lines();
+    lines
+        .find(|line| line.trim() == "rustunes__subcmd__cache__subcmd__prune)")
         .unwrap();
+    let prune_options = lines.next().unwrap();
     for name in ["--dry-run", "--unseen-days", "--json", "--device"] {
         assert!(prune_options.contains(name), "{name}");
     }
+    let fish = script(Shell::Fish, Cli::command()).unwrap();
+    for name in ["dry-run", "unseen-days", "json", "device"] {
+        assert!(
+            fish.lines().any(|line| line.contains(
+                "__fish_rustunes_using_subcommand cache; and __fish_seen_subcommand_from prune"
+            ) && line.contains(&format!(" -l {name}"))),
+            "{name}"
+        );
+    }
+    let zsh = script(Shell::Zsh, Cli::command()).unwrap();
+    assert!(zsh.starts_with("#compdef rustunes"));
+    assert!(zsh.contains("'--unseen-days=["));
 }
 
 #[test]
@@ -360,7 +371,9 @@ fn wifi_finds_the_phone_first_only_for_commands_that_reach_it() {
     assert!(!reaches(&["device", "list"]));
     assert!(!reaches(&["scan", "/tmp/music"]));
     assert!(!reaches(&["inspect", "/tmp/track.m4a"]));
-    assert!(!reaches(&["completions", "bash"]));
+    for shell in ["bash", "zsh", "fish"] {
+        assert!(!reaches(&["completions", shell]));
+    }
     let apply = [
         "apply",
         "plan.json",

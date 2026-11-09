@@ -173,14 +173,30 @@ cargo install --locked rustunes
 
 ### Shell completion (optional)
 
-```bash
-# Current shell only
-source <(rustunes completions bash)
+rustunes prints completion scripts for bash, zsh and fish. Install the one for
+your shell, then open a new terminal.
 
-# Permanently
+```bash
+# bash
 mkdir -p ~/.local/share/bash-completion/completions
 rustunes completions bash > ~/.local/share/bash-completion/completions/rustunes
+
+# zsh
+mkdir -p ~/.zfunc
+rustunes completions zsh > ~/.zfunc/_rustunes
+
+# fish
+mkdir -p ~/.config/fish/completions
+rustunes completions fish > ~/.config/fish/completions/rustunes.fish
 ```
+
+zsh only looks in folders on its `fpath`. Add `fpath=(~/.zfunc $fpath)` to
+`~/.zshrc` before the line that runs `compinit`. If nothing in your `~/.zshrc`
+runs it, add `autoload -Uz compinit && compinit` after the `fpath` line.
+
+To try completion in the current shell without installing it, run
+`source <(rustunes completions bash)`, `source <(rustunes completions zsh)` or
+`rustunes completions fish | source`.
 
 ### Upgrading
 
@@ -647,7 +663,7 @@ the same additions, updates and removals, and sends them as `sync` would.
 | --- | --- | --- |
 | `cache stats` | Show the fingerprint cache's entries, reuse and size. | `--unseen-days N` (count entries unused for `N` days, default 90), `--json` |
 | `cache prune` | Remove cache entries unused for a while, such as deleted tracks. | `--unseen-days N` (default 90), `--dry-run`, `--json` |
-| `completions bash` | Print the Bash completion script. | |
+| `completions SHELL` | Print the completion script for `bash`, `zsh` or `fish`. | |
 
 ### Diagnostics
 

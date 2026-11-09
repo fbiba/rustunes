@@ -12,6 +12,7 @@ rust-version.workspace = true
 music-protocol = { path = "../music-protocol", version = "0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 idevice.workspace = true
 libc.workspace = true
 lofty.workspace = true

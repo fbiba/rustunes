@@ -25,6 +25,7 @@ Direct Rust dependencies of the workspace (`Cargo.toml` and `crates/*/Cargo.toml
 | anyhow | 1.0.104 | MIT OR Apache-2.0 |
 | cbc | 0.1.2 | MIT OR Apache-2.0 |
 | clap | 4.6.7 | MIT OR Apache-2.0 |
+| clap_complete | 4.6.11 | MIT OR Apache-2.0 |
 | flate2 | 1.1.10 | MIT OR Apache-2.0 |
 | hmac | 0.12.1 | MIT OR Apache-2.0 |
 | idevice | 0.1.68 | MIT |

@@ -99,12 +99,12 @@ fn metadata_plan_cli_requires_complete_request_snapshot_and_journal() {
 
 #[test]
 fn metadata_plan_completion_is_derived_without_changing_set() {
-    let mut bytes = Vec::new();
-    completions::bash(Cli::command(), &mut bytes).unwrap();
-    let completion = String::from_utf8(bytes).unwrap();
-    assert!(completion.contains("metadata:plan"));
-    assert!(completion.contains("metadata/plan"));
-    assert!(completion.contains("--request"));
+    let completion = completions::script(completions::Shell::Bash, Cli::command()).unwrap();
+    let mut lines = completion.lines();
+    lines
+        .find(|line| line.trim() == "rustunes__subcmd__metadata__subcmd__plan)")
+        .unwrap();
+    assert!(lines.next().unwrap().contains("--request"));
     let set = Cli::try_parse_from([
         "rustunes",
         "metadata",

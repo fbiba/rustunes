@@ -202,10 +202,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Print shell completion to stdout (source the output in Bash).
+    /// Print the completion script for bash, zsh or fish to stdout.
     Completions {
-        #[arg(value_parser = ["bash"])]
-        shell: String,
+        #[arg(value_enum)]
+        shell: completions::Shell,
     },
     /// Mirror the library directory onto the phone: send its new tracks, update changed tags and covers, and remove the tracks this tool sent whose source file has left the library (listed and confirmed first). Set the directory once with `rustunes config library DIR`; `rustunes push` only sends.
     Sync {
@@ -1030,15 +1030,14 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
             });
         }
         Command::Completions { shell } => {
+            let script = completions::script(shell, Cli::command())?;
             if machine::enabled() {
-                let mut script = Vec::new();
-                completions::bash(Cli::command(), &mut script)?;
                 machine::report(
                     "completions",
-                    &serde_json::json!({"shell": shell, "script": String::from_utf8(script)?}),
+                    &serde_json::json!({"shell": shell.name(), "script": script}),
                 )?;
             } else {
-                completions::bash(Cli::command(), &mut std::io::stdout().lock())?;
+                std::io::stdout().lock().write_all(script.as_bytes())?;
             }
         }
         Command::Sync {

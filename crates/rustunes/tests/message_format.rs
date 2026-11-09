@@ -174,14 +174,18 @@ fn cache_and_completions_report_their_output() {
     assert_eq!(report(&records, "cache_prune")["removed"], 0);
     assert_eq!(records.last().unwrap()["outcome"], "dry_run");
 
-    let output = run(&["completions", "bash"], &home, "");
-    let records = checked(&output);
-    let completions = report(&records, "completions");
-    assert!(
-        completions["script"]
-            .as_str()
-            .is_some_and(|s| s.contains("--message-format"))
-    );
+    for shell in ["bash", "zsh", "fish"] {
+        let output = run(&["completions", shell], &home, "");
+        let records = checked(&output);
+        let completions = report(&records, "completions");
+        assert_eq!(completions["shell"], shell);
+        assert!(
+            completions["script"]
+                .as_str()
+                .is_some_and(|s| s.contains("message-format")),
+            "{shell}"
+        );
+    }
 }
 
 #[test]
