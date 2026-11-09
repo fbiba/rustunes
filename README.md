@@ -119,6 +119,27 @@ that has everything is used, with a warning that it is untested.
 
 ## Installation
 
+### Prebuilt binary (Linux x86_64)
+
+Each [release](https://github.com/fbiba/rustunes/releases) comes with a
+prebuilt binary, so you need neither Rust nor a C compiler. Download it, check
+it and install it:
+
+```bash
+version=0.1.0
+archive=rustunes-$version-x86_64-unknown-linux-gnu
+curl -LO https://github.com/fbiba/rustunes/releases/download/v$version/$archive.tar.gz
+curl -LO https://github.com/fbiba/rustunes/releases/download/v$version/SHA256SUMS
+sha256sum -c SHA256SUMS
+tar -xzf $archive.tar.gz
+install -Dm755 $archive/rustunes ~/.local/bin/rustunes
+```
+
+If the releases page lists a newer version, set `version` to it. Make sure
+`~/.local/bin` is on your `PATH`, then check it works with `rustunes --version`.
+The binary needs glibc 2.28 or newer. The archive also contains the licences of
+everything compiled into it.
+
 ### From source
 
 ```bash
