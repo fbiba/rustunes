@@ -1,6 +1,6 @@
 [package]
 name = "rustunes"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Sync local music (ALAC, AAC, MP3, FLAC, WAV, AIFF) into the stock iPhone Music library from Linux, over USB or Wi-Fi"
 license.workspace = true

@@ -126,7 +126,7 @@ prebuilt binary, so you need neither Rust nor a C compiler. Download it, check
 it and install it:
 
 ```bash
-version=0.1.0
+version=0.1.1
 archive=rustunes-$version-x86_64-unknown-linux-gnu
 curl -LO https://github.com/fbiba/rustunes/releases/download/v$version/$archive.tar.gz
 curl -LO https://github.com/fbiba/rustunes/releases/download/v$version/SHA256SUMS
