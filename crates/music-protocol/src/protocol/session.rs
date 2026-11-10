@@ -1448,10 +1448,22 @@ fn check_allowed(params: &Dictionary) -> Result<()> {
             && params["EducationModeEnabled"].as_boolean() == Some(false),
         "device is not ready for this unprotected manual Media session"
     );
-    strings(
-        params.get("DisabledAssetTypes"),
-        &["Photo", "Movie", "TVEpisode", "HomeVideo"],
-    )
+    // The types the phone takes from no computer follow its apps and
+    // settings: it lists the three video types only while the TV app is not
+    // installed. Music is the one type a session here sends.
+    let disabled = params
+        .get("DisabledAssetTypes")
+        .and_then(Value::as_array)
+        .context("expected string array")?;
+    let mut music = false;
+    for kind in disabled {
+        music |= kind.as_string().context("expected string array")? == "Music";
+    }
+    ensure!(
+        !music,
+        "the iPhone does not take Music from a computer (its SyncAllowed disables the Music asset type)"
+    );
+    Ok(())
 }
 
 struct SessionTransport(atc::Atc);
@@ -2120,6 +2132,28 @@ mod tests {
         assert!(channel.client.partial_frame().is_empty());
         assert_eq!(channel.frames, 0);
         assert!(std::fs::read_dir(&trace.0).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn sync_allowed_takes_any_disabled_asset_types_but_music() {
+        let allowed_with = |types: Value| {
+            let mut value = allowed();
+            set(&mut value, &["Params", "DisabledAssetTypes"], types);
+            check_telemetry(value.as_dictionary().unwrap())
+        };
+        // One phone sent both lists: the first with the TV app installed, the
+        // second with it deleted.
+        allowed_with(array(&["Photo"])).unwrap();
+        allowed_with(array(&["Photo", "Movie", "TVEpisode", "HomeVideo"])).unwrap();
+        allowed_with(array(&[])).unwrap();
+
+        let error = allowed_with(array(&["Photo", "Music", "MusicVideo"])).unwrap_err();
+        assert!(
+            error.to_string().contains("does not take Music"),
+            "{error:#}"
+        );
+        assert!(allowed_with(Value::Array(vec![Value::Integer(1.into())])).is_err());
+        assert!(allowed_with("Photo".into()).is_err());
     }
 
     fn metadata_policy() -> MetadataOnlyPolicy {

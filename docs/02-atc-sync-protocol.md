@@ -183,10 +183,12 @@ Params:
   DataProtected: false
   AppInstallationAllowed: <bool>
   SupportsFavorites: true
-  DisabledAssetTypes: [Photo, Movie, TVEpisode, HomeVideo]
+  DisabledAssetTypes: <asset types, see below>
 ```
 
 CONFIRMED key set. The boolean values not shown were not recorded. `SyncAllowed` is the phone's statement that it will accept a sync from this host. A client should wait for it before sending `RequestingSync`. Apple's host also keeps state strings `AutoSync`, `ManualSync`, `PurgeAllowed` and `DataProtected` and honours the disabled asset types. INFERRED from strings that the host refuses to sync a disabled type.
+
+`DisabledAssetTypes` lists the asset types the phone takes from no computer, and it follows the phone's apps and settings. CONFIRMED (passive probes of one phone): the phone sent `[Photo, Movie, TVEpisode, HomeVideo]` while the Apple TV app was deleted and `[Photo]` while it was installed. The other eight values were the same in both. What puts `Photo` in the list is not known. A client must not read the list as the signature of a known phone. rustunes refuses only a list that names `Music`, the one type it sends.
 
 ## 5. Session numbering, Ping and Pong
 
