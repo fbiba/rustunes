@@ -39,13 +39,14 @@ Host binaries analysed (Windows, x86-64 PE32+). The binaries are not redistribut
 | Package | AMPDevicesAgent.exe | AirTrafficHost.dll | MobileDevice.dll |
 | --- | --- | --- | --- |
 | Apple Devices 1.1540.23042.0 | 1.6.4.90 (12,409,712 bytes, SHA-256 `ad957f32107b7177969b3cb11b91e3922d27e622b53f9240b65cb457522111f9`) | 4025.400.1.5 (322,000 bytes, SHA-256 `0d38b01c21d57a9f3ca32c15d4b2b8aa0557d43a724b4745f1fb122322f4eecd`) | 1827.100.17.2 (4,020,688 bytes, SHA-256 `de08e3324f24dbcbc0597b78f797670f18f53faa58819cda3c32fa3cebcb9d39`) |
-| Apple Devices 1.1540.24088.0 | 1.6.4.94 (SHA-256 `f5e0f2115283e8719df383baf59d9b8a6f5a2ec39e566fbe802357f2d11e6fa9`) | 4026.110.1.6 (SHA-256 `230445f73c4887ff46adfb7a9a25ed83fb99b6abc9bc341fcb8349bad3a7664b`) | not analysed |
+| Apple Devices 1.1540.24088.0 | 1.6.4.94 (SHA-256 `f5e0f2115283e8719df383baf59d9b8a6f5a2ec39e566fbe802357f2d11e6fa9`) | 4026.110.1.6 (SHA-256 `230445f73c4887ff46adfb7a9a25ed83fb99b6abc9bc341fcb8349bad3a7664b`) | 1860.2.5.1 (SHA-256 `929e4c3582eede3cde35eabb31ad8211defcd425448fd75b5353073d6bd46812`); read only for the lockdown values of chapters 03 and 10 |
 
 Address conventions:
 
 - Addresses in `AMPDevicesAgent.exe` (written "AMP" below) are relative virtual addresses (RVAs). The virtual address is `0x140000000` plus the RVA. Some analysis output prints the full virtual address (`0x1404xxxxx`). This chapter gives RVAs unless a full address is shown.
 - Addresses in `AirTrafficHost.dll` are RVAs. The preferred image base is `0x180000000`.
 - Unless a build is named, an address belongs to AMPDevicesAgent 1.6.4.90 or AirTrafficHost 4025.400.1.5. Build 1.6.4.94 shifted most AMP addresses by a small offset. For example the `ReadyForSync` handler moved from `0x45ee20` to `0x45ef44`. Section 11 lists the verified mapping. The signer function (`0x248b0`) and the incoming-message callback in the DLL (`0x307a0`) did not move.
+- Statements about the phone's own code come from a static reading of the firmware of iOS 27.2 (24B119) for the same model, not from a session (chapter 09, sections 1 and 13.1). Each one names its binary: AirTrafficDevice (`0x22b7...`), AirTraffic (`0x2559e...`) and MusicLibrary (`0x1d1...`) are images of the dyld shared cache, and "sync bundle" is the Music sync bundle that `atc` loads (addresses such as `0x1a0ee8`). Method names are Apple's Objective-C names.
 
 Methods used, in order of strength:
 
@@ -170,6 +171,8 @@ CONFIRMED. These are aggregates only. No per-track entries exist in any capture.
 
 Correlation observed: after one 17,452,907-byte track was added, `_Count` rose by one and `_PhysicalSize` by 17,453,056 bytes. That is the file size rounded up to a multiple of 4096. The metrics can therefore confirm that an insertion landed, but they cannot identify the track. The phone sends `AssetMetrics` again after the metadata phase of a sync. Apple's host validates and logs the counts after `SyncFinished`.
 
+The numbers come from a cache. CONFIRMED (static, AirTrafficDevice `0x22b79a118`): `atc` keeps the last computed disk usage under `DiskUsage` in its defaults. At link start it sends `AssetMetrics` only when that cache is not empty (`0x22b79a218`). When the cache is empty or old it starts a refresh and sends `AssetMetrics` when the refresh ends. INFERRED: on a phone where `atc` has never computed the usage, the first `AssetMetrics` comes after `SyncAllowed`, and the second `AssetMetrics` of an active start is such a refresh. A client must not require `AssetMetrics` before `SyncAllowed`.
+
 ### 4.4 SyncAllowed
 
 ```text
@@ -186,9 +189,28 @@ Params:
   DisabledAssetTypes: <asset types, see below>
 ```
 
-CONFIRMED key set. The boolean values not shown were not recorded. `SyncAllowed` is the phone's statement that it will accept a sync from this host. A client should wait for it before sending `RequestingSync`. Apple's host also keeps state strings `AutoSync`, `ManualSync`, `PurgeAllowed` and `DataProtected` and honours the disabled asset types. INFERRED from strings that the host refuses to sync a disabled type.
+CONFIRMED key set. The boolean values not shown were not recorded. `SyncAllowed` tells the host what the phone will take and whether it is unlocked and free. A client should wait for it before sending `RequestingSync`. Apple's host also keeps state strings `AutoSync`, `ManualSync`, `PurgeAllowed` and `DataProtected` and honours the disabled asset types. INFERRED from strings that the host refuses to sync a disabled type.
 
-`DisabledAssetTypes` lists the asset types the phone takes from no computer, and it follows the phone's apps and settings. CONFIRMED (passive probes of one phone): the phone sent `[Photo, Movie, TVEpisode, HomeVideo]` while the Apple TV app was deleted and `[Photo]` while it was installed. The other eight values were the same in both. What puts `Photo` in the list is not known. A client must not read the list as the signature of a known phone. rustunes refuses only a list that names `Music`, the one type it sends.
+`DisabledAssetTypes` lists the asset types the phone takes from no computer, and it follows the phone's apps and settings. CONFIRMED (passive probes of one phone): the phone sent `[Photo, Movie, TVEpisode, HomeVideo]` while the Apple TV app was deleted and `[Photo]` while it was installed. The other eight values were the same in both. A client must not read the list as the signature of a known phone. rustunes refuses only a list that names `Music`, the one type it sends.
+
+How the phone builds the message. CONFIRMED (static, `-[ATLegacyDeviceSyncManager _sendSyncAllowed]`, AirTrafficDevice `0x22b79ab08`) unless marked:
+
+| Key | Value |
+| --- | --- |
+| `ManualSync` | True when no other link is the current sync link and the phone has been unlocked since it started (`0x22b79ab84`, `0x22b79ac78`). |
+| `AutoSync` | `ManualSync` and the phone is charging (`0x22b79acb8`). |
+| `DataProtected` | The phone has not been unlocked since it started (`0x22b79ad7c`). |
+| `EducationModeEnabled` | The phone is a shared (multi-user) device. |
+| `AppInstallationAllowed`, `AppRemovalAllowed` | From device-management restrictions. |
+| `SupportsFavorites` | Always true. |
+| `PurgeAllowed` | OPEN. The value comes from a constant outside the files that were read. |
+| `DisabledAssetTypes` | The lists of the phone's sync clients, one after another (`0x22b756ef0`). |
+| `ManagedOrganizationName` | A tenth key, present only when device management supplies a name (`0x22b79ae54`). Not observed. |
+
+- **It is information, not permission.** `atc` sends the message unconditionally, and its `RequestingSync` handler does not look at these flags (`0x22b798838`). A refusal is a `SyncFailed` (chapter 09, section 6.3).
+- **When it is sent.** At link start, after the first unlock, on every power change, when a session is reset, and once more after the phone accepts `RequestingSync` (section 6.1). A client sees it at least twice in a session.
+- **The Music client's part of `DisabledAssetTypes`** (sync bundle `0x1a9708`). It adds `Movie`, `TVEpisode` and `HomeVideo` only when neither `com.apple.tv` nor `com.apple.videos` is installed. It adds `Music` and `MusicVideo` when `[ICCloudClient isAuthenticated]` is true. INFERRED from the name: that is the state in which the owner's iCloud music library is on, and the phone then takes no music from a computer. The first rule agrees with the two probes above. Where `Photo` comes from is OPEN: its client is not in the files that were read.
+- **Nothing in the message depends on an earlier sync.** A phone that no computer has synced builds it the same way.
 
 ## 5. Session numbering, Ping and Pong
 
@@ -209,7 +231,9 @@ CONFIRMED. All Linux sessions on this phone, over USB and Wi-Fi, used Ping with 
 - Incoming `ReadyForSync`, `AssetManifest` and `SyncFinished`/`SyncFailed` messages are each compared with this counter by command-specific code (for example `SyncFinished` at `0x30cce-0x30d10`). A message with another session is not forwarded. CONFIRMED.
 - The Pong path (`0x30c22-0x30c4c`) branches to return without comparing the Session. A valid Pong is accepted whatever its Session. CONFIRMED.
 
-Correction: an early Linux probe required the Pong's Session to equal the Ping's. It failed on the first live run because the phone replied with Session 2. The echo requirement was wrong. A client must record the Session values it sent and received separately and must not require equality. How the phone chooses 2 is OPEN.
+Correction: an early Linux probe required the Pong's Session to equal the Ping's. It failed on the first live run because the phone replied with Session 2. The echo requirement was wrong. A client must record the Session values it sent and received separately and must not require equality.
+
+The phone's side is partly known. CONFIRMED (static, AirTrafficDevice `0x22b798d8c`): when the phone accepts `RequestingSync` it adopts the session number of the request (`+[ATLegacyMessage setSessionNumber:]`) and stamps everything it sends afterwards with it. That explains `ReadyForSync` and the later messages. The number is held once for the whole `atc` process, not per link (INFERRED from the class method), so the first messages on a new link can carry a number left by an earlier session. In one Linux session on iOS 27.2 whose frames were kept, the `SyncAllowed` that followed the Ping carried Session 1 and the `SyncAllowed` that followed `RequestingSync` carried Session 2. OPEN: what the phone does with the session number of a Ping, and why the Pong of the earlier sessions carried 2.
 
 ### 5.3 Grappa session ID versus ATC session number
 
@@ -237,6 +261,7 @@ host                                         phone
  |<--- Pong, Capabilities, InstalledAssets, |
  |     AssetMetrics, SyncAllowed, AssetMetrics (Session 2)
  |---- RequestingSync (Session 2) --------->|
+ |<--- SyncAllowed, InstalledAssets --------|   sent again
  |<--- ReadyForSync (Session 2) ------------|
  |     host writes Sync_00000000.plist and  |
  |     Sync_00000000.plist.cig over AFC     |
@@ -253,7 +278,9 @@ Notes on the sequence:
 
 - The metadata is not sent inside an ATC message. It is a file written through AFC (the Apple File Conduit service) into a staging directory, followed by `FinishedSyncingMetadata`. Section 8 describes the file.
 - The phone applies the metadata after it receives `FinishedSyncingMetadata` and finds the staged file. The receiver finished within about 0.07 to 0.6 s of the operation being staged in metadata-only sessions. For an insert batch the single `AssetManifest` arrived 92 ms after staging, and `SyncFinished` came 37 ms after the last `FileComplete`.
-- If every operation needs no asset, the phone skips the manifest and sends `SyncFinished` directly. A metadata-only session (updates and deletes) was seen to finish this way. Apple's host handles this case explicitly: its metadata waiter (`0x46d864-0x46dea7`) waits for `AssetManifest` or `SyncFinished`.
+- What the phone does with `RequestingSync`, in order (CONFIRMED static, `-[ATLegacyDeviceSyncManager _handleRequestingSyncMessage:fromLink:]`, AirTrafficDevice `0x22b798838`): it records the host (chapter 09, section 6.4), applies the version rule and the other refusals of chapter 09, section 6.3, establishes the Grappa session, cancels any session still open, adopts the request's session number, sends `SyncAllowed` again (`0x22b798ff0`), starts the session, sends `InstalledAssets` again, asks each sync client to prepare, and sends `ReadyForSync`. The second `SyncAllowed` was also seen on the wire. A client must accept both messages between its request and `ReadyForSync`.
+- Nothing in that handler reads a setup state, a stored host record, a stored anchor or any sign of an earlier sync. The request of a host the phone has never seen is handled like any other.
+- If every operation needs no asset, the phone skips the manifest and sends `SyncFinished` directly. A metadata-only session (updates and deletes) was seen to finish this way. Section 12.2 gives the phone's rule. Apple's host handles this case explicitly: its metadata waiter (`0x46d864-0x46dea7`) waits for `AssetManifest` or `SyncFinished`.
 - Linux sessions send exactly: Ping, RequestingSync, FinishedSyncingMetadata, then FileComplete and FileError messages as needed. A one-track artwork update sent six messages in all: Ping, RequestingSync, FinishedSyncingMetadata, FileComplete, FileError, FileError.
 - `Progress` messages begin after `FinishedSyncingMetadata`. Over USB the first one followed it by 34 to 152 ms.
 
@@ -285,7 +312,11 @@ These are internal host states, not wire fields.
 
 Dataclass names seen: `Media`, `Book`, `Keybag`, `VoiceMemo`. Music lives in `Media`.
 
-Host-side initialisation (static, AMP `0x46b1f8-0x46b218` and `0x46acb8-0x46ae7a`): the first dataclass entry is `Media` with mask 1. Each entry holds a host-last anchor (`+0x14`), a host-next anchor (`+0x18`), a device-last anchor (`+0x1c`), a chosen sync type (`+0x20`) and a pending operation array. Fresh entries start with both host anchors at 1. This is the initial state of a new host-side entry. It is not a rule for a new independent host.
+Host-side initialisation (static, AMP `0x46b1f8-0x46b218` and `0x46acb8-0x46ae7a`): the first dataclass entry is `Media` with mask 1. Each entry holds a host-last anchor (`+0x14`), a host-next anchor (`+0x18`), a device-last anchor (`+0x1c`), a chosen sync type (`+0x20`) and a pending operation array. Fresh entries start with both host anchors at 1. This is the initial state of a new host-side entry. It is not a rule for a new independent host. There are four entries: Media (mask 1), Ringtone (2), VoiceMemo (4) and Book (8).
+
+Apple's host keeps none of this on the computer. CONFIRMED (AMP 1.6.4.94, reader `0x14048142c`, writer `0x140475a64`): at every attach it reads its four last anchors from dataset 11 of the phone's `iTunesCDB` and it saves them there again. With no `iTunesCDB` on the phone the entries keep their initial 1 (chapter 10, section 5.3).
+
+Which dataclasses the request names is a constant of the host, not a reading of the phone. CONFIRMED (AMP 1.6.4.94, `0x140570128-0x140570258`): for any sync that touches media, play counts included, the host uses the mask `0x2d`, which is Media, VoiceMemo, Book and Keybag. It adds Photo for a photo sync and drops Keybag for a device without that capability. The `Dataclasses` builder (`0x14046ba78`) has no branch for VoiceMemo and the anchors builder (`0x14046bc88`) has one, with none for Book. That is why every request lists `[Media, Book, Keybag]` and carries anchors for Media and VoiceMemo. The VoiceMemo anchor stays 1 because that dataclass is never synced.
 
 Anchor wire format: a decimal string produced by `%u` (`0x46baa8`), nonzero. Example `"7"`.
 
@@ -298,7 +329,9 @@ Sync type values (`FinishedSyncingMetadata.Params.SyncTypes`), CONFIRMED by bran
 | 2 | `ATSyncResetSync` | the host sends the whole library (reset) |
 | 3 | `ATSyncPrepOnly` | preparation only |
 
-Host selector (`0x46cf0c`, called from `0x46d495`): when the dataclass is eligible and the host's last anchor differs from the device's last anchor, the host picks Reset (2) and drops `upload_track` operations. Otherwise it picks Delta (1). The reset reference session had Media host anchor `"7"`, device anchor `"8"`, and sent `SyncTypes {Media: 2, Book: 0, Keybag: 1}` with 401 operations. The delta reference session had matching anchors `"9"` and `"9"` and sent `{Media: 1, Book: 0, Keybag: 1}`. A Linux client must stop on an anchor mismatch instead of sending Reset, because the reset reference session rebuilt the library from the host's catalog.
+Host selector (`0x46cf0c`, called from `0x46d495`): when the dataclass is eligible and the host's last anchor differs from the device's last anchor, the host picks Reset (2) and drops every pending operation except `upload_track` (filter at `0x140469b50` in 1.6.4.94; an earlier version of this chapter had it the wrong way round). Otherwise it picks Delta (1). In 1.6.4.94 the selector is `0x14046d034`. It compares these two numbers and nothing else: it does not ask whether the phone was synced before or which library it belongs to. The reset reference session had Media host anchor `"7"`, device anchor `"8"`, and sent `SyncTypes {Media: 2, Book: 0, Keybag: 1}` with 401 operations. The delta reference session had matching anchors `"9"` and `"9"` and sent `{Media: 1, Book: 0, Keybag: 1}`. A Linux client must stop on an anchor mismatch instead of sending Reset, because the reset reference session rebuilt the library from the host's catalog.
+
+The phone takes no part in this choice. CONFIRMED (static, iOS 27.2): it compares no anchor with anything, accepts a Delta whatever anchor it holds, and stores the anchor of `FinishedSyncingMetadata` as it stands (section 12.1 and chapter 09, section 6.4). The sync type is the host's decision alone, and the phone carries it out (section 10.5).
 
 Anchor progression for one Media sync, CONFIRMED in Linux sessions:
 
@@ -309,7 +342,7 @@ Anchor progression for one Media sync, CONFIRMED in Linux sessions:
 | operation file `revision`, and `FinishedSyncingMetadata.DataclassAnchors.Media` | `A + 1` |
 | the phone afterwards | `A + 1` once the session is applied. A session rolled back at its first `Progress` leaves the anchor at `A` (section 14.3). |
 
-The anchor the phone holds also lives in its Music database (chapter 4). The anchor in the host-side saved catalog file (`iTunesCDB`) is a host-generated snapshot and can be stale. A client must take the live anchor from `ReadyForSync`, not from a saved file.
+The anchor the phone holds also lives in its Music database (chapter 4). The anchor in the saved catalog file (`iTunesCDB`, written to the phone by Apple's host) is that host's last anchor and can be stale. A client must take the live anchor from `ReadyForSync`, not from a saved file.
 
 Apple's host commits `hostNext` to `hostLast` once it receives an `AssetManifest` (`0x46cf78`) or reaches state 6 or 7 (`0x46dba4-0x46dbaa`). This happens before all assets complete. A matching anchor therefore does not prove that every asset arrived.
 
@@ -343,14 +376,14 @@ Field notes:
 | --- | --- | --- |
 | `Dataclasses` | array of string | Order is `Media`, `Book`, `Keybag` in Apple's reference sessions. A Music-only list was not tested. |
 | `DataclassAnchors.Media` | string | Anchor `A` as a decimal string. |
-| `DataclassAnchors.VoiceMemo` | string | `"1"` in all successful sessions. The phone's `ReadyForSync` does not refresh VoiceMemo (it lists only Media and Book). The saved catalog file stores the value. CONFIRMED value, OPEN why the host sends VoiceMemo. |
+| `DataclassAnchors.VoiceMemo` | string | `"1"` in all successful sessions. The phone's `ReadyForSync` does not refresh VoiceMemo (it lists only Media and Book). The saved catalog file stores the value. CONFIRMED value. The host sends it because its constant dataclass mask holds VoiceMemo (section 6.3). The phone never looks the key up (AirTrafficDevice reads `DataclassAnchors` only by the dataclasses of the session, `0x22b799208`). |
 | `HostInfo.Type` | string | `iTunes` |
 | `HostInfo.Version` | string | `13.2.4.123` in the analysed host. A third-party Books client uses `13.7.0.161`. This string is a compatibility profile, not a discovery of the running OS. The phone requires at least `10.5.0.115` by numeric comparison, or the literal `IGNORE`, and otherwise answers `SyncFailed` with `ErrorCode` 12 (chapter 09, section 6.2). |
 | `HostInfo.WindowsOSVersion` | string | `10.0` (the Books client uses a `MacOSVersion` key with a different value). |
 | `HostInfo.SyncHostName` | string | free text chosen by the host. |
 | `HostInfo.LibraryID` | string | 16 uppercase hex digits (`%016llX`). Section 7.2. |
-| `HostInfo.SyncedDataclasses` / `SyncedAssetTypes` | arrays | `[Media]` and `[Music]` in all Music sessions. |
-| `HostInfo.Wakeable` | integer | 0 |
+| `HostInfo.SyncedDataclasses` / `SyncedAssetTypes` | arrays | `[Media]` and `[Music]` in all Music sessions. Apple's host fills them from the phone's sync settings and sends both empty for a phone whose automatic sync is off (chapter 10, section 8). The phone only records them (chapter 09, section 6.4). |
+| `HostInfo.Wakeable` | integer | 0. The phone stores it and later wakes only hosts that sent a true value (chapter 03, section 5.8). |
 | `HostInfo.Grappa` | data | 84 bytes. Section 11. |
 
 The HostInfo builder is AMP `0x46bf50-0x46c2a4`. Asset types are built at `0x46bdd4` from host settings. The phone's `AutoSync` and `ManualSync` flags and the host's disabled types shape the list.
@@ -363,7 +396,11 @@ The `LibraryID` identifies which host library the phone is synced with. Apple do
 2. XOR it with the host's persistent user ID (preference `persistentUserID`, read at `0x6edc10`, generated and stored if absent),
 3. format the result as `%016llX`.
 
+The first value is the persistent ID of the host's own music library. Both values are host state: Apple's host never reads the `LibraryID` back from a phone. It writes the two numbers into the phone's `iTunesPrefs` when it adopts the phone, and compares the stored library ID with its own at each attach to decide whether the phone is "its" phone (chapter 10, section 6).
+
 A third-party Books client sends a new UUID for every operation. That is not Apple's behaviour and is not suitable for Music. The Linux client reuses the existing identity: it derives the two components from the phone's own preference files and sends the same `LibraryID` as the host that originally synced the library. In the phone's code (iOS 27.2) the field is compared with the library of a sync already in progress, and a different one is answered with `SyncFailed` `ErrorCode` 9. No other use that changes the sync was found (chapter 09, sections 6.3 and 6.4). No session with a wrong `LibraryID` was run.
+
+So the rule "one library at a time" is enforced by Apple's host, not by the phone. The phone accepts any `LibraryID`, including one it has never seen, and only keeps a record of it. What a new `LibraryID` risks is the reaction of Apple's host at a later connection, which chapter 10, sections 6 and 9 describe.
 
 ### 7.3 Phone reply: ReadyForSync
 
@@ -381,6 +418,23 @@ Params:
 - `DeviceInfo.Grappa` is an opaque 83-byte value. Both inspected replies start with bytes `01 01` and have byte 18 equal to `0x40`. It has no plist prefix. It is the input to the signing calculation in section 11.
 - Apple's host parses the dataclass anchor into the entry's device-last field. A missing anchor yields zero. The host logs a missing `DataclassAnchors` dictionary but still moves to state 3.
 - Ready arrives within the same session as the request. A client must check `Session` and `Media` anchor before continuing and must discard any Ready from another session.
+
+How the phone builds the reply. CONFIRMED (static, AirTrafficDevice `0x22b7993f0`, `0x22b79932c`):
+
+- `Params` holds exactly `DataclassAnchors` and `DeviceInfo`, and `DeviceInfo` holds only `Grappa`.
+- An anchor is added only for a requested dataclass whose sync client implements `currentSyncAnchor`. The Music client returns its stored `MLSyncClientSyncAnchor`, or `"0"` when the database holds none (sync bundle `0x1a0ee8`). A phone that no computer has synced therefore answers `Media: "0"`.
+- The anchors of the request are passed to the clients' prepare step. The Music client does not read its one (sync bundle `0x1a0f8c`), and prepare always succeeds. The phone therefore accepts any host anchor, `"0"` included.
+- INFERRED from the captures: `Book` is `"0"` and `Keybag` has no key. The Books client is not in the files that were read.
+
+### 7.4 RequestingSync sent by the phone
+
+Apple's host has a handler for a `RequestingSync` that arrives from the phone (AMP 1.6.4.94 `0x140460450`). It starts a sync with the default options and skips the checks the host applies to a sync it starts on its own (chapter 10, section 7). Whether the phone ever sends the message therefore matters.
+
+CONFIRMED (static, iOS 27.2). `atc` sends `RequestingSync` from one place: the block behind `-[ATDeviceService requestSyncForLibrary:withCompletion:]` (AirTrafficDevice `0x22b7963ec`), a method other processes on the phone reach over XPC. The message carries no parameters. It is not sent when a link opens, on a power change, after an interrupted session or after a restore.
+
+INFERRED: nothing in `atc`, AirTrafficDevice, AirTraffic, ATFoundation, MusicLibrary, the Music sync bundle or `medialibraryd` calls that method. The call sites were resolved by hand, because the shared-cache stubs of these images are not in the extracted files. OPEN: which other process calls it, for example a Sync button in Settings.
+
+No capture, from Apple's host or from Linux, shows the phone sending `RequestingSync`. A plain connection does not make the phone ask for a sync.
 
 ## 8. The operation file
 
@@ -409,6 +463,13 @@ CONFIRMED statically, then CONFIRMED live by the Linux client.
 - The phone consumes both files after `FinishedSyncingMetadata`. After a session the directory is empty again (observed after each session whose staging area was inspected; before the first Linux session the directory listing held only `.` and `..` and both index-0 names returned `ObjectNotFound`).
 - The AFC API used does not offer atomic create-exclusive or no-clobber rename. A client must therefore check that the staging directory is empty before the session and again after `ReadyForSync`, and must own the connection exclusively.
 
+The phone's side of the folder. CONFIRMED (static, iOS 27.2):
+
+- **Readers.** The Music sync bundle in `atc` lists the folder (`-[MLSyncClient _syncPlistFiles]`, sync bundle `0x1a8b68`) and `medialibraryd` lists it again for the import (MusicLibrary `0x1d1b94f1c`). Both keep the names that start with `Sync_` and end with `.plist`, sorted by name, and take the sidecar from `<name>.cig`.
+- **The phone never creates the folder.** No code on the phone creates `iTunes_Control/Sync` or `Sync/Media`. A phone that no computer has synced has neither. When the folder is missing both listings return nothing, the signature check passes on an empty list, and the import runs over no file. Nothing fails on the phone. A host must create the two folders before it writes, as Apple's host does (chapter 10, section 8).
+- **Clean-up.** When a session is prepared, the bundle deletes every `Sync_*.plist` left in the folder (`0x1a10bc`). It does not delete `.cig` files. After the import it deletes each plist and its `.cig` (`0x1a1f74`, `0x1a1ffc`). A `.cig` whose plist is gone therefore stays for good, and it blocks a client that requires an empty folder.
+- **The envelope.** The import reads only `operations` (MusicLibrary `0x1d1b95264`). The phone never reads `revision` or `timestamp`.
+
 Apple's host also takes a sync lock on the device during a Music sync: it opens `com.apple.itunes.lock_sync` on the AFC root, takes an AFC lock, posts `com.apple.itunes-mobdev.syncWillStart`, `syncLockRequest`, `syncDidStart` and later `syncDidFinish` through the notification proxy, and creates a `com.apple.itunes.syncing` flag (AMP `0x498440`, `0x498c4c`). CONFIRMED statically for Apple's host. Chapter 3, section 7.9 gives the full routine.
 
 INFERRED: the Linux client does not take this lock. No Linux session is recorded as taking it, and the live order of the lock and the notifications was never captured from Apple's host. The phone accepted every recorded Linux session without it, so the lock looks like a courtesy toward other Apple clients and not a receiver requirement. OPEN: how the lock interacts with a concurrent Apple sync.
@@ -434,7 +495,9 @@ db_info:
   primary_container_pid: <PID of the library's primary playlist>
 ```
 
-CONFIRMED in both reference sessions and every Linux session. Both values repeat the phone's existing identities. They are read from the phone's catalog; they are never allocated by the client. The database PID is also stored in the saved catalog file header (`+0x48`). The primary container is the playlist whose object flag `+0x238 & 4` is set. An unchanged `update_db_info` does not request a playlist replacement or a reset.
+CONFIRMED in both reference sessions and every Linux session. Both values repeat the phone's existing identities. On a phone that already has them, a client reads them from the phone's catalog and does not allocate them. The database PID is also stored in the saved catalog file header (`+0x48`). The primary container is the playlist whose object flag `+0x238 & 4` is set. An unchanged `update_db_info` does not request a playlist replacement or a reset.
+
+The operation is more than an echo. CONFIRMED (static, MusicLibrary `0x1d1b967c4`): when the phone's `db_info` table has no row, or its row has another `db_pid`, the phone deletes every row and creates one whose `db_pid` is the `pid` of the operation (`0x1d1b968a8`, `0x1d1b968f4`). It stores `primary_container_pid` without checking that such a playlist exists. The phone itself never creates a `db_info` row, so on a phone that no computer has synced the first host mints both numbers. Apple's host did so in the guarded capture of chapter 10, section 8. The other keys the phone accepts inside `db_info` are `audio_language`, `subtitle_language`, `genius_cuid`, `genius_config` and `apple_ids`. An operation whose `pid` is missing or not a number is logged and skipped, and the import goes on. Chapter 04, section 3.1 has the row.
 
 ### 8.5 Pruning of earlier operations
 
@@ -671,6 +734,12 @@ CONFIRMED on the phone (six sessions): both operations complete the session and 
 
 The reset builder (AMP `0x468330-0x468420`) assembles the full library operation list. For `Media`, and only when the switch word is below `0x800` (`0x468387`), it sends one `insert_artist` per artist and one `insert_album` per album before the tracks. Its playlist step selects `insert_playlist` (`0x46860d`, `0x468617`). Not relevant to a Linux client that stays in Delta.
 
+What the builder sends is the host's own copy of the device library, not the host's music library. In 1.6.4.94 (`0x140468364`) it emits one `insert_track` for each track of that copy and one `insert_playlist` for each of its playlists, with `update_db_info` first. It reads no "home library" flag and no music setting, and it does not stop at an empty copy. CONFIRMED. The copy is rebuilt at each attach from the phone's `iTunesCDB`. With no such file it holds one new library playlist named after the device and no track (chapter 10, section 5.3).
+
+What the phone does with a Reset. CONFIRMED (static, MusicLibrary `ML3ImportSession::begin` `0x1d1b43734` and `_finishImport` `0x1d1b6683c`): the phone treats sync type 2 as "the host sends everything it owns again". It remembers every track, playlist, album and album artist that has a host-sync identity (`sync_id != 0`), clears those identities, applies the operations, and then removes each remembered item the host did not send again. Items no computer synced, such as purchases and downloads, have no such identity and stay. The phone does not check which host sends the Reset, and no anchor has to match. Chapter 05, section 5 gives the steps.
+
+Together these two facts mean that a Reset from a host whose copy is empty removes all host-synced music from the phone. Chapter 10, section 9 describes when Apple's host does that.
+
 ## 11. Signing
 
 ### 11.1 What the host does
@@ -760,6 +829,10 @@ The `SyncTypes` for the reset reference session were `{Media: 2, Book: 0, Keybag
 
 Sending it ends the metadata phase. Once the phone reads the staged files the changes are applied. A session killed immediately after this message may be rolled back (section 14.3).
 
+What the phone reads from it. CONFIRMED (static, AirTrafficDevice `0x22b79af30`, `0x22b775eec`): for each dataclass of the session it takes `SyncTypes[dataclass]` as an unsigned integer, with 0 for a missing key, and `DataclassAnchors[dataclass]`, and hands both to that dataclass's sync client unchanged. Neither value is range-checked or compared with anything. Type 0 imports nothing. Type 3 ends the dataclass at once with success and without an import. Any other type starts the import, and only type 2 sets its Reset flag. When the import commits, the phone stores the anchor string as its new Media anchor (chapter 09, section 6.4). The phone answers `SyncFailed` with `ErrorCode` 23 when no session is active or the session number differs.
+
+Apple's host sends the message when its session is in state 4 and no stage failed (AMP 1.6.4.94 `0x14046d864`). It does not look at the operation list first.
+
 ### 12.2 AssetManifest
 
 CONFIRMED (Windows callback argument; Linux frames).
@@ -798,6 +871,10 @@ Observed values: 1, 2, 3, 4, 7, 8, 10. Interpretation: 3 is audio plus artwork, 
 
 Ordering: the manifest array is not in completion order. In the reset reference session, the audio-plus-artwork request at index 46 completed before the artwork request at index 1, and the lyrics request at index 0 completed later.
 
+When the phone sends a manifest. CONFIRMED (static, iOS 27.2): after the import the phone starts an asset task for the session (AirTrafficDevice `0x22b7763ec`, `0x22b776470`). It sends `AssetManifest` only when the number of outstanding assets is not zero (`0x22b781e34`). With none, the task ends, the phone sends `SyncFinished` with no parameters (`0x22b7982d8`), and it does not call the Music client's end-of-transfer step (chapter 05, section 5). For Media the candidates are the tracks that match `(store_saga_id = 0 AND sync_id != 0) OR needs_restore = 1`, which are the host-synced tracks outside the cloud library and the tracks marked for restore, and the artwork of host-synced playlists (sync bundle `0x1a5088`, `0x1a6630`). INFERRED from that predicate: the phone looks at its whole library, not at the operations of the session, which fits manifests that name tracks the session did not touch (section 14.2). OPEN: how the candidates are narrowed to the parts the phone asks for, and what sets `needs_restore`.
+
+Between `FinishedSyncingMetadata` and `SyncFinished` the phone may also send `Progress`, `SyncAllowed`, `AssetMetrics`, `Ping`, `SyncFailed`, and `IdleExit` after 45 s of silence from the host (section 14.3).
+
 ### 12.3 Staging audio: Airlock
 
 CONFIRMED by static data flow and by Linux sessions.
@@ -814,6 +891,25 @@ The phone then moves the file from the Airlock to that permanent location. CONFI
 Artwork-only requests (AssetParts 2 for the client's own track) use a different staging location, CONFIRMED live and statically: the cover image bytes go unchanged to `Airlock/Media/Artwork/<exact AssetID>` with no extension and no rename. Completion uses an empty path (section 12.4).
 
 The Airlock directory already exists on the phone with an `Artwork` subdirectory. A client that fails mid-session leaves its staged files in place. The Linux client never deletes them automatically.
+
+That sentence describes a phone Apple's host had synced. The life of the folder in the phone's code, CONFIRMED (static, iOS 27.2):
+
+| Event | What the phone does | Address |
+| --- | --- | --- |
+| `atc` starts or stops | Removes `Airlock` on the AFC root with everything in it. | AirTrafficDevice `0x22b76e604`, `0x22b76ed10`; AirTraffic `0x2559ecc48` |
+| A session begins (after `RequestingSync`) | Creates `Airlock/<dataclass>`, when it is missing, for each dataclass the request names. A Music session thereby gets `Airlock/Media`. | AirTrafficDevice `0x22b798018`; AirTraffic `0x2559eb780` |
+| An artwork part arrives | Reads `Airlock/Media/Artwork/<id>`, imports it and deletes it. | sync bundle `0x1a91c8`, `0x1a9600` |
+
+Nothing on the phone creates `Airlock/Media/Artwork`. A host that stages a cover must create that folder when it is missing. `atc` exits when it is idle or when memory is short, so a folder a host created, and any file left staged, lasts only until `atc` next starts. INFERRED: on a phone that no computer has synced there is no `Airlock` at all before the first session.
+
+The phone's move of a completed audio file. CONFIRMED (static, `-[ATAirlock processCompletedAsset:]`, AirTraffic `0x2559ec158`):
+
+1. The source is `Airlock/<dataclass>/<AssetID>`. If it is missing, the phone logs "asset not found in airlock" and moves nothing.
+2. The destination is `FileComplete.AssetPath` with a leading `/` removed, under the AFC root. The phone applies no naming rule of its own. The host chooses the folder and the name.
+3. The phone creates every missing folder of the destination in turn (`mkdirat`, mode 0755, `0x2559ec3e4`), so `iTunes_Control/Music` and `Fnn` need not exist. A failure logs "Could not create directory ... beneath AFC root".
+4. It renames the file and refuses a destination that leaves the AFC root (`renameatx_np` with `RENAME_RESOLVE_BENEATH`, `0x2559ec4e4`). If something is already at the destination it removes that and tries once more. Success logs "Airlock moved ... to ... beneath AFC root".
+
+Two consequences. A missing `Music/Fnn` folder is not an error: the phone creates it at the first track that goes there. And a file already at the permanent path is replaced without a message (INFERRED from what a rename does; the retry of step 4 is CONFIRMED), so the host's own collision check (section 12.5) is the only protection.
 
 ### 12.4 FileComplete
 
@@ -838,7 +934,7 @@ Params: {AssetID: "<PID>", Dataclass: "Media", AssetPath: ""}
 
 - The path is root-relative with forward slashes. The host's path builder removes one leading backslash and swaps separators (`0x45710c`, `0x456d98`).
 - No `Variant`, hash, size or timestamp is sent. The wire gives the phone no length check on the uploaded file.
-- The phone logs a generic "Cannot move asset outside of AFC root" diagnostic while handling the empty `AssetPath` of an artwork completion. The explicit artwork staging path is then used and the import succeeds. Treat this line as context, not as a failure.
+- The phone logs a generic "Cannot move asset outside of AFC root" diagnostic while handling the empty `AssetPath` of an artwork completion. The explicit artwork staging path is then used and the import succeeds. Treat this line as context, not as a failure. That was on iOS 27.0.1. The string does not exist in iOS 27.2, where the same case most likely logs "asset not found in airlock" (INFERRED from the code of section 12.3).
 - Completion order is not manifest order. Send the client's own audio `FileComplete` first, then the other messages. Linux sends the completion for its own audio before the `FileError` refusals.
 
 ### 12.5 Permanent filenames
@@ -849,6 +945,7 @@ CONFIRMED statically for Apple's host; the phone imposes none that was found.
 - Filename: four uppercase letters, each `'A' + (random_u16 % 26)` (`0x49cb0c`), with the extension: `m4a` for M4A. If the name exists the host adds a decimal suffix, for example `ABCD 1.m4a`. The final filename is limited to 31 UTF-16 units and the full path to 255.
 - There is no title or PID hash in the name.
 - The host's collision test issues AFC `GetFileInfo` and treats any nonzero status as "free". The Linux client requires an explicit `ObjectNotFound` for both Airlock names and the permanent path, verifies the parent directory, and checks that no catalogue row references the path.
+- The phone does not need the parent folder to exist, because it creates it during the move (section 12.3). On a phone that no computer has synced, `iTunes_Control/Music` and every `Fnn` are absent until the first track arrives (chapter 10, section 4).
 
 The wire gives the final path to the phone through `FileComplete.AssetPath`.
 
@@ -953,6 +1050,13 @@ CONFIRMED observations from Linux sessions killed at chosen points. The effects 
 
 In one product session the host refused an undeclared part (AssetParts 7 for a track that had declared 3, the extra bit being Genius) and abandoned the session before uploading. A client should accept a Genius bit on top of a track's declared parts. The Linux client now does.
 
+What a stopped session leaves, in the phone's code. CONFIRMED (static, iOS 27.2) unless marked:
+
+- **Before `FinishedSyncingMetadata`.** The prepare step writes nothing to the database: it runs in a read-only transaction (sync bundle `0x1a102c`). The anchor, `db_info` and every row change are written only by the import, which starts on that message. What remains is the phone's record of the host (chapter 09, section 6.4), the `Airlock` folders until `atc` next starts (section 12.3), the play-count file the prepare step wrote (chapter 09, section 6.5) and the host's own staged files. This agrees with the last row of the table.
+- **A closed link.** When the link closes during a session the phone cancels the session ("message link closed mid sync - cancelling active session", AirTrafficDevice `0x22b79765c`). The sync clients are told to cancel, and no last-sync time is recorded for the host.
+- **Silence.** The phone closes a link on which nothing arrived for 45 s, or 180 s for a host that announced `LocalCloudSupport`. It sends `IdleExit` first (AirTrafficDevice `0x22b7a40f0`). During a session that is a cancel like any other. A client must not hold a session open while it waits for a person. OPEN: which operations suspend the timeout.
+- **Staged plists.** The next session's prepare step deletes a `Sync_*.plist` left behind, but not its `.cig` (section 8.2). No session that left a pair staged and was followed by another was observed.
+
 A pair left staged blocks the next host, which needs the directory empty. A client that can prove it never sent `FinishedSyncingMetadata` (its own trace of outgoing frames) can read both files back and remove them when they are exactly its own (chapter 07, section 7.2). A drop before the pair was staged was not tested.
 
 Cancelling an in-flight read while sleeping on a different future is unsafe. Keep a single in-flight read for the life of the connection.
@@ -964,6 +1068,8 @@ CONFIRMED. The first live signed insert (revision 11) was accepted by the phone,
 ### 14.5 Empty delta
 
 CONFIRMED statically. When there are no operations Apple's host stages nothing and does not increment the anchor, but still sends `FinishedSyncingMetadata` with `SyncTypes Media: 1` and the unchanged next anchor.
+
+INFERRED from the phone's code (iOS 27.2): the phone still runs an import for such a message. The signature check passes on an empty file list (sync bundle `0x1a14f4`), the import loops over no file, and its commit stores the anchor of the message, a new last-synced revision and a new generation ID (MusicLibrary `0x1d1b94e0c`). An empty `FinishedSyncingMetadata` is therefore not a no-op: it sets the phone's Media anchor to whatever the host sent. With sync type 2 it would also be a Reset that sends nothing again (section 10.5). A client must never send the message without a staged, verified operation file.
 
 ## 15. Native session templates
 
@@ -1015,9 +1121,9 @@ The following advice is supported by the evidence in this chapter. It describes 
 
 1. Frame with a little-endian u32 length and a binary plist. Bound the frame size. Keep exactly one in-flight read for the life of the connection.
 2. Treat any error or cancellation as the end of the connection. Reconnect and restart the whole session.
-3. Send Ping with Session 1 and RequestingSync with Session 2. Record received Session values and do not require equality with what was sent.
-4. Read the phone's current Media anchor from `ReadyForSync` and use that value. Stop on a mismatch with the client's expected anchor. Never fall back to Reset.
-5. Send the existing library identity in `LibraryID`. Never generate a new one.
+3. Send Ping with Session 1 and RequestingSync with Session 2. Record received Session values and do not require equality with what was sent. Accept `SyncAllowed` and `InstalledAssets` between the request and `ReadyForSync`, and `AssetMetrics` at any point.
+4. Read the phone's current Media anchor from `ReadyForSync` and use that value. Stop on a mismatch with the client's expected anchor. Never fall back to Reset: on the phone a Reset removes every host-synced item the session does not send again (section 10.5).
+5. Send the existing library identity in `LibraryID`. Never generate a new one for a phone that has one.
 6. Write the operation file and sidecar exactly as serialised, then read both back before `FinishedSyncingMetadata`. Keep the staging directory empty before and after the session. Do not assume atomic create or rename over AFC.
 7. Put `update_db_info` first, with the phone's existing database and primary container PIDs.
 8. Send only the operations you need. Apple's extra statistics and artwork updates are not required.
@@ -1027,15 +1133,20 @@ The following advice is supported by the evidence in this chapter. It describes 
 12. Treat `SyncFinished` for the current session as the only terminal. Then verify the permanent file by reading it back.
 13. Over Wi-Fi, keep a heartbeat connection open before opening `com.apple.atc`.
 14. Do not use `delete_album` or `delete_artist`. Use `delete_playlist` only for playlists known to be removable and empty or ordinary.
+15. Never send `FinishedSyncingMetadata` without a staged and verified operation file. The phone commits the anchor of the message even when it finds no file (section 14.5).
+16. Do not hold a session open while waiting for a person. The phone closes a link that was silent for 45 s and cancels the session (section 14.3).
+17. Do not read `SyncAllowed` as a fixed signature. `DisabledAssetTypes` follows the phone's apps and settings (section 4.4).
+
+Rules 4, 5 and 7 assume a phone that Apple's host has synced at least once. Such a phone has a `db_info` row, a stored anchor, a library identity in `iTunesPrefs` and the staging folders. A phone that no computer has synced has none of them. [Chapter 10](10-library-ownership-and-first-sync.md) describes that phone, what Apple's host does with it, and what the phone's code allows a first host to do.
 
 ## 18. Open questions and facts not confirmed
 
 1. OPEN: whether the phone requires the `.cig` sidecar. Only signed files were sent.
 2. OPEN: Apple's signing algorithm and Grappa exchange (`0x248b0`, `0x11110`, `0x3430`). The Linux client uses a different, public fixed-request calculation that the phone accepts. The calculation does not reproduce Apple's own sidecars.
 3. OPEN: the meaning of byte 18 of the 84-byte request (fixed request `0x04`, Apple's `0x01`) and of the first two bytes (`01 01`) and byte 18 (`0x40`) of the Ready blob.
-4. OPEN: why the phone chooses Session 2 for its Pong, and the meaning of the `Type` field.
-5. OPEN: what a wrong `LibraryID` triggers. The phone's code compares it only with a sync already in progress (section 7.2). Only the existing identity was sent in Music sessions.
-6. OPEN: the meaning of `VoiceMemo: "1"` in the request, the role of `Book` and `Keybag` in the dataclass list, and whether a Music-only request is accepted.
+4. Partly answered: the phone adopts the session number of `RequestingSync` (section 5.2). OPEN: the number on its Pong, and the meaning of the `Type` field.
+5. Partly answered: on the phone a `LibraryID` it has not seen triggers nothing. The phone's code compares it only with a sync already in progress (section 7.2). What Apple's host does with a phone whose stored library is not its own is in chapter 10, sections 6 and 9. Only the existing identity was sent in Music sessions.
+6. Answered for the host: `VoiceMemo: "1"` and the `Book` and `Keybag` entries come from a constant dataclass mask (section 6.3). OPEN: what `Book` and `Keybag` do on the phone, and whether it accepts a Music-only request.
 7. OPEN: the contents of the `Metadata` and `Anchor` fields of `FileComplete`.
 8. OPEN: what `upload_track` and `update_playlist` do on this phone, and whether any add-member or remove-member operation exists.
 9. OPEN: the per-device switch that controls album and artist operations (`[handler+0x64]`).
@@ -1044,10 +1155,13 @@ The following advice is supported by the evidence in this chapter. It describes 
 12. OPEN: how the phone assigns persistent IDs to items it ignores, and whether PIDs below 1000 or with other structure are rejected. Random 64-bit values worked.
 13. OPEN: when the phone sends its own `Ping` mid-session and how often.
 14. OPEN: whether the host's lock on `com.apple.itunes.lock_sync` is a requirement for any Music sync. INFERRED that the Linux client takes no lock; no recorded session took it and the live order of lock and notifications was never captured.
-15. INFERRED, not tested: the `ATSyncPrepOnly` (3) sync type. The chunked operation-file branch is CONFIRMED in the host's code (section 8.1). How the phone handles it is item 11.
+15. Not tested: the `ATSyncPrepOnly` (3) sync type. In the phone's code it ends the dataclass without an import (section 12.1). The chunked operation-file branch is CONFIRMED in the host's code (section 8.1). How the phone handles it is item 11.
 16. OPEN: what the phone does with new audio for an existing PID (section 9.7).
 17. INFERRED: the 1,024-entry manifest bound is a client limit. The phone's own maximum was never observed.
 18. OPEN: the receiver's behaviour for a `location` dictionary inside `update_track` (section 9.7). It was never sent.
+19. OPEN: which process on the phone asks `atc` to send `RequestingSync` (section 7.4), and whether any does so without the owner acting.
+20. OPEN: where `Photo` in `DisabledAssetTypes` comes from, and the value of `PurgeAllowed` (section 4.4).
+21. Not observed: any statement in this chapter about the phone's code. In particular nobody has watched a Reset reach a phone that holds music from another host (section 10.5), or an empty `FinishedSyncingMetadata` (section 14.5).
 
 ## 19. Evidence
 
@@ -1083,6 +1197,8 @@ The traces hold the host's message dictionaries, not framed wire bytes. Both run
 AMPDevicesAgent.exe 1.6.4.90 and 1.6.4.94, AirTrafficHost.dll 4025.400.1.5 and 4026.110.1.6, and MobileDevice.dll 1827.100.17.2, with the sizes and SHA-256 values in section 1. Disassembly and string tables were read directly. Several conclusions were checked by scripts that pin individual instructions (16,861 and 9,106 retained instructions with 49 and 104 explicit pins for the existing-audio and audio-change-selection studies of section 9.7). Build 1.6.4.94 was compared with 1.6.4.90 instruction by instruction at the signing seam (section 11.1). The operation-file chunking of section 8.1 was read in both builds. No Apple code was executed outside Apple's own process.
 
 The phone's side of the version rule, the `LibraryID` comparison and the `SyncFailed` codes was read in the iOS 27.0.1 and 27.2 firmware. Chapter 09, section 13 describes that evidence.
+
+A later reading of the iOS 27.2 firmware (AirTrafficDevice, AirTraffic, MusicLibrary and the Music sync bundle) and of AMPDevicesAgent 1.6.4.94 was made for chapter 10. It supplied the phone-side paragraphs of sections 4.3, 4.4, 5.2, 6.1, 6.3, 7.3, 7.4, 8.2, 8.4, 10.5, 12.1 to 12.3, 12.5, 14.3 and 14.5, and the host-side additions to sections 6.3, 7.2, 10.5 and 12.1. Chapter 10, section 13 describes that evidence. Apart from the two `SyncAllowed` lists of section 4.4 and the session numbers of section 5.2, which were captured from the phone on iOS 27.2, none of it was observed.
 
 ### 19.4 Phone database and file captures
 

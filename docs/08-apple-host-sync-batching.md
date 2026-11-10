@@ -207,11 +207,16 @@ If the phone applied a session but the host never saw it succeed, the next `Requ
 
 ## 10. Reset is not a clear
 
-CONFIRMED. There is no operation that clears the library. The selector `0x14046cf0c` compares the host's last anchor with the device's (`[struct+0x1c]` and `[struct+0x14]`). If they match, it picks Delta. If they differ, it picks Reset (`SyncTypes` Media 2) and calls `0x140469a28`, which removes every pending operation except `upload_track`. While a dataclass is in Reset the change handler ignores library notifications (`cmp [struct+0x20],2` at `0x14046a46d`).
+CONFIRMED. There is no operation that clears the library. The selector `0x14046cf0c` compares the host's last anchor with the device's (`[struct+0x14]` and `[struct+0x1c]`). If they match, it picks Delta. If they differ, it picks Reset (`SyncTypes` Media 2) and calls `0x140469a28`, which removes every pending operation except `upload_track`. While a dataclass is in Reset the change handler ignores library notifications (`cmp [struct+0x20],2` at `0x14046a46d`).
 
 At write time `0x1404685b0` calls `0x14046823c`, which replaces the array with a fresh list built from the host's copy of the device library. The list holds album and artist inserts (only below device word `0x800`), then one `insert_track` per track (skipping `[track+0xc5] & 4`), then `insert_playlist`, with `update_db_info` first. No removals are sent. The reset reference session, Apple's reset of this phone, had exactly this shape: `update_db_info`, 399 `insert_track` and one `insert_playlist`.
 
-The sync pass stops with "not syncing because library is empty" (error `0x458`, `0x140565c4f`) when the selected source library has no tracks, so a sync cannot empty the phone. `EraseDevice` and `AMSEraseDevice` belong to the whole-device restore path, not to Music sync.
+The sync pass stops with "not syncing because library is empty" (error `0x458`, `0x140565c4f`) when the selected source library has no tracks. That stops the track stage only. `SynchronizeDevice` treats the error as success (`0x140570c72` in 1.6.4.94) and the session still ends with `FinishedSyncingMetadata`. An earlier version of this section concluded that a sync cannot empty the phone. That is wrong for a Reset, for two reasons.
+
+- **On the phone, a Reset removes what the host does not send again.** The import remembers every track, playlist, album and album artist that has a host-sync identity (`sync_id != 0`), and after the import removes those the host did not re-send (chapter 05, section 5). Items with no host-sync identity, such as purchases and cloud items, stay.
+- **The host's copy of the device library can be empty.** It is rebuilt at each attach from the phone's `iTunesCDB`. With no such file the copy holds one new library playlist and no track, and the host's last anchor is 1 (chapter 10, section 5.3). If the phone then reports another anchor, the Reset list is `update_db_info` plus that playlist, and the phone removes every host-synced track. Chapter 10, section 9 describes when Apple's host reaches this.
+
+`EraseDevice` and `AMSEraseDevice` belong to the whole-device restore path, not to Music sync.
 
 ## 11. Wi-Fi and USB
 

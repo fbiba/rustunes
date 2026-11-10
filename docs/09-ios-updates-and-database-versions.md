@@ -225,9 +225,10 @@ CONFIRMED.
 - **`atc` is a launcher.** `/usr/libexec/atc` has 0x3c8 bytes of code. It logs the iOS build, waits for SpringBoard and runs `-[ATDeviceService run]` from AirTrafficDevice. launchd starts it at boot. It compares no version.
 - **The Music client is a bundle.** `ATDeviceService` loads every bundle in `/System/Library/SyncBundles`. The Music client is `MusicLibrary.syncBundle` (`com.apple.mobileipod.sync`, principal class `MLSyncClient`).
 - **The bundle never touches SQLite itself.** It has no `sqlite3_` call, no `PRAGMA` and no reference to the version or validation functions. It reads the library through `ML3MusicLibrary`, so its first read validates through `medialibraryd`.
-- **`medialibraryd` applies the host's operations.** In `reconcileSync:withNewAnchor:progressCallback:error:` the bundle builds an `ML3MutableDatabaseImport` with the Reset flag and the host's new anchor and calls `-[MLMediaLibraryService performImport:fromSource:withProgressBlock:completionHandler:]` with source 5. The daemon runs `ML3ITunesSyncImportOperation` in one writer transaction. It writes `MLSyncClientLastSyncedRevision` and `MLSyncClientSyncAnchor` only after the commit.
+- **`medialibraryd` applies the host's operations.** In `reconcileSync:withNewAnchor:progressCallback:error:` (`0x1a184c`) the bundle builds an `ML3MutableDatabaseImport` and sets three things on it: the Reset flag, which is `syncType == 2` (`setResetSync:`, `0x1a2468`); a cloud flag, which is `[ICCloudClient isAuthenticated]` (`setSagaEnabled:`, `0x1a2480`); and the host's new anchor (`setSyncAnchor:`, `0x1a24a4`). It then calls `-[MLMediaLibraryService performImport:fromSource:withProgressBlock:completionHandler:]` with source 5. A sync type of 0 imports nothing. The daemon runs `ML3ITunesSyncImportOperation` in one writer transaction, and lists and reads the operation files in `iTunes_Control/Sync/Media` itself (`0x1d1b93ce8`). A commit hook (`enqueueBlockForTransactionCommit:`, hook at `0x1d1b94e0c`) writes three properties, and only when the import succeeded: `MLSyncClientLastSyncedRevision`, `MLSyncClientSyncAnchor` and a new random `MLSyncClientGenerationID`.
 - **The host never sees the schema.** The importer reads each operation through a fixed vocabulary of host keys (`ML3ITunesSyncTrackImportItem` and its siblings) and maps it onto the phone's current tables. A schema change is invisible to the host unless Apple adds a key. Chapter 05 describes the effects of each operation.
-- **Prepare cannot fail.** `-[MLSyncClient prepareForSyncWithHostAnchor:progressCallback:grappaID:hostVersion:error:]` (`0x1a0f48`) ignores the host's anchor and version. It removes stale `Sync_*.plist` files, writes the play counts changed since `MLSyncClientLastSyncedRevision` and always returns success.
+- **Prepare cannot fail and writes nothing to the database.** `-[MLSyncClient prepareForSyncWithHostAnchor:progressCallback:grappaID:hostVersion:error:]` (`0x1a0f48`) ignores the host's anchor and version. Its database work runs in a read-only transaction (`0x1a102c`). It removes stale `Sync_*.plist` files but not their `.cig` sidecars (`0x1a10bc`), removes and recreates `/var/tmp/Media/` (`0x1a1164`), writes the play counts changed since `MLSyncClientLastSyncedRevision` as plist files and always returns success. When `MLSyncClientLastSyncedRevision` is 0 it leaves the playlist part out and logs "Not saving out playlist data because this a first sync" (`0x1a1314`). That is the only test for a first sync found in the bundle.
+- **`atc` keeps a record of each host and closes an idle link.** The record is one entry per `LibraryID` under `Hosts` in the `com.apple.atc` defaults (section 6.4). In a session `atc` sends `SyncAllowed` twice: at link start, and again after it accepts `RequestingSync` (chapter 02, sections 4.4 and 6.1). It closes a link on which nothing arrived for 45 s, or 180 s for a host that announced `LocalCloudSupport` (`-[ATLegacyMessageLink _checkMessageTimeouts]`, `0x22b7a40f0`; chapter 02, section 14.3).
 
 ### 6.2 The only version rule: `HostInfo.Version`
 
@@ -249,7 +250,7 @@ CONFIRMED in the code. None of these messages was observed on the phone. The nam
 | --- | --- | --- |
 | `HostInfo.Version` missing or below `10.5.0.115` | `ErrorCode` 12, `RequiredVersion` `"10.5.0.115"` | IncompatibleVersion |
 | The phone is in multi-user mode (and the host is not Configurator) | `ErrorCode` 9, `EducationModeEnabled`, `ManagedOrganizationName` | SyncDisallowed |
-| Another library is syncing (the host's `LibraryID` differs from that of the active connection) | `ErrorCode` 9 | SyncDisallowed |
+| Another library is syncing: a current link exists, is not this link, and has an identifier that differs from the host's `LibraryID` (`0x22b798bb4`). The phone sets that identifier only from a `Capabilities` message sent by the host with a `LibraryID` (`0x22b798718`), so the check never fires against a host that sends none | `ErrorCode` 9 | SyncDisallowed |
 | The host cancelled before the sync started | `ErrorCode` 2 | Canceled |
 | The Grappa session could not be established | `ErrorCode` 4 | NotAuthorized |
 | `FinishedSyncingMetadata` with no active session or the wrong session number | `ErrorCode` 23 | RequestNotValid |
@@ -261,6 +262,8 @@ No code means "database too new" or "schema not supported". OPEN: what the phone
 ### 6.4 Anchors and Reset
 
 CONFIRMED. The phone never asks for a Reset. `-[MLSyncClient currentSyncAnchor]` (`0x1a0ee8`) returns the property `MLSyncClientSyncAnchor`, or `"0"` when it is absent, and `ReadyForSync` carries that string as `DataclassAnchors.Media`. The phone does not compare it with the host's anchor. Apple's host makes the choice (section 7.3).
+
+The anchor the phone stores is the string of the host's `FinishedSyncingMetadata`, copied without a check (`0x1d1b94e9c`). The phone does not read the `revision` of the operation file: `_syncOperationsFromPlistFile:` reads only `operations` (`0x1d1b95264`). No code in AirTrafficDevice, the bundle or the importer compares an anchor with anything, and none requires a Reset when no anchor is stored. A Delta against an anchor of `"0"` is accepted by the code. INFERRED: a `FinishedSyncingMetadata` that finds no operation file still commits an import of zero files and stores its anchor, because the signature check passes for an empty list (`0x1a14f4`).
 
 What zeroes the anchor the phone reports:
 
@@ -274,7 +277,7 @@ What zeroes the anchor the phone reports:
 
 An iOS update does not. `-[MLSyncClient reconcileUpgradeWithError:]` (`0x1a3f48`) leaves the anchor alone, and the step to 2410000 does not touch it. On this phone the anchor was the same before and after the update.
 
-`ReadyForSync` carries no library identity, no database ID and no revision. INFERRED from the references found: the phone uses the host's `LibraryID` only to refuse a second library while one is syncing (section 6.3) and for its own records of hosts.
+`ReadyForSync` carries no library identity, no database ID and no revision. CONFIRMED: the phone uses the host's `LibraryID` in two places only. One is the refusal of a second library while one is syncing (section 6.3). The other is its record of hosts. `-[ATUserDefaults updateHostInfo:disabledAssetTypes:]` (`0x22b78a85c`) keeps one entry per `LibraryID` under `Hosts` in the `com.apple.atc` defaults: the host's name, operating system, `Wakeable` flag and synced dataclasses. It is written when `RequestingSync` or a `HostInfo` message arrives, before the version check, so a refused session leaves it too. When a host with another `LibraryID` claims the same dataclasses, the phone removes those asset types from the other hosts' entries and deletes an entry left with none. A `LastSync` time is added only after a session that ended without error on a link whose identifier is set. The only reader of the record is the service that wakes a host over Wi-Fi (chapter 03, section 5.8). No refusal, Reset, removal or prompt depends on it. INFERRED: the defaults are `/var/mobile/Library/Preferences/com.apple.atc.plist`, which a computer cannot reach through AFC.
 
 ### 6.5 What the phone reports to the host
 
@@ -300,7 +303,7 @@ The legacy SQL path for old devices (`UserVersionCommandSets`, `0x14053cf60`) co
 
 ### 7.3 Reset or Delta from anchors only
 
-CONFIRMED. The selector at `0x14046cf0c` (chapter 08, section 14.3) chooses Reset when the phone's anchor differs from the host's last one, Delta otherwise, and nothing when the dataclass is not selected. The anchor reader (`0x14045637c`) only logs a missing or unreadable anchor; it does not refuse.
+CONFIRMED. The selector (`0x14046d034` in AMPDevicesAgent 1.6.4.94, `0x14046cf0c` in 1.6.4.90; chapter 08, section 14.3) chooses Reset when the host's last anchor for the dataclass (entry `+0x14`) differs from the anchor the phone reported (entry `+0x1c`), Delta otherwise, and nothing when the dataclass is not in the session. The host does not keep its last anchor on the host: it reads it at attach from the phone's `iTunesCDB`, and a new entry starts at 1 when that file is absent (chapter 10, section 5.3). The anchor reader (`0x14045637c`) only logs a missing or unreadable anchor; it does not refuse.
 
 ### 7.4 No change for iOS 27.2
 
@@ -432,6 +435,8 @@ Re-checked after the analysis:
 - the body of `_ML3MigrationFunction2400060to2410000`: two setters with 1, a setter with `0x24c610` and one constant statement;
 - in the 24B119 cache, the strings "Media library database is too new for this device", "Recreating un-migratable database...", `10.5.0.115`, the `AlbumCloudChannelName` statement, `MLSortMapUnicodeVersion` and "initial sort map insert failed - commit what we have and force a rebuild";
 - the first instructions of the sync bundle's `currentSyncAnchor` (`0x1a0ee8`), prepare (`0x1a0f48`), `reconcileUpgradeWithError:` (`0x1a3f48`) and `clearSyncData` (`0x1a96c0`), and the `MLSyncClientSyncAnchor` and `"0"` operands of the first.
+
+A later reading of the same 24B119 files, made for chapter 10, added to section 6 the import's flags and commit hook, what prepare does, the host record, the condition of the concurrency check and the idle timeout.
 
 ### 13.2 Static analysis of the Windows host
 

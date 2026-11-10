@@ -20,7 +20,7 @@ This chapter describes how a host reaches the stock iPhone Music sync services a
 
 ## 1. Scope and provenance
 
-Phone: iPhone17,2, iOS 27.0.1, build 24A446.
+Phone: iPhone17,2, iOS 27.0.1, build 24A446. Sections 3.2 and 5.8 describe the phone's own code. They come from a static reading of the firmware of iOS 27.2 (24B119) for the same model (chapter 09, section 13.1). Addresses there are those of `lockdownd` (`0x1000...`) and of the AirTrafficDevice framework in the dyld shared cache (`0x22b7...`).
 
 Host binaries analysed (Windows "Apple Devices" app, static analysis with objdump, strings and a small PE parser; nothing was executed for the static findings):
 
@@ -31,8 +31,9 @@ Host binaries analysed (Windows "Apple Devices" app, static analysis with objdum
 | AT | AirTrafficHost.dll | 4025.400.1.5, Apple Devices 1.1540.23042.0 | `0x180000000` |
 | AMP2 | AMPDevicesAgent.exe | 1.6.4.94, Apple Devices 1.1540.24088.0 | `0x140000000` |
 | AT2 | AirTrafficHost.dll | 4026.110.1.6, Apple Devices 1.1540.24088.0 | `0x180000000` |
+| MD2 | MobileDevice.dll | 1860.2.5.1, Apple Devices 1.1540.24088.0 | `0x180000000` |
 
-The newer package (1.1540.24088.0) ships no MobileDevice.dll. Its AMP contains the same key strings as AMP and the same hash call-site structure (section 8), but its copy and connection code was not re-read. Findings about AMP below refer to 1.6.4.90 unless stated. The binaries are not redistributed; this chapter gives only addresses and findings. A `VA` is the objdump address; `RVA` is the VA minus the image base. Function names are the DLL export where one exists, otherwise `sub_<RVA>` (labels chosen by the analyst).
+The newer package (1.1540.24088.0) ships its own MobileDevice.dll (x64 at the package root, x86 under `AMDS32/`); an earlier version of this chapter said it shipped none. Its transport code was not re-read. Only the Wi-Fi sync switch of section 5.8 was read in it. Its AMP contains the same key strings as AMP and the same hash call-site structure (section 8), but its copy and connection code was not re-read. Findings about AMP below refer to 1.6.4.90 unless stated. The binaries are not redistributed; this chapter gives only addresses and findings. A `VA` is the objdump address; `RVA` is the VA minus the image base. Function names are the DLL export where one exists, otherwise `sub_<RVA>` (labels chosen by the analyst).
 
 Live observations come from a Linux host (Fedora, usbmuxd running) and the phone, over USB and over Wi-Fi. Section 13 lists the evidence by kind.
 
@@ -73,6 +74,28 @@ Facts about the passive ATC start (CONFIRMED over USB): a host that only starts 
 ### 3.1 ATC connections cannot be reused after an error
 
 CONFIRMED (client behaviour). A length-prefixed stream loses its frame boundary if a read is cancelled or fails part-way: the bytes already consumed are gone and the next read starts inside a payload. A client therefore has to treat an ATC connection as unusable after any read error, write error or cancelled read or write, and open a new one. Recovery by "trying again on the same socket" is not possible. The same rule applies to a send whose preparation failed locally.
+
+### 3.2 What lockdown checks before it starts `com.apple.atc`
+
+CONFIRMED (static, `lockdownd` of iOS 27.2). The service table is an XML plist inside `lockdownd`. The entry for `com.apple.atc` holds a label, the user `mobile` and an XPC service name, and none of the optional restrictions (`AllowUnactivatedService`, `USBOnlyService`, `DeveloperModeRequired`, `InstanceLimit`). `com.apple.afc` has `AllowUnactivatedService`.
+
+`StartService` checks, in this order:
+
+| Check | Failure | Address |
+| --- | --- | --- |
+| The request names a service | "did not specify a service to launch" | `0x100020810` |
+| The phone was unlocked once since it started | `PasswordProtected` ("Device not unlocked since boot.") | `0x10002083c` |
+| The phone was unlocked within the last 24 hours (true at once while it is unlocked) | "Device not unlocked within required time." | `0x100020844` |
+| The connection is inside a lockdown session | "The connection is not within a session. We cannot start services." | `0x100020ac8` |
+| The pair record is valid | "Invalid pair record." | `0x100020af0` |
+| The phone is activated, because the entry lacks `AllowUnactivatedService` | "currently prohibited from running (device is not activated)" | `0x10001ffbc` |
+
+None of these refers to iTunes, to setup by a computer or to an earlier sync. The two unlock checks apply to every service. A phone that no computer has ever synced therefore starts `com.apple.atc` for a paired host like any other phone.
+
+Two related facts from the same reading:
+
+- **`iTunesSetupComplete` gates nothing.** Apple's host writes `com.apple.mobile.iTunes / iTunesSetupComplete = true` through lockdown (chapter 10, section 6.5). On the phone the name occurs once, in the table of `lockdownd` that makes the key readable by a host. No code on the phone reads its value.
+- **Pair records do not survive Setup Assistant.** When a new boot session starts while the phone is still in Setup Assistant, `lockdownd` deletes every pair record (`0x10001267c`, "Device is in buddy upon new boot session, deleting all existing pair records."). It also removes them when a USB host disconnects during setup (`0x10001751c`). A host should pair after the owner has finished setting the phone up.
 
 ## 4. USB transport on Linux
 
@@ -192,6 +215,36 @@ Locked phone, unplugged, on Wi-Fi:
 - CONFIRMED. A phone restart deletes the `Airlock` staging folders (section 7.5). The first insert after a restart found "required directory absent". A client must accept the staging folders as absent and create them before the first upload.
 - CONFIRMED. A dropped AFC connection (phone slept) must be recognised as such. Wrapping copy errors into text hid this once. A read-only capture can be retried; a write cannot be replayed blindly.
 - CONFIRMED. `afcd` can wedge (section 9).
+
+### 5.8 How the phone wakes a host
+
+Sections 5.1 to 5.7 are about a host that reaches a phone. Apple's automatic Wi-Fi sync also needs the reverse: the phone telling a sleeping or idle host that it is there. This was read in code only; none of it was observed.
+
+**The host's side** (CONFIRMED static, AMP2, AT2 and MD2). When the owner turns "Sync over Wi-Fi" on, Apple's host writes through lockdown:
+
+| Domain and key | Value |
+| --- | --- |
+| `com.apple.iTunes` / `WiFiSyncingUserIDs` | Array of host user IDs as 16 hex digits. The host adds its own (`0x1405c5048`). |
+| `com.apple.iTunes` / `WiFiSyncingLibraries` | `{<LibraryID>: {SyncedDataclasses: [...], SyncedAssetTypes: [...]}}` (`0x1405c5ba8`). The key is the `LibraryID` of `HostInfo` (chapter 02, section 7.2). |
+| `com.apple.mobile.wireless_lockdown` / `WirelessBuddyID` | An ID the host generated once and keeps in its own preferences (`AMDeviceSetWirelessBuddyFlags`, MD2 `0x1800ef3ea`). |
+| `com.apple.mobile.wireless_lockdown` / `EnableWifiConnections` | `true`, by the same call. |
+
+The call first requires `SupportsWifiSyncing` to be true. Turning the switch off removes the keys. The host also advertises a Bonjour service `_atc._tcp` whose TXT record holds `libid`, its `LibraryID` (AT2, "Advertising wake service for libraryIdentifier"). None of these keys is needed for a host that opens the session itself (section 5.1).
+
+**The phone's side** (structure CONFIRMED, conditions INFERRED; static, iOS 27.2):
+
+1. `atc` keeps one record per `LibraryID` under `Hosts` in its defaults (chapter 09, section 6.4). The record's `Wakeable` flag is copied from the `HostInfo` of the host's last `RequestingSync` or `HostInfo` message (`0x22b78a95c`), and removed when the host sent none.
+2. On a power change, when the phone is charging and its network is reachable and of the right kind, `ATHostWakeupService` (`0x22b7a0ca8`) browses `_atc._tcp` for 10 s (`0x22b79471c`).
+3. For each service found it reads `libid` and looks up `Hosts[libid]`. Only a host whose record has `Wakeable` true is woken (`0x22b7a0638`).
+4. The wake is small (`0x22b7a09dc`). The phone posts the local notification `com.apple.atc.idlewake`, now and again after 5 s. It opens one TCP connection to the host's first address and closes it at once. The port is stored as the bytes `BB 01`, which is port 47873 on the wire (the value `0x01BB` is 443, so a missing byte swap is possible). Its log lines are "Connected to host, closing." and "failed to connect to host wakeup listener - hope its ok".
+
+The connection carries nothing. The host must then open lockdown and `com.apple.atc` itself, as in section 5.1. The phone does not start a sync session on its own account (chapter 02, section 7.4).
+
+Consequences for a client that is not Apple's:
+
+- A host that never sends `Wakeable` is never looked for. `rustunes` sends no such key.
+- A host that wants to be woken needs a stable `LibraryID`, `Wakeable: true` in `HostInfo`, a Bonjour `_atc._tcp` service with that `libid`, and a listener on the port. Whether the lockdown keys above are also needed is OPEN: no reader of them was looked for on the phone.
+- OPEN: whether the power change that starts `atc` also delivers the callback of step 2.
 
 ## 6. Keeping a Wi-Fi phone awake
 
@@ -544,7 +597,7 @@ Advice the evidence above supports:
 | # | Question | Status |
 | --- | --- | --- |
 | 1 | Does an ATC `PowerAssertion {Enabled: true}` alone keep a locked Wi-Fi phone awake for a whole sync? | OPEN. The `assertion_agent` route works (section 6.3). |
-| 2 | Does a locked phone on its charger stay awake on Wi-Fi without any assertion? Apple's automatic Wi-Fi sync runs only while charging. | OPEN |
+| 2 | Does a locked phone on its charger stay awake on Wi-Fi without any assertion? Apple's automatic Wi-Fi sync runs only while charging. | OPEN. Section 5.8 gives the phone's part of the automatic sync: it wakes a known host when it starts charging on Wi-Fi. |
 | 3 | Does `afcd` tolerate more than one outstanding request on one connection? Apple never tries. | Answered for stats: 64 `GetFileInfo` requests in flight were answered in order (section 10.3). Reads and writes untested. |
 | 4 | Does a third AFC connection help, or does `afcd` throttle? Apple never uses more than two. | OPEN. A second did not help on a 200 Mbit/s link. |
 | 5 | Do `GetFileInfo`, `ReadDirectory`, `FileRefRead` or `GetFileHashWithRange` leak in `afcd` like `GetFileHash`? | Partly answered: 12,000 stats and 6,000 open+read+close did not leak. `ReadDirectory` and ranged hash untested. |
@@ -589,8 +642,11 @@ Disassembly (objdump), string extraction and a small PE parser, with no code exe
 | AirTrafficHost.dll | 4025.400.1.5 (1.1540.23042.0) | `0d38b01c21d57a9f3ca32c15d4b2b8aa0557d43a724b4745f1fb122322f4eecd` |
 | AMPDevicesAgent.exe | 1.6.4.94 (1.1540.24088.0) | `f5e0f2115283e8719df383baf59d9b8a6f5a2ec39e566fbe802357f2d11e6fa9` |
 | AirTrafficHost.dll | 4026.110.1.6 (1.1540.24088.0) | `230445f73c4887ff46adfb7a9a25ed83fb99b6abc9bc341fcb8349bad3a7664b` |
+| MobileDevice.dll | 1860.2.5.1 (1.1540.24088.0) | `929e4c3582eede3cde35eabb31ad8211defcd425448fd75b5353073d6bd46812` |
 
-Findings about AMP in sections 7 and 8 were read in 1.6.4.90. The hash and checksum string sets of 1.6.4.94 match, and the two hash call sites exist there too. Its copy and connection code was not re-read.
+Findings about AMP in sections 7 and 8 were read in 1.6.4.90. The hash and checksum string sets of 1.6.4.94 match, and the two hash call sites exist there too. Its copy and connection code was not re-read. The host's side of section 5.8 was read in the 1.1540.24088.0 binaries.
+
+Sections 3.2 and 5.8 also rest on the firmware of iOS 27.2 (24B119): `usr/libexec/lockdownd` from the system volume (SHA-256 `1aee64771b85cb3c5be083c3862f9039dd0c0149f9ed224209176531d20b4b22`) and the AirTrafficDevice framework from the dyld shared cache, read as described in chapter 09, section 13.1. Nothing in those two sections was observed on a phone.
 
 ### 13.4 Open-source clients
 

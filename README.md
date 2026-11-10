@@ -789,7 +789,8 @@ what was asked and nothing else.
 The [documentation](docs/README.md) is the full reverse-engineering write-up:
 the wire protocol, the transport, the phone's library database, what the phone
 does with each operation, the audio and gapless rules, the design of the sync
-engine, and what an iOS update does to the phone's library database.
+engine, what an iOS update does to the phone's library database, and how
+Apple's software decides which library a phone belongs to.
 
 ## Performance
 
@@ -838,6 +839,7 @@ covers).
 | [Sync engine design](docs/07-sync-engine-design.md) | The journal, planning, verification and recovery, and why; the JSON records of `--message-format json` |
 | [Apple's host sync batching](docs/08-apple-host-sync-batching.md) | How Apple's host splits, orders and uploads a sync, compared with rustunes |
 | [iOS updates and database versions](docs/09-ios-updates-and-database-versions.md) | How the phone versions and migrates its library database, and what the iOS 27.2 update changed |
+| [Library ownership and the first sync](docs/10-library-ownership-and-first-sync.md) | How Apple's host decides which library a phone belongs to, its first session with a new phone, and what it does to a phone another tool filled |
 
 ## Project layout
 

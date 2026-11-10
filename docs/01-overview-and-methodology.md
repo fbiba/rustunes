@@ -14,7 +14,7 @@ The work took place on one iPhone 16 Pro Max (ProductType `iPhone17,2`, iOS 27.0
 
 The principal result is that the phone accepts a Linux client that speaks the same AirTrafficConnect (ATC) session as Apple Devices, stages a signed operation file and the audio over the Apple File Conduit (AFC) service, and then lets the phone's own receiver register the tracks. The phone applies exact, observable rules when it does so. Those rules are the substance of the later chapters.
 
-This chapter is the method and the history. It states what was observed, how, with which tools, what each method could and could not show, and in what order the findings arrived. It also names the third-party sources consulted and the limits of what is published. Protocol, transport, database and format results are summarised in one paragraph each and are developed in chapters 02 to 06. Chapter 07 describes the design of the CLI built on them. Chapter 08 describes how Apple's host batches a sync, and chapter 09 how an iOS update changes the library database.
+This chapter is the method and the history. It states what was observed, how, with which tools, what each method could and could not show, and in what order the findings arrived. It also names the third-party sources consulted and the limits of what is published. Protocol, transport, database and format results are summarised in one paragraph each and are developed in chapters 02 to 06. Chapter 07 describes the design of the CLI built on them. Chapter 08 describes how Apple's host batches a sync, chapter 09 how an iOS update changes the library database, and chapter 10 what decides which computer a phone's music belongs to and what a first sync does.
 
 Evidence labels used throughout this document set:
 
@@ -89,8 +89,10 @@ Two builds of Apple Devices were examined.
 | --- | --- | --- |
 | Package version | 1.1540.23042.0 | 1.1540.24088.0 |
 | `AMPDevicesAgent.exe` | 1.6.4.90, 12,409,712 bytes, SHA-256 `ad957f32107b7177969b3cb11b91e3922d27e622b53f9240b65cb457522111f9` | 1.6.4.94, SHA-256 `f5e0f2115283e8719df383baf59d9b8a6f5a2ec39e566fbe802357f2d11e6fa9` |
-| `AirTrafficHost.dll` | 4025.400.1.5, 322,000 bytes, SHA-256 `0d38b01c21d57a9f3ca32c15d4b2b8aa0557d43a724b4745f1fb122322f4eecd` | present (the instrumentation pins a different SHA-256 for it) |
-| `MobileDevice.dll` | 1827.100.17.2, 4,020,688 bytes, SHA-256 `de08e3324f24dbcbc0597b78f797670f18f53faa58819cda3c32fa3cebcb9d39` | not saved |
+| `AirTrafficHost.dll` | 4025.400.1.5, 322,000 bytes, SHA-256 `0d38b01c21d57a9f3ca32c15d4b2b8aa0557d43a724b4745f1fb122322f4eecd` | 4026.110.1.6, 322,512 bytes, SHA-256 `230445f73c4887ff46adfb7a9a25ed83fb99b6abc9bc341fcb8349bad3a7664b` |
+| `MobileDevice.dll` | 1827.100.17.2, 4,020,688 bytes, SHA-256 `de08e3324f24dbcbc0597b78f797670f18f53faa58819cda3c32fa3cebcb9d39` | 1860.2.5.1, 4,035,536 bytes, SHA-256 `929e4c3582eede3cde35eabb31ad8211defcd425448fd75b5353073d6bd46812` |
+
+An earlier version of this table said the new build's `MobileDevice.dll` was not saved. The package ships it, and it was read for chapters 03 and 10.
 
 The Windows host was updated from the old build to the new one during the work. Helpers written against the old build had their address pins invalidated at that point (the failed title-update capture of section 3.2.1). Static analysis was done on the old build and cross-checked on the new one (section 3.3).
 
@@ -188,6 +190,17 @@ Never succeeded:
 - The title-update capture and the title update on a connected phone produced no accepted title-update exchange. The second was stopped because a navigation Enter was sent without verifying its target. Neither counts as evidence.
 
 The terminal parts of the protocol were therefore reconstructed from static analysis and from controlled Linux experiments (sections 3.3 and 3.4).
+
+#### 3.2.4 A guarded capture
+
+One later capture used the same instrumentation for the opposite purpose: to see what Apple Devices does with a phone it does not know, and to stop it before the phone could act on it. The session in question is a Reset, which removes host-synced music the host does not send again, and the only phone available held a music library in use.
+
+- **Preparation.** Every host file on the phone was copied twice and compared. The prefs pair and `iTunesCDB` were then moved to another folder over AFC, so that Apple's host would find none. The Windows guest ran from a throwaway disk overlay with no network.
+- **The guard.** A Frida script in `AMPDevicesAgent` recorded each outgoing ATC message at the link writer of `AirTrafficHost.dll`, and each AFC path operation. It ended the process on entry to the function that sends `FinishedSyncingMetadata`, on any message after a `.cig` file was opened, and on any message it could not name. A watchdog in the guest ended any agent process that started without the guard.
+- **Rehearsal.** A first run was ended at the first `HostInfo`, to prove that the guard ended the process before the message left.
+- **Afterwards.** The staged files and the prefs Apple had written were removed, the originals were moved back, and every table of the phone's database was compared with the copy taken before.
+
+CONFIRMED: the phone's database and host files were unchanged. The capture is the basis of chapter 10, section 8. Its limit is the reverse of the earlier traces: it shows everything the host sent up to the last message, and nothing of what the phone answered.
 
 ### 3.3 Static analysis of the Windows binaries
 
@@ -298,7 +311,9 @@ Chapter 02 gives the protocol detail. What remains OPEN is the general algorithm
 
 **What it yielded.** CONFIRMED, all in chapter 09: the phone's version constant and its exact-equality check; the chain of one-step migrations; the refusal of a newer database and the rebuild of one that cannot be migrated; where `medialibraryd` validates the database; the device side of the sync service and its only version rule (`HostInfo.Version` at least `10.5.0.115`); the `SyncFailed` codes; the events that zero the phone's anchor; and the one change of iOS 27.2, a new index.
 
-**Limits.** The code was read, not run. Nothing in chapter 09 was exercised on the phone, and the order in which the phone's processes act after an update is partly INFERRED. Only the two builds were compared.
+A second reading of the 24B119 files asked a different question: what the phone itself requires of a first sync. It covered `lockdownd`'s rules for starting the sync service, the startup messages, the handling of `RequestingSync` and `FinishedSyncingMetadata`, the import with its Reset branch and `update_db_info`, the creation of a new database, and every folder under `iTunes_Control`. It also searched the whole shared cache and about 3,500 executables for the names of the files Apple's host keeps on the phone. CONFIRMED: the phone reads none of them, compares no anchor and has no notion of a first sync. The results are in chapter 10 and in the phone-side paragraphs of chapters 02 to 05 and 09.
+
+**Limits.** The code was read, not run. Nothing in chapter 09 was exercised on the phone, and the order in which the phone's processes act after an update is partly INFERRED. Only the two builds were compared. The second reading had the extracted images without the shared stub islands of the cache, so call targets were resolved by hand from the selector tables. Statements that rest on that are marked INFERRED where they are made.
 
 **Not published.** The firmware, the decrypted images, the extracted files and every dump made from them are Apple's code or derived from it. They are retained privately and are not distributed (section 10). Chapter 09, section 1 gives the SHA-256 of every file read. To check a claim, download the same builds for iPhone17,2 and disassemble the cited addresses.
 
@@ -321,6 +336,8 @@ One paragraph per later chapter (07 describes the CLI rather than Apple's behavi
 **Chapter 08, how Apple's host batches a Music sync** (`08-apple-host-sync-batching.md`). Apple Devices sends a whole sync in one ATC session: updates, removals and additions in one operation array, split only into operation files of at most 500 operations. It uploads one file at a time in the order of the phone's manifest, converts on a thread pool working ahead of the upload, and never waits for the phone between files. Removals are bare `delete_track` operations; the phone removes the files. CONFIRMED in the code of both builds, and one session per sync in both reference sessions; how the phone takes several operation files in one session is OPEN.
 
 **Chapter 09, iOS updates and database versions** (`09-ios-updates-and-database-versions.md`). The database version is `PRAGMA user_version`, a constant of the phone's MusicLibrary framework: 2400060 in iOS 27.0.1 and 2410000 in 27.2. The phone migrates an older database in place, one exact step at a time in one transaction. It refuses a newer one, and it truncates and rebuilds one it cannot migrate, which gives the library a new identity and an anchor of `"0"` but the current version. Neither the protocol nor Apple's host uses the version. The phone checks only that the host's `HostInfo.Version` is at least `10.5.0.115`, and Apple Devices never reads the phone's database and treats any iOS above 26.0 as 26.0. iOS 27.2 added one index and nothing else. The update kept the anchor, collected emptied groups and gave every item a new revision. CONFIRMED in the firmware of both builds and in database captures before and after the update; nothing was exercised on the phone.
+
+**Chapter 10, library ownership and the first sync** (`10-library-ownership-and-first-sync.md`). The phone has no notion of an owning library or of a first sync: it starts its sync service for any paired host, accepts any library identity, compares no anchor and creates its `db_info` row from the host's `update_db_info`. Apple's host keeps what it knows about a phone in four files on the phone, which the phone never reads, and decides ownership by comparing one stored library ID with its own. It adopts a phone that has no such files without asking and syncs it at once with a Reset; that was observed up to the staged operation file. Because every default sync of an iPhone requests the Media dataclass, and a Reset sends the host's own copy of the device, Apple's host can remove all host-synced music from a phone that another program filled. That last result was read in code twice and not observed.
 
 ## 5. Timeline
 
@@ -460,6 +477,20 @@ Eight offline studies of the Windows binaries: container deletion, the Wi-Fi tra
 | Does the tool still work after the phone updates to iOS 27.2? | No. `sync` stopped at the catalogue read because the database version had changed from 2400060 to 2410000. The read-only captures before and after the update were kept. |
 | How do the phone and Apple's host treat the database version? | Firmware of both builds and Apple Devices read statically (section 3.7). The phone migrates its own database, and neither the protocol nor Apple's host uses the version. iOS 27.2 added one index; see chapter 09. |
 
+### 5.14 Phase N: a phone no computer has synced
+
+The tool stopped on a phone that had never been synced by Apple's software, because the files it reads the library identity from were not there. No such phone was available, so the question was answered from code and from one guarded capture.
+
+| Question | Outcome |
+| --- | --- |
+| What are the missing files, and who writes them? | The new build of Apple Devices read statically. Four files, all written by Apple's host and none read by the phone. They hold the host's settings, the identity of the library that adopted the phone, the host's copy of the device library and its sync anchors; see chapter 10, section 5. |
+| What does the phone itself need for a first sync? | The 24B119 firmware read a second time (section 3.7). Nothing from a host beforehand: the phone reports the anchor `"0"`, accepts any library identity and creates its own folders, apart from the staging folder; see chapter 10, section 10. |
+| What does Apple Devices do with a phone it does not know? | One guarded capture (section 3.2.4). It adopted the phone and started a Reset session within seconds of the attach, with no click. The capture was ended before the last message; see chapter 10, section 8. |
+| What would Apple Devices do to a phone another program filled? | Read in the agent's code by two independent readings. With no prefs on the phone it empties it at attach, and with prefs of another library it empties it when the owner presses Sync, without asking. Not observed; see chapter 10, section 9. |
+| Is the phone's `SyncAllowed` the same on every phone? | No. Two passive probes showed `DisabledAssetTypes` changing with the Apple TV app. The tool had required one exact list and was changed to refuse only a list that names `Music`; see chapter 02, section 4.4. |
+
+The same reading corrected four earlier statements, which chapter 10, section 13.1 lists.
+
 ## 6. Clean-room posture of the implementation
 
 The CLI that results is a Rust reimplementation of observed behaviour.
@@ -536,9 +567,10 @@ The CLI that results is a Rust reimplementation of observed behaviour.
 | `07-sync-engine-design.md` | How the CLI's journal, planning, verification and recovery are designed, and why; its commands, caches and upgrades; its JSON output for other programs. |
 | `08-apple-host-sync-batching.md` | How Apple's host batches a sync: one session, operation files of at most 500, the order of updates, removals and additions, upload and conversion scheduling, failure handling, and a comparison with the CLI. |
 | `09-ios-updates-and-database-versions.md` | How the phone versions, migrates and rebuilds its database, the other version stamps, the version rules of the phone's sync service and of Apple's host, what iOS 27.2 changed and what the update did to a library. |
+| `10-library-ownership-and-first-sync.md` | What a phone no computer has synced holds, the four files Apple's host keeps on the phone, how Apple's host decides a phone is its own and when it syncs, its first session with a phone it does not know, what it does to a phone another program filled, and what the phone allows a first host. |
 
 ## 10. Evidence and retention
 
 The raw traces, database captures, disassembly dumps, Apple binaries, firmware images and the chronological working notes behind this work are retained privately and are not published. The Apple binaries and their derivatives are Apple's code. The traces and database copies contain the device owner's library and device identity.
 
-The chapters are the public record. Each chapter ends with an "Evidence" section that describes the evidence the chapter rests on: its kind (wire capture, database comparison, static analysis, controlled phone experiment), the device and the binary build. A reader who wants to repeat a claim needs their own phone and, for the static results, their own copy of Apple Devices 1.1540.23042.0 or 1.1540.24088.0, or of Apple's iPhone17,2 firmware 24A446 and 24B119. The hashes in section 2.2 and in chapter 09, section 1 identify the exact binaries. Addresses, constants, field names and conclusions are published in the chapters so that a claim can be checked against a disassembly of those builds.
+The chapters are the public record. Each chapter ends with an "Evidence" section that describes the evidence the chapter rests on: its kind (wire capture, database comparison, static analysis, controlled phone experiment), the device and the binary build. A reader who wants to repeat a claim needs their own phone and, for the static results, their own copy of Apple Devices 1.1540.23042.0 or 1.1540.24088.0, or of Apple's iPhone17,2 firmware 24A446 and 24B119. The hashes in section 2.2, in chapter 09, section 1 and in chapter 10, section 13 identify the exact binaries. Addresses, constants, field names and conclusions are published in the chapters so that a claim can be checked against a disassembly of those builds.

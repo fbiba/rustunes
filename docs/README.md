@@ -26,6 +26,7 @@ tools used are in [`../ACKNOWLEDGEMENTS.md`](../ACKNOWLEDGEMENTS.md).
 | 7 | [Sync engine design](07-sync-engine-design.md) | How the CLI's journal, planning, verification and recovery are designed, and why: `sync`, `push` and `pull`, change plans, caches, journals carried across versions, FLAC to ALAC, JSON output for other programs |
 | 8 | [How Apple's host batches a sync](08-apple-host-sync-batching.md) | Sessions per sync, the 500-operation file limit, the order of updates, removals and additions, upload and conversion scheduling, failure handling, and a comparison with `rustunes` |
 | 9 | [iOS updates and database versions](09-ios-updates-and-database-versions.md) | How the phone versions and migrates `MediaLibrary.sqlitedb`, the other version stamps, the version rules of the phone's sync service and of Apple's host, what changed in iOS 27.2 and what the update did to a library |
+| 10 | [Library ownership and the first sync](10-library-ownership-and-first-sync.md) | What a phone no computer has synced holds, the four files Apple's host keeps on the phone, how Apple's host decides a phone is its own and when it syncs, its first session with a phone it does not know, what it does to a phone another program filled, and what the phone allows a first host |
 
 ## Evidence labels
 
@@ -44,8 +45,11 @@ used, and the chapter says so when the correction matters.
 
 Chapters 1 to 6 describe Apple's protocol, transport, library and receiver
 behaviour. Chapter 7 describes the design of the sync tool itself, chapter
-8 how Apple's host structures a sync, compared with the tool, and chapter 9
-how an iOS update changes the library database. Chapter 1
+8 how Apple's host structures a sync, compared with the tool, chapter 9
+how an iOS update changes the library database, and chapter 10 how Apple's
+host decides which library a phone belongs to and what a first sync does.
+Chapter 10 rests on code and on one capture that was stopped before the
+phone could act: no phone that had never been synced was available. Chapter 1
 explains the methods and the retention policy in section 10.
 
 The raw evidence is private and is not published: the traces, database
@@ -60,4 +64,6 @@ Start with chapter 1 for context and vocabulary. Implementers of a sync client
 need chapters 2, 3, 5 and 8. Anyone writing metadata or converting audio for the
 phone needs chapters 4 and 6, and anyone reading the phone's database across
 iOS updates needs chapter 9. Chapter 7 is for readers who want to see how the
-findings are turned into a safe sync engine.
+findings are turned into a safe sync engine. Anyone who wants to sync a phone
+that Apple's software has never synced, or to use Apple's software on a phone
+after another tool, should read chapter 10 first.

@@ -2050,6 +2050,18 @@ from every `message`, and its summary from the last `report` and the `result`.
 
 Known limits (all DESIGN unless noted):
 
+- A phone that no Apple host has synced is not supported. The tool takes the
+  library identity from the two prefs files Apple's host writes, and it
+  requires that host's saved catalogue, a `db_info` row and the staging
+  folder. Such a phone has none of them, and the tool stops at the first
+  missing file before it sends anything. The phone's own code would accept a
+  first session from any host; what that takes, and what Apple's host later
+  does to a phone another program filled, is in chapter 10. Nothing in that
+  chapter about a first session has been tried on a phone.
+- The tool sends the identity it finds and writes none of the host's files,
+  so Apple's host still sees its own phone with an older anchor. A later
+  sync with Apple's host resets the phone to what that host holds (chapter
+  10, section 11.1; INFERRED).
 - Group collection: the phone collects emptied albums, artists, composers and
   genres by its own rules, seen in sessions of 16 to 499 targets but not in
   smaller ones or in one of 90 (chapter 05, section 3). The tool cannot force

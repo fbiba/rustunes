@@ -50,10 +50,14 @@ CONFIRMED. The library database is `iTunes_Control/iTunes/MediaLibrary.sqlitedb`
 
 Other files in the same area exist but are not authoritative:
 
-- `iTunesCDB` and `ArtworkDB` are written by the Windows host as its own saved copy of the catalogue and of the artwork cache IDs. They are host-generated state. An unchanged `iTunesCDB` after an accepted insertion does not mean the insertion failed. CONFIRMED (the native writer `SaveIPodFilesFiber`, `0x4b4050`, option bit 22 selects the `iTunesCDB` name; phone-side CDB export is OPEN).
-- `iTunesPrefs` holds library preferences and identity.
+- `iTunesCDB` and `ArtworkDB` are written by the Windows host as its own saved copy of the catalogue and of the artwork cache IDs. They are host-generated state. An unchanged `iTunesCDB` after an accepted insertion does not mean the insertion failed. CONFIRMED (the native writer `SaveIPodFilesFiber`, `0x4b4050`, option bit 22 selects the `iTunesCDB` name).
+- `iTunesPrefs` and `iTunesPrefs.plist` hold the host's sync settings for the phone and the identity of the library that adopted it.
 
-The host sync engine also reads `PlayCounts.plist` from the iTunes folder when present (consumer chain `0x489970 -> 0x3a7a60 -> 0x3a76ac`). Each `tracks[]` row carries `persistentID` plus play, skip, bookmark, rating, liked/played and deleted fields. Unknown PIDs are skipped, and the file is not a catalogue enumerator. CONFIRMED statically; no instance of this file on the phone was observed.
+No code on the phone reads or writes any of these four files. CONFIRMED by a search of iOS 27.2 (24B119): the names `iTunesCDB`, `ArtworkDB` and `iTunesDB` occur nowhere in the dyld shared cache or in the executables of the system volume, and `iTunesPrefs.plist` occurs only in a backup-rule list for store demo devices. Chapter 10, section 5 describes the four files and what Apple's host does when they are absent.
+
+Only `medialibraryd` creates the database. CONFIRMED (iOS 27.2, static). `-[ML3DatabaseConnection _openWithFlags:]` (`0x1d1815840`) may create the device library only inside `medialibraryd` (`0x1d1815b74`). When the folder is missing it first creates `iTunes_Control/iTunes` with its parents (`0x1d1bae4ec`). It raises when a component of the path is missing, has no attributes, or is owned by root or by another user (`_ML3DatabaseConnectionCheckPathiTunesControl`, `0x1d19d9f90`). The Music sync bundle opens the library when `atc` starts, so the file should exist before any host connects (INFERRED).
+
+The host sync engine also reads `PlayCounts.plist` from the iTunes folder when present (consumer chain `0x489970 -> 0x3a7a60 -> 0x3a76ac`). Each `tracks[]` row carries `persistentID` plus play, skip, bookmark, rating, liked/played and deleted fields. Unknown PIDs are skipped, and the file is not a catalogue enumerator. CONFIRMED statically. The phone writes the file during the prepare step of a session (chapter 09, section 6.5). In the guarded capture of chapter 10, section 8, Apple's host read it and then removed it.
 
 ### 2.2 Read-only capture
 
@@ -78,13 +82,28 @@ CONFIRMED. The `_MLDatabaseProperties` table holds key/value strings. Keys obser
 
 | Key | Behaviour |
 | --- | --- |
-| `MLSyncClientSyncAnchor` | Integer, +1 for each accepted sync session. It is the "Media anchor" the host sends in `RequestingSync` (see protocol chapter). |
+| `MLSyncClientSyncAnchor` | The "Media anchor". The phone stores the string of the host's `FinishedSyncingMetadata` without checking it, so the +1 for each accepted session is the host's convention (chapter 09, section 6.4). A database with no such row reports `"0"`. |
 | `MLSyncClientLastSyncedRevision` | Becomes the highest revision of the session's metadata phase. For a delete session it equals the highest tombstone or playlist revision. |
 | `MLArtistHeroImageImportDatabaseRevision` | Follows the highest new revision after a session, and may catch up independently in the background. |
 | `MLSyncClientGenerationID` | A new random signed 64-bit value after every session. Not derivable. |
 | `MLMaintenanceTaskOperationDate` | Did not change during a 100-target removal session that also collected groups, so that collection belongs to the sync session and not to the maintenance task. Its role otherwise is OPEN. |
 
 Every other property stayed exact across all experiments. Across an iOS update other properties move too, among them `MLCloudDatabaseUserVersion`, which belongs to the iCloud library client. Chapter 09, section 5 lists the version stamps and who writes them.
+
+The three `MLSyncClient` properties are written together, by a commit hook of the import, and by nothing else in a sync (chapter 09, section 6.1).
+
+### 2.5 A new database
+
+CONFIRMED in the code of iOS 27.2; not observed, because no phone with a new database was read. When the file is missing, `medialibraryd` creates it and its validation finds `user_version` 0 ("User version is 0, building tables for newly created DB", `0x1d1a7141c`). It then builds the schema, the indexes and the triggers, and inserts two rows: `base_location (0, '')` and the property `OrderingLanguage` (`0x1d1a711e0`, `0x1d1a71208`). After that it sets `user_version` and adds a random `_UUID` property when there is none (`0x1d1a71510`).
+
+A new database therefore has:
+
+- every table, with one `base_location` row;
+- the properties `OrderingLanguage` and `_UUID`, and no `MLSyncClient` property, so the phone reports the anchor `"0"`;
+- no `db_info` row: the MusicLibrary image contains no statement that inserts one, and the row is created only by the host's `update_db_info` operation (chapter 05, section 5);
+- no container and an empty `sort_map`.
+
+This is the database of a phone no computer has synced (chapter 10, section 4), and of a library the phone truncated and rebuilt (chapter 09, section 4.4). OPEN: when the phone adds its own containers, such as the built-in smart playlists and Playback History, and whether a phone that was never synced has any.
 
 ## 3. Identifiers (PIDs) and revisions
 
@@ -98,7 +117,7 @@ CONFIRMED. A sync operation names objects by signed 64-bit persistent IDs. The p
 | `item.album_pid` | `album.sync_id` | Track `+0x28`, then album qword `+0x20` (RVA `0x463079-0x46308a`, new build) |
 | `item.artist_pid` | `album_artist.sync_id` | Track `+0x40`, then artist qword `+0x18` (RVA `0x464137-0x46414b`, new build) |
 | container `pid` | `container.sync_id` | playlist and database identity |
-| `update_db_info.pid` and `db_info.primary_container_pid` | database and primary library container | unchanged "current" values must be echoed |
+| `update_db_info.pid` and `db_info.primary_container_pid` | `db_info.db_pid` and `db_info.primary_container_pid` | a client that syncs an existing library echoes the current values. The phone replaces the row when the sent `pid` differs or no row exists (chapter 05, section 5) |
 
 Three groups have no wire identity: `item_artist`, `composer` and `genre`. The receiver matches them by the grouping key of their name (section 7). The column `item_artist.sync_id` is not the same namespace as `artist_pid`; internal SQLite row IDs, `item_artist.sync_id` and source strings are not interchangeable with wire PIDs.
 
@@ -193,6 +212,8 @@ The library holds three built-in containers: the primary library playlist, Photo
 ### 4.5 Bookkeeping
 
 `entity_revision`, `_MLDatabaseProperties`, `sort_map`.
+
+`db_info` holds one row: the database PID (`db_pid`), the PID of the primary library container, and language and Genius fields. Only the host's `update_db_info` operation creates or replaces it. A Reset does not touch it.
 
 ## 5. Metadata mapping: source tag to plist key to column
 
@@ -703,7 +724,7 @@ Static analysis only (CONFIRMED unless marked).
 - The phone answers with an `AssetManifest` listing only the assets and asset parts it still needs: entries `{AssetID, AssetType, IsDownload, Variant:{AssetParts}}`, with `AssetID` a bare signed-decimal PID. Asset-part bits: Track = 1, Artwork = 2, Genius = 4, Lyrics = 8. The host copies exactly those. In the reference reset run the host staged 401 operations (1 `update_db_info`, 399 `insert_track`, 1 `insert_playlist`) and the phone asked for 54 assets. The staged `insert_track` carried no audio hash, and its `location` held only `kind`.
 - The phone's rule for "needed" is inside iOS and cannot be seen (INFERRED PID-based; artwork, lyrics and Genius parts are requested separately from the track part).
 - There is no message that lists the phone's tracks with sizes or hashes. `AssetMetrics` carries only `_Count`, `_PhysicalSize`, `_PurgeableSize` per asset type; `InstalledAssets` contained only `Application._Deleted` in captured sessions.
-- Host-side change detection uses per-dataclass sync anchors (`hostLastSyncAnchor`, `hostNextSyncAnchor`, and the device's anchor from `ReadyForSync`). Selector `0x46cf0c`: if host-last differs from device-last, the sync is a Reset after dropping pending `upload_track` operations; otherwise Delta. Delta sends only changed fields, computed against the host's mirror ("modifiedTrackFields"), and drops any `update_track` that ends with two or fewer keys (`operation`, `pid`; `cmp rax,0x2` at `0x14046a0a0`). Replacing a device track compares a 64-bit "store version" at TrackInfo `+0xa8`. Comparisons ("X does not match", in `sub_35a294`) are against the host mirror, never against the phone's file.
+- Host-side change detection uses per-dataclass sync anchors (`hostLastSyncAnchor`, `hostNextSyncAnchor`, and the device's anchor from `ReadyForSync`). Selector `0x46cf0c`: if host-last differs from device-last, the sync is a Reset after dropping every pending operation except `upload_track`; otherwise Delta. Delta sends only changed fields, computed against the host's mirror ("modifiedTrackFields"), and drops any `update_track` that ends with two or fewer keys (`operation`, `pid`; `cmp rax,0x2` at `0x14046a0a0`). Replacing a device track compares a 64-bit "store version" at TrackInfo `+0xa8`. Comparisons ("X does not match", in `sub_35a294`) are against the host mirror, never against the phone's file.
 - Size-like change detectors are cheap numbers, not hashes: `artwork_checksum` is computed from stored fields (section 10), and the host logs "artwork size for track changed".
 - `file-hash`, `package-file-hash` and `cover-image-hash` plist sources exist in the builder (`0x14046483b`, `0x140464803`, `0x140464793`) but come from item metadata (books and Store content), not computed from phone files.
 
@@ -991,7 +1012,7 @@ Client-side policy built on these rules (planning, verification and recovery) is
 - OPEN: whether the phone ever removes unreferenced `artwork` rows or fills empty grayscale renditions; which property of a grayscale cover causes the empty rendition; what the phone keeps of a CMYK or 12-bit JPEG original.
 - OPEN: why the phone dropped exactly the first two manifest rows when a session was abandoned.
 - OPEN: what triggers group collection (16 to 499 targets collected; up to 8 targets, and 90 targets that emptied the library, did not). The phone's routine for it is known (chapter 09, section 9); the condition under which an import runs it is not.
-- OPEN: whether the phone detects a truncated file from `location.file_size`; what bit `0x20` of `[handler+0x2e02]` means (whether the host's resume hash runs for a modern iPhone); where the host persists anchors and its device mirror.
+- OPEN: whether the phone detects a truncated file from `location.file_size`; what bit `0x20` of `[handler+0x2e02]` means (whether the host's resume hash runs for a modern iPhone). The host persists its anchors and its device mirror in the phone's `iTunesCDB` (chapter 10, section 5.3).
 - OPEN: how the phone's background renumbering is triggered, and what `MLMaintenanceTaskOperationDate` governs.
 - OPEN: whether leftover container rows (primary library, Playback History) and unreferenced artwork are ever cleaned.
 - OPEN: a title edit to a label already present in `sort_map`; where the phone stores `container_ui` values; what the `item_extra` integrity value encodes.
