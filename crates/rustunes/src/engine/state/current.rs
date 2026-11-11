@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::{Instant, timeout_at};
 
 use crate::{
-    engine::execution::device, engine::state::journal::Identity,
+    engine::execution::device, engine::state::device_files, engine::state::journal::Identity,
     engine::verification::catalogue_capture,
 };
 use music_protocol::catalogue::identity::{self, LibraryIdentity};
@@ -559,9 +559,9 @@ async fn capture_inner_options(
         Transfer::connect(&provider, &transfer_path, deadline).await?
     };
     let mut names = vec![
-        "iTunes_Control/iTunes/iTunesPrefs",
-        "iTunes_Control/iTunes/iTunesPrefs.plist",
-        "iTunes_Control/iTunes/iTunesCDB",
+        device_files::PREFS,
+        device_files::PREFS_PLIST,
+        device_files::CDB,
     ];
     let mut caps = vec![
         1024 * 1024,
@@ -569,17 +569,27 @@ async fn capture_inner_options(
         music_protocol::catalogue::anchor::MAX_INPUT_BYTES as u64,
     ];
     if include_artwork {
-        names.push("iTunes_Control/Artwork/ArtworkDB");
+        names.push(device_files::ARTWORK_DB);
         caps.push(32 * 1024 * 1024);
     }
     let mut attrs = Vec::new();
     let mut copies = Vec::new();
     for (index, name) in names.iter().enumerate() {
         check_capture(control)?;
-        let observed = afc
-            .stat(name)
-            .await?
-            .context("required device library input missing")?;
+        let Some(observed) = afc.stat(name).await? else {
+            let mut folder = None;
+            for parent in device_files::folders(name) {
+                if afc.stat(parent).await?.is_none() {
+                    folder = Some(parent.to_owned());
+                    break;
+                }
+            }
+            let other_half = match device_files::other_half(name) {
+                Some(other) if folder.is_none() => afc.stat(other).await?.is_some(),
+                _ => false,
+            };
+            return Err(device_files::MissingDeviceFile::new(name, folder, other_half).into());
+        };
         let size: u64 = observed
             .get("st_size")
             .context("device file size missing")?

@@ -67,11 +67,13 @@ const PLANNING_READS_AT_TOP: [&str; 2] = ["run.json", "plan.json"];
 
 /// Remove the runs in `state` no journal needs, and trim the finished ones
 /// to what planning reads again. A run stays whole while the process that
-/// made it is running (this one included) and while a journal under
-/// `devices` names it for unfinished work: a batch's or replacement's
-/// evidence, or a single-track operation's input. A run a journal names only
-/// for finished work is trimmed. A directory `new_run` did not name is left
-/// alone, and a journal that cannot be read keeps every run.
+/// made it is running (this one included), while a journal under `devices`
+/// names it for unfinished work (a batch's or replacement's evidence, or a
+/// single-track operation's input), and while it is a phone's latest
+/// `rustunes init` run, whose messages point to it. A run a journal names
+/// only for finished work is trimmed. A directory `new_run` did not name is
+/// left alone, and a journal or init run name that cannot be read keeps
+/// every run.
 pub fn prune_runs(state: &Path) -> Result<Pruned> {
     let runs = state.join("runs");
     let entries = match fs::read_dir(&runs) {
@@ -97,7 +99,7 @@ pub fn prune_runs(state: &Path) -> Result<Pruned> {
     if candidates.is_empty() {
         return Ok(Pruned::default());
     }
-    let [unfinished, finished] = journal_references(state)?;
+    let [kept, finished] = journal_references(state)?;
     let mut pruned = Pruned::default();
     for run in candidates {
         let inputs = inputs(&run)?;
@@ -106,7 +108,7 @@ pub fn prune_runs(state: &Path) -> Result<Pruned> {
                 .is_some_and(|name| references.runs.contains(name))
                 || !references.inputs.is_disjoint(&inputs)
         };
-        if names(&unfinished) {
+        if names(&kept) {
             continue;
         }
         if names(&finished) {
@@ -160,6 +162,11 @@ fn trim(directory: &Path, top: bool, removed: &mut impl FnMut(u64)) -> Result<bo
     Ok(empty)
 }
 
+/// Whether `name` is one `new_run` gives a run directory.
+pub(crate) fn is_run_name(name: &str) -> bool {
+    run_process(name).is_some()
+}
+
 /// The process a run's name records, when `new_run` named it.
 fn run_process(name: &str) -> Option<u32> {
     let (timestamp, process) = name.split_once('-')?;
@@ -177,16 +184,27 @@ struct References {
     inputs: BTreeSet<[u8; 32]>,
 }
 
-/// What the journals name for unfinished work, then for finished work.
+/// What the journals name for unfinished work, with each phone's latest
+/// init run, then what they name for finished work.
 fn journal_references(state: &Path) -> Result<[References; 2]> {
     let mut journals = Vec::new();
+    let mut init_runs = BTreeSet::new();
     match fs::read_dir(state.join("devices")) {
         Ok(devices) => {
             // `devices/<device>/<library>/` holds `journal` and the
             // `journal.previous` and `journal.pulling` a pull leaves.
+            // `devices/<device>/` also holds the files of `rustunes init`
+            // (`init.json`, its staged pair and `init-run`), which hold no
+            // journal.
             for device in devices {
-                for library in fs::read_dir(device?.path())? {
-                    for journal in fs::read_dir(library?.path())? {
+                let device = device?.path();
+                init_runs.extend(crate::engine::state::init_record::latest_run(&device)?);
+                for library in fs::read_dir(&device)? {
+                    let library = library?;
+                    if library.file_type()?.is_file() {
+                        continue;
+                    }
+                    for journal in fs::read_dir(library.path())? {
                         let journal = journal?.path();
                         if journal.join("journal.sqlite").try_exists()? {
                             journals.push(journal);
@@ -198,7 +216,13 @@ fn journal_references(state: &Path) -> Result<[References; 2]> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut references = [References::default(), References::default()];
+    let mut references = [
+        References {
+            runs: init_runs,
+            ..References::default()
+        },
+        References::default(),
+    ];
     if journals.is_empty() {
         return Ok(references);
     }
@@ -464,6 +488,82 @@ mod tests {
             state.join("devices/d/other/journal/journal.sqlite"),
             b"not a journal",
         );
+        assert!(prune_runs(&state).is_err());
+        assert!(finished(6).exists());
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    /// The state directory a new user has after `rustunes init`, a dry run
+    /// and a pull: the device's directory holds init's record, staged pair
+    /// and latest run beside the library's, and the init run its own layout.
+    /// That run stays whole, as the evidence init's messages point to, until
+    /// a later attempt on the phone replaces it.
+    #[test]
+    fn the_latest_init_run_of_each_phone_is_kept_whole() {
+        use crate::engine::state::init_record;
+        use crate::engine::state::journal::{Journal, test_support};
+        let state = std::env::temp_dir().join(format!(
+            "music-state-prune-init-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let runs = state.join("runs");
+        let finished = |n: u32| runs.join(format!("{n}-99999999"));
+        let file = |path: PathBuf| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"0").unwrap();
+        };
+        let (phone, other_phone) = ([1; 32], [2; 32]);
+        let device = init_record::directory(&state, &phone);
+        // Creates the phone's directory private, as init does.
+        init_record::save_run(&state, &phone, &finished(1)).unwrap();
+        for name in ["init.json", "init-staged.plist", "init-staged.plist.cig"] {
+            file(device.join(name));
+        }
+        let init_run = [
+            "inspection/afc/afc-0000-intent.plist",
+            "inspection/database/MediaLibrary.sqlitedb",
+            "inspection-confirmed/database/MediaLibrary.sqlitedb",
+            "afc/afc-0000-intent.plist",
+            "atc/000-outgoing.plist",
+            "after/MediaLibrary.sqlitedb",
+            "after-2/MediaLibrary.sqlitedb-wal",
+            "inspection.json",
+            "outcome.json",
+            "plan.json",
+            "Sync_00000000.plist",
+        ];
+        let whole = |run: PathBuf| init_run.iter().all(|path| run.join(path).is_file());
+        for n in [1, 4] {
+            for path in init_run {
+                file(finished(n).join(path));
+            }
+        }
+        init_record::save_run(&state, &other_phone, &finished(4)).unwrap();
+        file(finished(2).join("plan.json"));
+        // Before the pull, no journal: only the init runs stay.
+        assert_eq!(prune_runs(&state).unwrap().removed, 1);
+        assert!(whole(finished(1)) && whole(finished(4)));
+        file(finished(3).join("snapshot/catalog/MediaLibrary.sqlitedb"));
+        fs::create_dir(device.join("l")).unwrap();
+        drop(Journal::create(&device.join("l/journal"), &test_support::identity()).unwrap());
+        assert_eq!(prune_runs(&state).unwrap().removed, 1);
+        assert!(whole(finished(1)) && whole(finished(4)));
+        assert!(device.join("init.json").is_file());
+        // A later attempt on the phone replaces it; the other phone's stays.
+        for path in init_run {
+            file(finished(5).join(path));
+        }
+        init_record::save_run(&state, &phone, &finished(5)).unwrap();
+        assert_eq!(prune_runs(&state).unwrap().removed, 1);
+        assert!(!finished(1).exists());
+        assert!(whole(finished(5)) && whole(finished(4)));
+        // A name that cannot be read keeps every run.
+        file(finished(6).join("plan.json"));
+        fs::write(device.join("init-run"), b"../5-99999999").unwrap();
         assert!(prune_runs(&state).is_err());
         assert!(finished(6).exists());
         fs::remove_dir_all(state).unwrap();

@@ -1373,33 +1373,107 @@ impl Transfer {
         operation: &[u8],
         signature: &[u8; 21],
     ) -> Result<Vec<&'static str>> {
+        let mut removed = Vec::new();
+        for (path, expected) in [(SIGNATURE, &signature[..]), (METADATA, operation)] {
+            if self.remove_checked(path, expected, false).await? {
+                removed.push(path);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Remove what a write of exactly `bytes` to `path` left, whether it
+    /// finished or stopped part way: a regular file holding `bytes` or a
+    /// prefix of them (none at all included). Anything else at `path` refuses
+    /// and nothing is removed. Returns false when `path` is absent. As with
+    /// `remove_staged_operation`, a locked connection can do this and remove
+    /// nothing else; the caller proves the write was its own.
+    pub async fn remove_interrupted_write(&mut self, path: &str, bytes: &[u8]) -> Result<bool> {
+        self.remove_checked(path, bytes, true).await
+    }
+
+    /// Read `path` back and remove it only if it holds `expected` (or, with
+    /// `prefix`, the start of it). The one RemovePath a locked connection may
+    /// send is for the path this just read.
+    async fn remove_checked(&mut self, path: &str, expected: &[u8], prefix: bool) -> Result<bool> {
         ensure!(
             !self.readonly_summary,
             "removal refused by read-only AFC summary transport"
         );
-        let mut removed = Vec::new();
-        for (path, expected) in [(SIGNATURE, &signature[..]), (METADATA, operation)] {
-            let Some(attrs) = self.stat(path).await? else {
-                continue;
-            };
-            let bytes = expected.len() as u64;
-            regular_size(&attrs, bytes)
-                .with_context(|| format!("staged {path} is not this operation; nothing removed"))?;
-            let read = self.read_hash(path, bytes, bytes).await?;
+        validate_path(path)?;
+        let Some(attrs) = self.stat(path).await? else {
+            return Ok(false);
+        };
+        let (not_it, differs) = if prefix {
+            (
+                format!("{path} is not what the interrupted write left; nothing removed"),
+                format!(
+                    "{path} differs from what the interrupted write was writing; nothing removed"
+                ),
+            )
+        } else {
+            (
+                format!("staged {path} is not this operation; nothing removed"),
+                format!("staged {path} differs from this operation; nothing removed"),
+            )
+        };
+        let size = if prefix {
             ensure!(
-                read[..] == Sha256::digest(expected)[..],
-                "staged {path} differs from this operation; nothing removed"
+                attrs.get("st_ifmt").map(String::as_str) == Some("S_IFREG"),
+                "{not_it}: not a regular file"
             );
-            self.checked_removal = Some(path.to_owned());
-            let result = self
-                .status(AfcOpcode::RemovePath, path.as_bytes().to_vec(), Vec::new())
-                .await;
-            self.checked_removal = None;
-            result?;
-            self.require_absent(path).await?;
-            removed.push(path);
-        }
-        Ok(removed)
+            let observed: u64 = attrs
+                .get("st_size")
+                .context("missing file size")
+                .and_then(|size| Ok(size.parse()?))
+                .with_context(|| not_it.clone())?;
+            ensure!(observed <= expected.len() as u64, "{not_it}: it is larger");
+            observed
+        } else {
+            expected.len() as u64
+        };
+        regular_size(&attrs, size).with_context(|| not_it.clone())?;
+        let read = self.read_hash(path, size, size.max(1)).await?;
+        ensure!(
+            read[..] == Sha256::digest(&expected[..size as usize])[..],
+            "{differs}"
+        );
+        self.checked_removal = Some(path.to_owned());
+        let result = self
+            .status(AfcOpcode::RemovePath, path.as_bytes().to_vec(), Vec::new())
+            .await;
+        self.checked_removal = None;
+        result?;
+        self.require_absent(path).await?;
+        Ok(true)
+    }
+
+    /// Write a new file as Apple Devices writes its prefs: to `<path>.tmp`,
+    /// then renamed to `path`. Neither may exist before, so nothing is
+    /// overwritten; the result is read back. Returns its digest.
+    pub async fn write_new_through_temporary(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<[u8; 32]> {
+        self.require_writable("write_new_through_temporary")?;
+        let temporary = format!("{path}.tmp");
+        let size = bytes.len() as u64;
+        let expected: [u8; 32] = Sha256::digest(bytes).into();
+        self.require_absent(path)
+            .await
+            .with_context(|| format!("{path} is already on the phone"))?;
+        let written = self
+            .write_new(&temporary, &mut std::io::Cursor::new(bytes), size)
+            .await
+            .with_context(|| format!("writing {temporary}"))?;
+        ensure!(written == expected, "{temporary} write digest differs");
+        self.rename_absent(&temporary, path, size).await?;
+        ensure!(
+            self.read_hash(path, size, size.max(1)).await? == expected,
+            "{path} reads back differently"
+        );
+        Ok(expected)
     }
 
     /// Create a directory whose parent exists, unless it already exists; an
@@ -2235,6 +2309,9 @@ mod tests {
     }
 
     mod bounded;
+    mod fake_phone;
+    mod interrupted_write;
     mod locked;
     mod summary;
+    mod through_temporary;
 }

@@ -33,6 +33,9 @@ pub use crate::engine::recovery::resume::{
 pub use crate::engine::verification::journal::{AudioStatus, Report as VerificationResult};
 pub use events::Event;
 pub use execution::change::{Outcome as ChangeApplyOutcome, Request as ChangeApplyRequest};
+pub use execution::init::{
+    Outcome as InitOutcome, Plan as InitPlan, Request as InitRequest, plan_json as init_plan_json,
+};
 pub use execution::pull::{
     NOT_IN_LIBRARY, PhoneTrack as PulledTrack, Report as PullResult, Request as PullRequest,
 };
@@ -201,6 +204,38 @@ impl Engine {
         self.check()?;
         self.scope(Box::pin(execution::pull::run(request, self)))
             .await
+    }
+    /// Prepare an iPhone no computer has synced (`rustunes init`). `confirm`
+    /// sees the plan before anything is written to the phone.
+    pub async fn init(
+        &self,
+        request: InitRequest<'_>,
+        confirm: &mut impl FnMut(&InitPlan) -> Result<bool>,
+    ) -> Result<InitOutcome> {
+        self.check()?;
+        self.scope(Box::pin(execution::init::run(request, self, confirm)))
+            .await
+    }
+    /// Inspect what the phone holds for music syncing (`rustunes device
+    /// check`), read-only. `trace` becomes a new private directory holding
+    /// the database copy. The report never includes the library identity.
+    pub async fn check_device(&self, state: &Path, trace: &Path) -> Result<serde_json::Value> {
+        self.check()?;
+        self.scope(Box::pin(async {
+            let provider = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                execution::device::provider(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out discovering the device"))??;
+            let deadline = self.control(120).deadline;
+            let inspection = verification::readiness::inspect(&provider, trace, deadline).await?;
+            let device = state::journal::device_binding(&provider.udid)?;
+            let record = state::init_record::load(state, &device)?;
+            let readiness = inspection.readiness(record.as_ref())?;
+            Ok(inspection.report(&readiness))
+        }))
+        .await
     }
     pub async fn cover(&self, request: CoverRequest<'_>) -> Result<CoverResult> {
         self.check()?;

@@ -124,6 +124,67 @@ fn prepare_playlists(
     envelope(revision, timestamp, operations)
 }
 
+/// The operation file of a phone's first session, the shape Apple Devices
+/// sends when it adopts a phone with Music sync off (docs/10
+/// §8.2): `update_db_info` with the library's new database and library
+/// playlist PIDs, then that playlist itself, hidden, named after the phone
+/// and empty. The phone keeps no `db_info` row until a host sends one, and
+/// stores the sent values unchecked (docs/02 §8.4).
+///
+/// The revision is 1: the phone reports Media anchor "0" and never reads it.
+pub fn first_session(
+    database_pid: u64,
+    library_playlist_pid: u64,
+    device_name: &str,
+    timestamp: SystemTime,
+) -> Result<Vec<u8>> {
+    ensure!(
+        database_pid != 0 && library_playlist_pid != 0 && database_pid != library_playlist_pid,
+        "first-session PIDs must be nonzero and distinct"
+    );
+    ensure!(
+        !device_name.trim().is_empty()
+            && device_name.len() <= 255
+            && !device_name.chars().any(char::is_control),
+        "device name must be 1..=255 bytes of non-control text"
+    );
+    let identity = CatalogIdentity {
+        database: database_pid,
+        primary_container: library_playlist_pid,
+        anchor: 0,
+    };
+    // Apple's container dates are whole seconds.
+    let seconds = timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("timestamp before 1970")?
+        .as_secs();
+    let created =
+        Value::Date((SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds)).into());
+    let mut container = Dictionary::new();
+    container.insert("date_created".into(), created.clone());
+    container.insert("date_modified".into(), created);
+    container.insert("is_hidden".into(), true.into());
+    container.insert("name".into(), device_name.into());
+    let mut container_ui = Dictionary::new();
+    container_ui.insert("album_field_order".into(), 0u64.into());
+    container_ui.insert("has_been_shuffled".into(), false.into());
+    container_ui.insert("is_reversed".into(), false.into());
+    container_ui.insert("play_order".into(), 1u64.into());
+    container_ui.insert("repeat_mode".into(), 0u64.into());
+    container_ui.insert("shuffle_items".into(), false.into());
+    let mut playlist = Dictionary::new();
+    playlist.insert("container".into(), Value::Dictionary(container));
+    playlist.insert("container_ui".into(), Value::Dictionary(container_ui));
+    playlist.insert("item_to_container".into(), Value::Array(Vec::new()));
+    playlist.insert("operation".into(), "insert_playlist".into());
+    playlist.insert("pid".into(), (library_playlist_pid as i64).into());
+    envelope(
+        1,
+        timestamp,
+        vec![db_info_update(&identity), Value::Dictionary(playlist)],
+    )
+}
+
 fn validate_unfilled(track: &Track) -> Result<()> {
     let state = &track.availability;
     ensure!(
@@ -331,6 +392,80 @@ fn validate_removable(track: &Track) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_session_matches_apples_adoption_file() {
+        use std::time::Duration;
+        let at = SystemTime::UNIX_EPOCH + Duration::from_micros(1_600_000_000_250_000);
+        let bytes = super::first_session(
+            0xF123_4567_89AB_CDEF,
+            0x0FED_CBA9_8765_4321,
+            "iPhone - Test",
+            at,
+        )
+        .unwrap();
+        assert!(bytes.starts_with(b"bplist00"));
+        let value = plist::Value::from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        let root = value.as_dictionary().unwrap();
+        assert_eq!(root["revision"].as_unsigned_integer(), Some(1));
+        let operations = root["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 2);
+        let db = operations[0].as_dictionary().unwrap();
+        assert_eq!(db["operation"].as_string(), Some("update_db_info"));
+        assert_eq!(
+            db["pid"].as_signed_integer(),
+            Some(0xF123_4567_89AB_CDEF_u64 as i64)
+        );
+        let info = db["db_info"].as_dictionary().unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(
+            info["primary_container_pid"].as_signed_integer(),
+            Some(0x0FED_CBA9_8765_4321)
+        );
+        let playlist = operations[1].as_dictionary().unwrap();
+        let keys: Vec<_> = playlist.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "container",
+                "container_ui",
+                "item_to_container",
+                "operation",
+                "pid"
+            ]
+        );
+        assert_eq!(playlist["operation"].as_string(), Some("insert_playlist"));
+        assert_eq!(
+            playlist["pid"].as_signed_integer(),
+            Some(0x0FED_CBA9_8765_4321)
+        );
+        assert_eq!(
+            playlist["item_to_container"].as_array().map(Vec::len),
+            Some(0)
+        );
+        let container = playlist["container"].as_dictionary().unwrap();
+        assert_eq!(container["is_hidden"].as_boolean(), Some(true));
+        assert_eq!(container["name"].as_string(), Some("iPhone - Test"));
+        let created: SystemTime = container["date_created"].as_date().unwrap().into();
+        assert_eq!(
+            created,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000)
+        );
+        assert_eq!(container["date_modified"], container["date_created"]);
+        let ui = playlist["container_ui"].as_dictionary().unwrap();
+        assert_eq!(ui.len(), 6);
+        assert_eq!(ui["play_order"].as_unsigned_integer(), Some(1));
+        assert_eq!(ui["is_reversed"].as_boolean(), Some(false));
+        for (database, playlist, name) in [
+            (0, 1, "x"),
+            (1, 0, "x"),
+            (5, 5, "x"),
+            (1, 2, " "),
+            (1, 2, "a\nb"),
+        ] {
+            assert!(super::first_session(database, playlist, name, at).is_err());
+        }
+    }
+
     use super::*;
     use crate::catalogue::sqlite::{Availability, TrackMetadata};
     use std::{

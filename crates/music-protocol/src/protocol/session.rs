@@ -1061,6 +1061,38 @@ impl Session {
         Ok(())
     }
 
+    /// Wait after a phone's first session's metadata for its end. A phone with
+    /// nothing synced holds no asset of this library to ask for, so any request
+    /// ends the session with no further sends.
+    pub async fn wait_first_session(&mut self) -> Result<()> {
+        ensure!(
+            self.phase == Phase::MetadataSent,
+            "first-session wait outside metadata state"
+        );
+        self.phase = Phase::MetadataOnlyWaiting;
+        loop {
+            let value = self.channel.receive().await?;
+            let root = dictionary(&value)?;
+            ensure!(
+                number(root, "Session")? == 2,
+                "wrong-session first-session message"
+            );
+            match string(root, "Command")? {
+                "SyncFinished" => {
+                    if root.contains_key("Params") {
+                        child(root, "Params")?;
+                    }
+                    self.phase = Phase::Finished;
+                    return Ok(());
+                }
+                "Progress" | "SyncAllowed" | "InstalledAssets" | "AssetMetrics" => {
+                    check_telemetry(root)?
+                }
+                _ => bail!("unexpected request or terminal in a first session; no further sends"),
+            }
+        }
+    }
+
     pub async fn wait_finished(&mut self) -> Result<()> {
         ensure!(
             self.phase == Phase::CompleteSent,
@@ -2358,6 +2390,7 @@ mod tests {
     mod dynamic;
     mod empty_delta;
     mod empty_delta_observe;
+    mod first_session;
     mod pending_audio;
     mod pending_completion;
     mod stage;

@@ -28,7 +28,7 @@ use crate::{
         self, Absent, CatalogBinding, IndexIdentity, IndexProgress, OtherAudio, ReadControl,
         TrackAudio, fingerprint_json,
     },
-    engine::state::journal::Identity,
+    engine::state::{device_files, journal::Identity},
 };
 use music_protocol::catalogue::identity;
 use music_protocol::catalogue::sqlite::Catalog;
@@ -613,11 +613,31 @@ async fn prefs(
 }
 
 /// A file's attributes; unlike `afc_stat::attributes`, a missing file is an
-/// error here.
+/// error here, a `MissingDeviceFile` naming it, any absent folder and
+/// whether the other half of the identity pair is there.
 async fn attributes(afc: &mut AfcClient, path: &str, deadline: Instant) -> Result<Attributes> {
-    afc_stat::attributes(afc, path, deadline, None, "stat prefs")
-        .await?
-        .context("stat prefs: object not found")
+    if let Some(attributes) = afc_stat::attributes(afc, path, deadline, None, "stat prefs").await? {
+        return Ok(attributes);
+    }
+    let mut folder = None;
+    for parent in device_files::folders(path) {
+        if afc_stat::attributes(afc, parent, deadline, None, "stat prefs folder")
+            .await?
+            .is_none()
+        {
+            folder = Some(parent.to_owned());
+            break;
+        }
+    }
+    let other_half = match device_files::other_half(path) {
+        Some(other) if folder.is_none() => {
+            afc_stat::attributes(afc, other, deadline, None, "stat prefs")
+                .await?
+                .is_some()
+        }
+        _ => false,
+    };
+    Err(device_files::MissingDeviceFile::new(path, folder, other_half).into())
 }
 fn unix_time_ns() -> Result<String> {
     Ok(SystemTime::now()
@@ -761,3 +781,107 @@ mod tests {
 
 #[cfg(test)]
 mod retry_tests;
+
+#[cfg(test)]
+mod missing_tests {
+    use super::*;
+    use idevice::{
+        Idevice,
+        afc::{
+            MAGIC,
+            opcode::AfcOpcode,
+            packet::{AfcPacket, AfcPacketHeader},
+        },
+    };
+
+    async fn answer(peer: &mut Idevice, expected: &str, found: bool) {
+        let request = AfcPacket::read(peer).await.unwrap();
+        assert_eq!(request.header.operation, AfcOpcode::GetFileInfo);
+        assert_eq!(request.header_payload, expected.as_bytes());
+        let (operation, header_payload, payload) = if found {
+            (
+                AfcOpcode::Data,
+                Vec::new(),
+                b"st_ifmt\0S_IFDIR\0st_size\0128\0st_mtime\01\0".to_vec(),
+            )
+        } else {
+            (AfcOpcode::Status, 8u64.to_le_bytes().to_vec(), Vec::new())
+        };
+        let header_payload_len = AfcPacketHeader::LEN + header_payload.len() as u64;
+        let packet = AfcPacket {
+            header: AfcPacketHeader {
+                magic: MAGIC,
+                entire_len: header_payload_len + payload.len() as u64,
+                header_payload_len,
+                packet_num: request.header.packet_num,
+                operation,
+            },
+            header_payload,
+            payload,
+        };
+        peer.send_raw(&packet.serialize()).await.unwrap();
+    }
+
+    /// `iTunesPrefs` absent; `folders` answers the stat of each folder on its
+    /// path, and `plist` that of the other half, asked only when both
+    /// folders are there.
+    async fn missing(folders: &[bool], plist: bool) -> device_files::MissingDeviceFile {
+        let (client, peer) = tokio::io::duplex(64 * 1024);
+        let mut afc = AfcClient::new(Idevice::new(Box::new(client), "offline-only"));
+        let mut peer = Idevice::new(Box::new(peer), "offline-peer");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let phone = async {
+            answer(&mut peer, device_files::PREFS, false).await;
+            for (folder, found) in device_files::folders(device_files::PREFS).zip(folders) {
+                answer(&mut peer, folder, *found).await;
+            }
+            if folders.iter().all(|found| *found) {
+                answer(&mut peer, device_files::PREFS_PLIST, plist).await;
+            }
+        };
+        let (result, ()) = tokio::join!(attributes(&mut afc, device_files::PREFS, deadline), phone);
+        result
+            .unwrap_err()
+            .downcast::<device_files::MissingDeviceFile>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn absent_prefs_name_the_file_and_the_outermost_absent_folder() {
+        let file = missing(&[true, true], false).await;
+        assert!(file.never_synced());
+        assert!(
+            file.to_string()
+                .starts_with("iTunes_Control/iTunes/iTunesPrefs is not on the iPhone. "),
+            "{file}"
+        );
+        let folder = missing(&[true, false], false).await;
+        assert!(
+            folder.to_string().starts_with(
+                "iTunes_Control/iTunes/iTunesPrefs is not on the iPhone: the folder iTunes_Control/iTunes is absent. "
+            ),
+            "{folder}"
+        );
+        let root = missing(&[false], false).await;
+        assert!(
+            root.to_string()
+                .contains("the folder iTunes_Control is absent"),
+            "{root}"
+        );
+    }
+
+    /// What a restore by Apple's host can leave: the plist alone, which
+    /// `init` refuses.
+    #[tokio::test]
+    async fn a_lone_plist_does_not_point_to_init() {
+        let file = missing(&[true, true], true).await;
+        assert!(!file.never_synced());
+        assert!(
+            file.to_string().ends_with(
+                "Only iTunes_Control/iTunes/iTunesPrefs.plist of the library identity pair is \
+                 there: rustunes device check says whether rustunes init can prepare this iPhone"
+            ),
+            "{file}"
+        );
+    }
+}

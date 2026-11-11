@@ -38,8 +38,10 @@ pub const USER_VERSION_FLOOR: i64 = 2_400_060;
 /// version at or above the floor is read, and `Catalog` reports it untested.
 pub const TESTED_USER_VERSIONS: &[i64] = &[2_400_060, 2_410_000];
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+mod library_state;
 mod scratch;
 pub mod tables;
+pub use library_state::{ContainerRow, LibraryState, SYNCED_TABLES, read_library_state};
 mod without;
 
 #[derive(Clone)]

@@ -4,6 +4,7 @@ pub(crate) mod completions;
 pub(crate) mod config;
 mod deletion;
 pub(crate) mod device_view;
+mod init_view;
 pub(crate) mod journal_view;
 pub(crate) mod library_view;
 mod logging;
@@ -493,6 +494,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Prepare an iPhone no computer has synced: write a new library identity and run its one first session (no tracks). Shows the plan and asks first.
+    Init {
+        /// Confirm without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Inspect the iPhone and save the plan; nothing is written to it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Private run history and per-device records (default: XDG_STATE_HOME/rustunes).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// The computer name written into the iPhone's prefs and sent in the session (printable ASCII, at most 63 characters).
+        #[arg(long, default_value = "rustunes")]
+        host_name: String,
+        /// Maximum time for the inspection, again for the session, and again for reading its result back.
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=1800))]
+        seconds: u64,
+    },
     /// Read device details using an existing pairing record. Never initiates pairing.
     #[command(hide = true)]
     DeviceInfo,
@@ -579,6 +598,18 @@ enum DeviceCommand {
         /// the phone accepts).
         #[arg(long)]
         domain: Option<String>,
+    },
+    /// Check what the phone holds for music syncing, and whether it needs rustunes init; read-only.
+    Check {
+        /// Print a JSON report to stdout.
+        #[arg(long)]
+        json: bool,
+        /// Keep the database copy and AFC evidence in this new directory.
+        #[arg(long)]
+        trace_dir: Option<PathBuf>,
+        /// Where rustunes keeps per-device records (default: XDG_STATE_HOME/rustunes).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -773,6 +804,7 @@ fn run_state(command: &Command) -> Option<PathBuf> {
         | Command::Push { state_dir, .. }
         | Command::Pull { state_dir, .. }
         | Command::Apply { state_dir, .. }
+        | Command::Init { state_dir, .. }
         | Command::Metadata {
             action: MetadataCommand::Set { state_dir, .. },
         } => state_dir.clone(),
@@ -853,8 +885,9 @@ fn reaches_phone(command: &Command) -> bool {
             | Command::Delete { .. }
             | Command::Clear { .. }
             | Command::Device {
-                view: DeviceCommand::Info { .. },
+                view: DeviceCommand::Info { .. } | DeviceCommand::Check { .. },
             }
+            | Command::Init { .. }
             | Command::Resume { .. }
             | Command::Sync { .. }
             | Command::Push { .. }
@@ -1004,6 +1037,53 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
             )
             .await
             .context("timed out reading paired device information")??;
+        }
+        Command::Device {
+            view:
+                DeviceCommand::Check {
+                    json,
+                    trace_dir,
+                    state_dir,
+                },
+        } => {
+            let state = state_dir.map(Ok).unwrap_or_else(default_state_directory)?;
+            let (trace, keep) = match trace_dir {
+                Some(trace) => (trace, true),
+                None => (
+                    std::env::temp_dir().join(format!(
+                        "rustunes-device-check-{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_nanos()
+                    )),
+                    false,
+                ),
+            };
+            let report = engine.check_device(&state, &trace).await;
+            if !keep {
+                let _ = std::fs::remove_dir_all(&trace);
+            }
+            init_view::check(&report?, json)?;
+        }
+        Command::Init {
+            yes,
+            dry_run,
+            state_dir,
+            host_name,
+            seconds,
+        } => {
+            let state = state_dir.map(Ok).unwrap_or_else(default_state_directory)?;
+            let request = engine::InitRequest {
+                state: &state,
+                host_name: &host_name,
+                dry_run,
+                seconds,
+            };
+            let outcome = engine
+                .init(request, &mut |plan| init_view::confirm(plan, yes))
+                .await?;
+            init_view::outcome(&outcome)?;
         }
         Command::Resume {
             snapshot,

@@ -364,6 +364,40 @@ fn keep(capture: &CaptureDirectory, untested: Option<i64>, nested: bool) -> Resu
     Ok(())
 }
 
+/// The sync state of the phone's database, copied with the same stability
+/// checks as a catalogue into `trace` (a new private directory). None when
+/// the phone has no database, which it creates at its first sync session.
+/// Unlike the catalogue, a database no computer has synced is read too.
+pub(crate) async fn library_state(
+    provider: &DeviceProvider,
+    trace: &Path,
+    deadline: Instant,
+) -> Result<Option<music_protocol::catalogue::sqlite::LibraryState>> {
+    DirBuilder::new().mode(0o700).create(trace)?;
+    let mut afc = timeout_at(
+        deadline.min(Instant::now() + Duration::from_secs(20)),
+        music_protocol::protocol::afc::connect_checked(provider),
+    )
+    .await
+    .context("database AFC connection deadline")??;
+    if afc_stat::attributes(&mut afc, &remote(FILES[0]), deadline, None, "stat database")
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let snapshot = capture_client(afc, trace, deadline, None).await?;
+    let scratch = CaptureDirectory::create(None)?;
+    let path = std::fs::canonicalize(&scratch.path)?;
+    let result = music_protocol::catalogue::sqlite::read_library_state(
+        &snapshot.database,
+        snapshot.wal.as_deref(),
+        &path,
+    );
+    std::fs::remove_dir(&path).context("remove empty private database analysis directory")?;
+    result.map(Some)
+}
+
 #[cfg(test)]
 pub(crate) fn parse_copied_snapshot(
     database: &Path,
