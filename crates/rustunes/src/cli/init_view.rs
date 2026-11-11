@@ -42,6 +42,12 @@ pub(super) fn confirm(plan: &InitPlan, yes: bool) -> Result<bool> {
     ))
 }
 
+/// What to run once the phone is initialised. A first sync needs no
+/// `rustunes pull`: it starts the journal of a phone init prepared that
+/// holds no track.
+const NEXT: &str = "Next, run rustunes sync --dry-run to see what the first sync sends, then \
+                    rustunes sync (or rustunes push PATH to send chosen files).";
+
 pub(super) fn outcome(outcome: &InitOutcome) -> Result<()> {
     let (line, plan) = match outcome {
         InitOutcome::Planned(plan) => (
@@ -51,14 +57,12 @@ pub(super) fn outcome(outcome: &InitOutcome) -> Result<()> {
             ),
             Some(plan),
         ),
-        InitOutcome::AlreadyInitialised { .. } => (
-            "This iPhone is already initialised; sync it with rustunes sync or rustunes push."
-                .to_owned(),
-            None,
-        ),
+        InitOutcome::AlreadyInitialised { .. } => {
+            (format!("This iPhone is already initialised. {NEXT}"), None)
+        }
         InitOutcome::Initialised { plan, playlist } => (
             format!(
-                "Initialised \"{}\": it now holds rustunes' library and syncs with rustunes sync or rustunes push.{}",
+                "Initialised \"{}\": it now holds rustunes' library.{} {NEXT}",
                 plan.device_name,
                 if *playlist {
                     ""

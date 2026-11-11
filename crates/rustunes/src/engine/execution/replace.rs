@@ -32,7 +32,9 @@ use std::{
 
 use crate::{
     engine::execution::device,
+    engine::execution::run_journal::{Ask, Captured, RunJournal},
     engine::planning::source_collection::SelectionOptions,
+    engine::state::audio_index::Absent,
     engine::state::journal::{CoordinationId, CoordinationKind, Identity, Journal},
     engine::state::layout,
     engine::state::snapshot,
@@ -43,7 +45,6 @@ use crate::{
         planning::change::MAX_BATCH,
     },
 };
-use music_protocol::catalogue::identity;
 use music_protocol::protocol::trace::private_write;
 
 /// A coordination begins in phase 0, removing the selected tracks. Phase 1:
@@ -206,25 +207,33 @@ pub(crate) async fn run(
     }
     let run = layout::new_run(r.state)?;
     engine.emit(Event::RunEvidence(&run))?;
-    let saved = capture(engine, &run.join("snapshot"), r.seconds).await?;
-    let identity = Identity::for_saved_device(
-        saved.identity.device_identifier_sha256,
-        &identity::parse(&saved.raw_preferences)?,
-    )?;
-    let journal_path = match r.journal {
-        Some(path) => std::path::absolute(path)?,
-        None => {
-            crate::engine::execution::pull::current_journal(
-                r.state,
-                &saved,
-                Some(&source),
-                r.selection.recursive,
-                &run,
-                &engine.control(r.seconds),
-            )
-            .await?
-        }
-    };
+    engine.emit(Event::ReadingDeviceSnapshot)?;
+    let captured = Captured::take(
+        run.join("snapshot"),
+        Absent::NONE,
+        &engine.control(r.seconds),
+    )
+    .await?;
+    let resolved = RunJournal::resolve(
+        Ask {
+            state: r.state,
+            run: &run,
+            explicit: r.journal,
+            dry_run: r.dry_run,
+            library: Some(&source),
+            recursive: r.selection.recursive,
+        },
+        &captured.snapshot,
+        captured.taken,
+        &engine.control(r.seconds),
+    )
+    .await?;
+    let Captured {
+        snapshot: saved,
+        identity,
+        ..
+    } = captured;
+    let journal_path = resolved.path().to_path_buf();
     let active = if journal_path.join("journal.sqlite").try_exists()? {
         let journal = Journal::open_read_only(&journal_path, &identity)?;
         journal.active_coordination()?
@@ -359,10 +368,7 @@ pub(crate) async fn run(
     let id = match continuing {
         Some(id) => id,
         None => {
-            if !journal_path.join("journal.sqlite").try_exists()? {
-                drop(Journal::create(&journal_path, &identity)?);
-            }
-            let mut journal = Journal::open(&journal_path, &identity)?;
+            let mut journal = resolved.writable(&identity)?;
             journal.begin_coordination(
                 r.kind.coordination(),
                 &serde_json::to_vec(&intent)?,

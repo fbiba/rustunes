@@ -15,4 +15,5 @@ pub(crate) mod native_insert;
 pub(crate) mod pull;
 pub(crate) mod removal_batch;
 pub(crate) mod replace;
+pub(crate) mod run_journal;
 pub(crate) mod sync;

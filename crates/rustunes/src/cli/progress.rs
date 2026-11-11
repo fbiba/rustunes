@@ -161,6 +161,7 @@ pub(super) fn line(event: &Event<'_>) -> Result<Option<String>> {
         Event::JournalCarried {
             earlier,
             journal,
+            installed,
             carried,
             matched,
             unbound,
@@ -169,10 +170,20 @@ pub(super) fn line(event: &Event<'_>) -> Result<Option<String>> {
             covers_unproven,
             unfinished,
         } => {
-            let mut text = format!(
-                "Carried the journal forward from {}: {carried} tracks carried, {matched} matched to library files, {unbound} left unbound, {gone} no longer on the phone",
-                earlier.display()
+            let counts = format!(
+                "{carried} tracks carried, {matched} matched to library files, {unbound} left unbound, {gone} no longer on the phone"
             );
+            let mut text = if *installed {
+                format!(
+                    "Carried the journal forward from {}: {counts}",
+                    earlier.display()
+                )
+            } else {
+                format!(
+                    "Planned against the journal carried forward from {} into the run directory: {counts}; the real run installs it",
+                    earlier.display()
+                )
+            };
             if let Some(covers) = super::pull::covers_text(*covers_proven, *covers_unproven) {
                 text.push('\n');
                 text.push_str(&covers);
@@ -185,6 +196,14 @@ pub(super) fn line(event: &Event<'_>) -> Result<Option<String>> {
             }
             text.push_str(&format!("\nJournal: {}", journal.display()));
             text
+        }
+        Event::JournalStarted { journal, installed } => {
+            let text = if *installed {
+                "Started this phone's journal: rustunes init prepared it and it holds no track"
+            } else {
+                "Planned against a new journal in the run directory: rustunes init prepared this phone and it holds no track; the real run starts the phone's journal"
+            };
+            format!("{text}\nJournal: {}", journal.display())
         }
         Event::PullingTrack { number, title, .. } => {
             format!("Copying phone track {number}: {title}")

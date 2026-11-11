@@ -360,8 +360,17 @@ DESIGN, CONFIRMED on the phone.
   that names `pull`. It is never converted in place.
 - **What carries it.** `pull` builds a new journal from a fresh capture of the
   phone. `sync`, `push`, `delete`, `metadata set` and the replacements do the
-  same on their own before their work, and report what they carried. `verify`,
-  `resume` and `status` name `pull` when they meet a superseded journal.
+  same on their own before their work, and report what they carried. They
+  carry only from a capture they took: given a saved snapshot (`--snapshot`),
+  which may predate tracks the phone holds now, they refuse, name `pull` and
+  change nothing. Their dry runs carry into the run directory and plan against
+  that journal, as `pull --dry-run` does; the journal in use stays as it is.
+  A mirroring `sync` carries (or starts, below) once, in its removal, and its
+  additions plan against the journal the removal used, so its dry run writes
+  one journal into the removal's run directory and reads the phone's covers
+  once (section 4.5).
+  `verify`, `resume` and `status` name `pull` when they meet a superseded
+  journal.
 - **What is carried.** Each track the earlier journal bound and the capture
   still shows keeps its cover record, source path and FLAC conversion.
   A recorded source path that no longer exists gives way to the FLAC the track
@@ -390,8 +399,8 @@ DESIGN, CONFIRMED on the phone.
   most.
 - **Installation.** The new journal is built beside the one in use, reopened,
   and renamed into place. The one it replaces stays as `journal.previous`.
-  `pull --dry-run` writes the pulled journal into its run directory and leaves
-  the one in use.
+  `pull --dry-run`, and every dry run that carries, writes the new journal
+  into its run directory and leaves the one in use.
 - **The caches survive too.** The fingerprint and source caches recompute
   every audio identity they reuse from its stored components, and the
   fingerprint and cover proof caches key a phone's files by the SHA-256 of its
@@ -665,6 +674,12 @@ leaves. One pushed from elsewhere stays through every `sync`.
   removal batches of `--batch-size` (499 by default), the last of which, if it
   is not full, goes with the sync's first new tracks in one session (section
   5.1). Running `sync` again settles an unfinished batch or session first.
+- The removal also settles which journal the run uses (section 3.5): it
+  carries a superseded journal forward, or starts the journal of a phone
+  `init` prepared, and the sync after it uses the journal the removal used,
+  as if `--journal` had named it. A dry run therefore carries or starts the
+  journal once, into the removal's run directory, and previews the sync
+  against that journal; the phone's journal stays as it is.
 
 On the phone: with a covered ALAC, an MP3 and a singly inserted test tone
 deleted and another covered tone moved to a subdirectory, the preview selected
@@ -753,7 +768,8 @@ DESIGN.
   nowhere else. A conservative miss costs a re-add. A wrong delete costs the
   track.
 - A pull is the one way to take tracks over: `pull` itself, or the carry that a
-  command runs when it meets a superseded journal. It binds a phone track only
+  command runs when it meets a superseded journal (a dry run's carry only goes
+  into its run directory). It binds a phone track only
   when exactly one library file holds its encoded audio (an MP3 byte for byte).
   That is not a guess: the audio the phone plays is the audio of the file the
   tool will manage. From then on `sync` may update and remove the track like
@@ -1914,7 +1930,8 @@ its details.
 | `catalogue_capture_retained`, `state_capture_retained` | info | `path`; a catalogue captured inside a state capture is not announced on its own, as the `state_capture_retained` names where the whole capture is kept |
 | `audio_index_retained` | info | `tracks`, `bytes` |
 | `artwork_proofs_reused` | info | `reused`, `total` |
-| `journal_carried` | info | `earlier`, `journal`, `carried`, `matched`, `unbound`, `gone`, `unfinished` |
+| `journal_carried` | info | `earlier`, `journal`, `installed` (false on a dry run, whose `journal` is in its run directory), `carried`, `matched`, `unbound`, `gone`, `covers_proven`, `covers_unproven`, `unfinished` |
+| `journal_started` | info | `journal`, `installed` (false on a dry run, whose `journal` is in its run directory): with none to carry, the journal of a phone `init` prepared that holds no track was started, binding nothing (section 3.5) |
 | `updates_scheduled` | info | `tracks`, `sessions` |
 | `sync_continuing` | info | `remaining`: actions a fresh sync runs one per session |
 | `converting_flacs` | info | `directory` |

@@ -1193,10 +1193,10 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                     &mut |selection| deletion::confirm_mirror(selection, yes),
                 )
                 .await?;
-            let removal_ready = removal.ready();
+            let removal_ready = removal.outcome.ready();
             // Held removals wait for an unreadable source; the rest goes on.
-            let held = matches!(removal, engine::DeletionOutcome::Held { .. });
-            let left = match &removal {
+            let held = matches!(removal.outcome, engine::DeletionOutcome::Held { .. });
+            let left = match &removal.outcome {
                 engine::DeletionOutcome::Completed { left, .. } => left.clone(),
                 _ => Vec::new(),
             };
@@ -1211,12 +1211,15 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                 )?;
                 return Ok(ExitCode::from(3));
             }
+            // The sync plans against the journal the removal used: the
+            // removal carried it forward or started it, if that was needed,
+            // and on a dry run it is in the removal's run directory.
             let result = engine
                 .sync(engine::SyncRequest {
                     source: &library,
                     state: &state,
                     snapshot: None,
-                    journal: journal.as_deref(),
+                    journal: Some(journal.as_deref().unwrap_or(&removal.journal)),
                     selection: &selection,
                     host_name: &host_name,
                     dry_run,
@@ -2589,5 +2592,6 @@ async fn remove(
             deletion::confirm_selection(selection, yes)
         })
         .await?
+        .outcome
         .ready())
 }

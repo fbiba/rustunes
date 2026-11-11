@@ -9,15 +9,15 @@ use anyhow::{Context, Result, ensure};
 use crate::{
     engine::execution::apply,
     engine::execution::cover,
-    engine::execution::device,
+    engine::execution::run_journal::{Ask, Captured, RunJournal},
     engine::planning::additive::{ArtworkDecision, Decision},
     engine::planning::saved_plan,
     engine::planning::source_collection::SelectionOptions,
     engine::planning::source_collection::mp3::preparation::PreparedSource,
+    engine::state::audio_index::Absent,
     engine::state::journal::{CoordinationId, Identity, Journal},
     engine::state::layout,
     engine::state::snapshot,
-    engine::verification::audio_capture,
     engine::{
         Engine, Event, Hold, PlanRequest, SkipStage, Skipped, SyncHolds, SyncOutcome, SyncResult,
         execution::{insert_batch, metadata_batch},
@@ -157,52 +157,49 @@ pub(crate) async fn run_with(
         (!options.dry_run && coordination.is_none()) || options.removals.is_empty(),
         "only a sync that sends removes the tracks a removal left it"
     );
+    // A replacement carried its journal forward before it began, and names it.
+    ensure!(
+        coordination.is_none() || options.journal.is_some(),
+        "a replacement's sync is given the replacement's journal"
+    );
     // Invalid local selection must fail before expensive device work.
     crate::engine::planning::source_collection::select(options.source, options.selection)?;
     let run = layout::new_run(options.state)?;
     engine.emit(Event::RunEvidence(&run))?;
-    let snapshot_path = match options.snapshot {
-        Some(path) => std::fs::canonicalize(path).context("opening supplied snapshot")?,
+    let captured = match options.snapshot {
+        Some(path) => Captured::saved(path, Absent::NONE)?,
         None => {
-            let path = run.join("snapshot");
             engine.emit(Event::ReadingDeviceSnapshot)?;
-            let control = engine.control(options.seconds);
-            control.check()?;
-            Box::pin(audio_capture::capture_with_control(
-                &path,
-                &control,
-                device::provider,
-            ))
-            .await?;
-            path
-        }
-    };
-    let saved = snapshot::open(&snapshot_path)?;
-    let journal = match options.journal {
-        Some(path) => std::path::absolute(path)?,
-        // A replacement carried its journal forward before it began.
-        None if coordination.is_none() => {
-            crate::engine::execution::pull::current_journal(
-                options.state,
-                &saved,
-                options.library,
-                options.selection.recursive,
-                &run,
+            Captured::take(
+                run.join("snapshot"),
+                Absent::NONE,
                 &engine.control(options.seconds),
             )
             .await?
         }
-        None => layout::journal_path(
-            options.state,
-            &saved.identity.device_identifier_sha256,
-            &saved.identity.library_identity_sha256,
-        )?,
     };
-    if coordination.is_none() && journal.try_exists()? {
-        let identity = Identity::for_saved_device(
-            saved.identity.device_identifier_sha256,
-            &music_protocol::catalogue::identity::parse(&saved.raw_preferences)?,
-        )?;
+    let resolved = RunJournal::resolve(
+        Ask {
+            state: options.state,
+            run: &run,
+            explicit: options.journal,
+            dry_run: options.dry_run,
+            library: options.library,
+            recursive: options.selection.recursive,
+        },
+        &captured.snapshot,
+        captured.taken,
+        &engine.control(options.seconds),
+    )
+    .await?;
+    let Captured {
+        path: snapshot_path,
+        snapshot: saved,
+        identity,
+        ..
+    } = captured;
+    let journal = resolved.path().to_path_buf();
+    if coordination.is_none() && resolved.exists()? {
         crate::engine::execution::replace::ensure_no_unfinished_attempt(
             &journal,
             &identity,

@@ -23,6 +23,7 @@ use music_protocol::catalogue::metadata_edit::{self, Envelope, TrackUpdate};
 use crate::{
     engine::execution::device,
     engine::execution::native_insert::{Control, create_trace, durable_write, sync_trace},
+    engine::execution::run_journal::{Ask, RunJournal, Taken},
     engine::planning::source_collection::mp3::preparation::PreparedSource,
     engine::recovery::retained::playback::{Window, between_runs},
     engine::state::journal::{
@@ -415,25 +416,26 @@ pub(crate) async fn set(
     let control = control();
     let (identity, before) =
         removal_batch::capture_fresh(&directory.join("edit"), &control).await?;
-    let journal_path = match o.journal {
-        Some(path) => std::path::absolute(path)?,
-        None => {
-            crate::engine::execution::pull::current_journal(
-                o.state,
-                &before.snapshot,
-                None,
-                false,
-                &directory,
-                &control,
-            )
-            .await?
-        }
-    };
+    let resolved = RunJournal::resolve(
+        Ask {
+            state: o.state,
+            run: &directory,
+            explicit: o.journal,
+            dry_run: o.dry_run,
+            library: None,
+            recursive: false,
+        },
+        &before.snapshot,
+        // A saved snapshot returned above.
+        Taken::ByThisRun,
+        &control,
+    )
+    .await?;
     // Unfinished work stops a dry run too, before planning, naming the
     // `resume` that settles it.
-    if journal_path.try_exists()? {
+    if resolved.exists()? {
         crate::engine::execution::replace::ensure_no_unfinished_attempt(
-            &journal_path,
+            resolved.path(),
             &identity,
             o.state,
             &directory.join("edit").join("snapshot"),
@@ -448,11 +450,7 @@ pub(crate) async fn set(
     if !confirm(planned.updates.len())? {
         return Ok(SetOutcome::Cancelled);
     }
-    let mut journal = if journal_path.join("journal.sqlite").try_exists()? {
-        Journal::open(&journal_path, &identity)?
-    } else {
-        Journal::create(&journal_path, &identity)?
-    };
+    let mut journal = resolved.writable(&identity)?;
     let settled = run(
         &mut journal,
         &identity,

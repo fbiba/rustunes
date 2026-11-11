@@ -202,7 +202,9 @@ To try completion in the current shell without installing it, run
 
 Install the new version over the old binary, using any method above. The first
 `sync`, `push` or `pull` carries rustunes' records of what is on the phone
-forward, even when the new version stores them differently.
+forward, even when the new version stores them differently. A dry run only
+previews that and leaves the records as they are, and a command given
+`--snapshot` asks you to run `pull` first.
 
 ### Uninstalling
 
@@ -403,7 +405,7 @@ Tracks already on the phone keep their audio and tags, and nothing is removed.
 | `--include PATH`, `--exclude PATH` | Choose files within the folder. Repeatable. |
 | `--flac-to-alac` | Send each new FLAC as ALAC, as for `sync`. |
 | `--batch-size N` | See [shared options](#options-shared-by-many-commands). |
-| `--snapshot DIR` | Plan from a saved snapshot; the phone's current state is still checked before anything is sent. |
+| `--snapshot DIR` | Plan from a saved snapshot; the phone's current state is still checked before anything is sent. Refused when rustunes' records must first be carried forward (run `pull`). |
 | `--seconds N` | Time limit for reading the phone's library. |
 | `--host-name NAME`, `--state-dir DIR` | See [shared options](#options-shared-by-many-commands). |
 | `--journal DIR` | Use a journal created by `apply` instead of the automatic one. |
@@ -461,7 +463,7 @@ All three take these options:
 | `--json` | Print one JSON event per line on stdout; progress stays on stderr. |
 | `--batch-size N` | Tracks removed per session (default 499). |
 | `--seconds N` | Time limit for each verification pass. |
-| `--snapshot DIR` | Plan from a saved snapshot; the phone's current state is checked again before removing. |
+| `--snapshot DIR` | Plan from a saved snapshot; the phone's current state is checked again before removing. Refused when rustunes' records must first be carried forward (run `pull`). |
 | `--journal DIR`, `--state-dir DIR`, `--host-name NAME` | See [shared options](#options-shared-by-many-commands). |
 | `--recursive` | `prune` only: read the folder's subfolders too. |
 

@@ -22,7 +22,8 @@ pub(crate) mod verification;
 pub use crate::engine::execution::cover::Options as CoverRequest;
 pub use crate::engine::execution::delete::{
     Confirmation as DeletionConfirmation, Event as DeletionEvent, Mode as DeletionMode,
-    Options as DeletionRequest, Outcome as DeletionOutcome, ParseTrackIdError, TrackId,
+    Options as DeletionRequest, Outcome as DeletionOutcome, ParseTrackIdError,
+    Report as DeletionResult, TrackId,
 };
 pub use crate::engine::execution::device::{Config as DeviceConfig, Event as DeviceEvent};
 pub use crate::engine::execution::sync::Options as SyncRequest;
@@ -125,7 +126,7 @@ impl Engine {
         request: DeletionRequest,
         mode: DeletionMode,
         confirm: &mut impl FnMut(DeletionConfirmation<'_>) -> Result<bool>,
-    ) -> Result<DeletionOutcome> {
+    ) -> Result<DeletionResult> {
         self.check()?;
         self.scope(Box::pin(crate::engine::execution::delete::run(
             request,

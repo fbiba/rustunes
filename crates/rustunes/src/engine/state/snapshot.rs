@@ -27,6 +27,17 @@ pub struct Snapshot {
     pub plist_preferences: Vec<u8>,
 }
 
+impl Snapshot {
+    /// The identity of the journal for the phone and library this capture
+    /// shows.
+    pub(crate) fn journal_identity(&self) -> Result<crate::engine::state::journal::Identity> {
+        crate::engine::state::journal::Identity::for_saved_device(
+            self.identity.device_identifier_sha256,
+            &identity::parse(&self.raw_preferences)?,
+        )
+    }
+}
+
 pub fn open(directory: &Path) -> Result<Snapshot> {
     open_inner(directory, None, Absent::NONE)
 }

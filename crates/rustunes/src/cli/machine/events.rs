@@ -316,6 +316,7 @@ pub(crate) fn event(event: &Event<'_>) -> Result<()> {
         Event::JournalCarried {
             earlier,
             journal,
+            installed,
             carried,
             matched,
             unbound,
@@ -330,6 +331,7 @@ pub(crate) fn event(event: &Event<'_>) -> Result<()> {
             json!({
                 "earlier": path(earlier),
                 "journal": path(journal),
+                "installed": installed,
                 "carried": carried,
                 "matched": matched,
                 "unbound": unbound,
@@ -337,6 +339,15 @@ pub(crate) fn event(event: &Event<'_>) -> Result<()> {
                 "covers_proven": covers_proven,
                 "covers_unproven": covers_unproven,
                 "unfinished": unfinished,
+            }),
+        ),
+        Event::JournalStarted { journal, installed } => notice(
+            "journal_started",
+            Info,
+            line()?,
+            json!({
+                "journal": path(journal),
+                "installed": installed,
             }),
         ),
         Event::PullingTrack {

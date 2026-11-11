@@ -132,6 +132,9 @@ pub enum Event<'a> {
     JournalCarried {
         earlier: &'a Path,
         journal: &'a Path,
+        /// False on a dry run: `journal` is in its run directory and the
+        /// journal in use stays as it is.
+        installed: bool,
         carried: usize,
         matched: usize,
         unbound: usize,
@@ -143,6 +146,15 @@ pub enum Event<'a> {
         /// Work the earlier journal left unfinished, which this build
         /// cannot resume.
         unfinished: &'a [String],
+    },
+    /// With no journal and none to carry forward, the journal of a phone
+    /// `rustunes init` prepared that holds no track was started from a fresh
+    /// capture, as a pull would write it: it binds nothing.
+    JournalStarted {
+        journal: &'a Path,
+        /// False on a dry run: `journal` is in its run directory and the
+        /// phone's journal is still absent.
+        installed: bool,
     },
     /// `pull --tracks` is copying phone track `number` of `total`, `bytes`
     /// long, after `bytes_done` of all `bytes_total`.

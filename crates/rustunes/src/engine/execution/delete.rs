@@ -22,6 +22,7 @@ use serde_json::json;
 
 use crate::{
     engine::execution::device,
+    engine::execution::run_journal::{Ask, Captured, RunJournal, Taken},
     engine::planning::additive::JournalEvidence,
     engine::planning::removal::{self, Decision, Origin, Request},
     engine::planning::source_collection::{self, Selection, SelectionOptions, SourceCollection},
@@ -168,6 +169,17 @@ impl Outcome {
     }
 }
 
+/// What a removal did, and the journal it used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    pub outcome: Outcome,
+    /// The journal `--journal` named, or the phone's as the removal found,
+    /// carried forward or started it, or the path where it is absent. A dry
+    /// run that carried or started one planned against it in its run
+    /// directory. A mirroring `sync` plans its additions against it.
+    pub journal: PathBuf,
+}
+
 /// A confirmation is requested only for an immutable, fully supported selection.
 /// It never substitutes for per-operation qualification or a Started permit.
 pub struct Confirmation<'a> {
@@ -218,6 +230,23 @@ pub async fn run(
     selected_device: Option<&str>,
     engine: &crate::engine::Engine,
     confirm: &mut impl FnMut(Confirmation<'_>) -> Result<bool>,
+) -> Result<Report> {
+    let mut chosen = None;
+    let outcome = remove(o, mode, selected_device, engine, confirm, &mut chosen).await?;
+    Ok(Report {
+        outcome,
+        journal: chosen.context("a removal reached an outcome before choosing its journal")?,
+    })
+}
+
+/// `run`, which names in `chosen` the journal it uses once it has chosen it.
+async fn remove(
+    o: Options,
+    mode: Mode,
+    selected_device: Option<&str>,
+    engine: &crate::engine::Engine,
+    confirm: &mut impl FnMut(Confirmation<'_>) -> Result<bool>,
+    chosen: &mut Option<PathBuf>,
 ) -> Result<Outcome> {
     engine.check()?;
     ensure!(
@@ -277,35 +306,37 @@ pub async fn run(
         any_unfilled: true,
         ..absent
     };
-    let fresh = o.snapshot.is_none();
-    let snapshot_path = if let Some(path) = o.snapshot {
-        std::fs::canonicalize(path)?
-    } else {
-        let path = run.join("snapshot");
-        audio_capture::capture_allowing(&path, first, &engine.control(o.seconds), device::provider)
-            .await?;
-        path
+    let captured = match &o.snapshot {
+        Some(path) => Captured::saved(path, first)?,
+        None => Captured::take(run.join("snapshot"), first, &engine.control(o.seconds)).await?,
     };
-    let mut saved = snapshot::open_allowing(&snapshot_path, first)?;
-    let library = music_protocol::catalogue::identity::parse(&saved.raw_preferences)?;
-    let identity = Identity::for_saved_device(saved.identity.device_identifier_sha256, &library)?;
-    ensure_selected_device(selected_device, &library, &identity)?;
-    let journal_path = match o.journal {
-        Some(path) => std::path::absolute(path)?,
-        None => {
-            crate::engine::execution::pull::current_journal(
-                &state,
-                &saved,
-                missing_selection.as_ref().map(|s| s.root()),
-                missing_selection
-                    .as_ref()
-                    .is_some_and(|s| s.options().recursive),
-                &run,
-                &engine.control(o.seconds),
-            )
-            .await?
-        }
-    };
+    let fresh = captured.taken == Taken::ByThisRun;
+    let library = music_protocol::catalogue::identity::parse(&captured.snapshot.raw_preferences)?;
+    ensure_selected_device(selected_device, &library, &captured.identity)?;
+    let resolved = RunJournal::resolve(
+        Ask {
+            state: &state,
+            run: &run,
+            explicit: o.journal.as_deref(),
+            dry_run: o.dry_run,
+            library: missing_selection.as_ref().map(|s| s.root()),
+            recursive: missing_selection
+                .as_ref()
+                .is_some_and(|s| s.options().recursive),
+        },
+        &captured.snapshot,
+        captured.taken,
+        &engine.control(o.seconds),
+    )
+    .await?;
+    let Captured {
+        path: snapshot_path,
+        snapshot: mut saved,
+        identity,
+        ..
+    } = captured;
+    let journal_path = resolved.path().to_path_buf();
+    *chosen = Some(journal_path.clone());
     removal_batch::only_taken(&saved, &removal_batch::taken(&journal_path, &identity)?)?;
     only_unfinished(saved.index.unfilled(), &journal_path, &identity)?;
     // A batch an earlier run left unfinished (interrupted, or its observation
@@ -599,7 +630,7 @@ pub async fn run(
     } else {
         // Explicit deletion may record an unowned target.
         // Prune has already refused a missing journal in the planning layer.
-        drop(Journal::create(&journal_path, &identity)?);
+        drop(resolved.writable(&identity)?);
     }
     // A source put back since the selection keeps its track.
     for row in plan

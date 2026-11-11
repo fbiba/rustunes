@@ -177,7 +177,8 @@ pub(crate) async fn run(
                 engine,
                 &mut |_| Ok(true),
             )
-            .await?;
+            .await?
+            .outcome;
             let (removed, left) = match outcome {
                 delete::Outcome::Completed { removed, left, .. } => (removed, left),
                 delete::Outcome::Preview => (0, Vec::new()),

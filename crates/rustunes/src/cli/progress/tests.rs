@@ -108,3 +108,28 @@ fn an_untested_catalogue_version_names_it_and_the_tested_ones() {
         "The phone's Music database is version 2420000, which rustunes has not been tested with (tested: 2400060, 2410000); every table and column it reads is present"
     );
 }
+
+/// Starting an init-prepared phone's journal shows a line, which says where
+/// the journal is and, on a dry run, that the real run starts it.
+#[test]
+fn starting_a_journal_says_whether_the_real_run_still_starts_it() {
+    let line = |journal: &str, installed| {
+        super::line(&Event::JournalStarted {
+            journal: Path::new(journal),
+            installed,
+        })
+        .unwrap()
+        .unwrap()
+    };
+    assert_eq!(
+        line("/state/devices/d/l/journal", true),
+        "Started this phone's journal: rustunes init prepared it and it holds no track\nJournal: /state/devices/d/l/journal"
+    );
+    let dry = line("/state/runs/1/journal", false);
+    assert!(
+        dry.starts_with("Planned against a new journal in the run directory")
+            && dry.contains("the real run starts the phone's journal")
+            && dry.ends_with("\nJournal: /state/runs/1/journal"),
+        "{dry}"
+    );
+}

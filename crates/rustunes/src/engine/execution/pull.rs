@@ -11,7 +11,10 @@
 //! as `journal.previous`. A pull sends nothing to the phone. `sync` and `push`
 //! pull first, without being asked, when the journal is superseded or when
 //! only an earlier journal at another location (other identity digests) knows
-//! the phone's tracks: a new version keeps the library it finds.
+//! the phone's tracks: a new version keeps the library it finds. Which journal
+//! a run uses, and when it is carried, is `run_journal`'s; this module finds
+//! the earlier journal (`find_earlier`), carries it (`carry`) and writes the
+//! journal that binds nothing (`write_unbound`).
 use std::{
     collections::{BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
@@ -29,6 +32,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     engine::execution::device,
     engine::execution::native_insert::Control,
+    engine::execution::run_journal::Captured,
     engine::planning::source_collection::{self, SelectionOptions, SourceCollection},
     engine::state::audio_index::OtherCodec,
     engine::state::current,
@@ -36,7 +40,6 @@ use crate::{
     engine::state::layout,
     engine::state::snapshot,
     engine::verification::artwork::{self, TrackArtworkExpectation, TrackCheck},
-    engine::verification::audio_capture,
 };
 use music_protocol::media::fingerprint::TransferredSource;
 use music_protocol::protocol::afc::copy;
@@ -141,20 +144,20 @@ pub(crate) async fn run(request: Request<'_>, engine: &crate::engine::Engine) ->
     let run = layout::new_run(request.state)?;
     engine.emit(crate::engine::Event::RunEvidence(&run))?;
     engine.emit(crate::engine::Event::ReadingDeviceSnapshot)?;
-    let path = run.join("snapshot");
     let absent = crate::engine::state::audio_index::Absent {
         gone: true,
         ..crate::engine::state::audio_index::Absent::NONE
     };
-    audio_capture::capture_allowing(
-        &path,
+    let Captured {
+        snapshot: saved,
+        identity,
+        ..
+    } = Captured::take(
+        run.join("snapshot"),
         absent,
         &engine.control(request.seconds),
-        device::provider,
     )
     .await?;
-    let saved = snapshot::open_allowing(&path, absent)?;
-    let identity = identity(&saved)?;
     let journal = layout::journal_path(
         request.state,
         &saved.identity.device_identifier_sha256,
@@ -242,36 +245,55 @@ pub(crate) async fn run(request: Request<'_>, engine: &crate::engine::Engine) ->
     Ok(report)
 }
 
-/// The journal for this capture's phone and library, carried forward first
-/// when this build cannot use the one there (`Superseded`) or when there is
-/// none but an earlier journal elsewhere in `state` knows the phone's tracks.
-/// A current journal, or no journal and nothing to carry, is left alone.
-/// `library` is the directory phone tracks are matched to, with its
-/// subfolders when `recursive`. Progress goes to the engine scope's observer.
-pub(crate) async fn current_journal(
+/// What `carry` did, for its report.
+pub(crate) struct Carry {
+    /// The earlier journal it carried forward.
+    pub earlier: PathBuf,
+    pub carried: usize,
+    pub matched: usize,
+    pub unbound: usize,
+    pub gone: usize,
+    pub covers_proven: usize,
+    pub covers_unproven: usize,
+    /// Work the earlier journal left unfinished, which is not resumed.
+    pub unfinished: Vec<String>,
+}
+
+/// The earlier journal a carry for the phone and library `saved` shows
+/// starts from, as a pull finds it (`find_prior`): the one at `journal`,
+/// where that phone's journal belongs, or one elsewhere in `state` whose
+/// bindings the capture confirms. Its private copies go in `run`.
+pub(crate) fn find_earlier(
     state: &Path,
+    journal: &Path,
     saved: &snapshot::Snapshot,
+    run: &Path,
+) -> Result<Option<Found>> {
+    find_prior(
+        state,
+        journal,
+        &saved.journal_identity()?,
+        matcher(saved),
+        run,
+    )
+}
+
+/// Carry `found` forward as a pull without `--tracks` does: reconcile the
+/// capture with it and with the library at `library` (its subfolders too when
+/// `recursive`), read back the phone covers no record proves (traces in
+/// `run/covers`), and write the journal at `target`. A journal already there
+/// moves to `journal.previous`. Nothing is sent to the phone. Progress goes to
+/// the engine scope's observer.
+pub(crate) async fn carry(
+    saved: &snapshot::Snapshot,
+    found: Found,
     library: Option<&Path>,
     recursive: bool,
     run: &Path,
+    target: &Path,
     control: &Control,
-) -> Result<PathBuf> {
-    let identity = identity(saved)?;
-    let journal = layout::journal_path(
-        state,
-        &saved.identity.device_identifier_sha256,
-        &saved.identity.library_identity_sha256,
-    )?;
-    if journal.try_exists()? {
-        match Journal::open_read_only(&journal, &identity) {
-            Ok(_) => return Ok(journal),
-            Err(error) if crate::engine::state::journal::is_superseded(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    let Some(found) = find_prior(state, &journal, &identity, matcher(saved), run)? else {
-        return Ok(journal);
-    };
+) -> Result<Carry> {
+    let identity = saved.journal_identity()?;
     let options = SelectionOptions {
         recursive,
         ..Default::default()
@@ -282,25 +304,37 @@ pub(crate) async fn current_journal(
     let mut reconciled = reconcile_saved(saved, Some(&found.prior), library.as_ref());
     let covers = prove_covers(&mut reconciled, &identity, run, control).await?;
     write(
-        &journal,
+        target,
         &identity,
         receipt(saved),
         &reconciled.pulled,
         Some(&found.prior),
         false,
     )?;
-    crate::engine::observe(crate::engine::Event::JournalCarried {
-        earlier: &found.path,
-        journal: &journal,
+    Ok(Carry {
+        earlier: found.path,
         carried: reconciled.carried,
         matched: reconciled.matched,
         unbound: reconciled.unbound.len(),
         gone: reconciled.gone,
         covers_proven: covers.proven,
         covers_unproven: covers.unproven,
-        unfinished: &found.prior.unfinished,
-    })?;
-    Ok(journal)
+        unfinished: found.prior.unfinished,
+    })
+}
+
+/// Write at `target`, where no journal is, the journal a pull writes for a
+/// phone that holds no track a sync made and no earlier journal knows: it
+/// binds nothing and records the capture `saved`.
+pub(crate) fn write_unbound(target: &Path, saved: &snapshot::Snapshot) -> Result<()> {
+    write(
+        target,
+        &saved.journal_identity()?,
+        receipt(saved),
+        &[],
+        None,
+        false,
+    )
 }
 
 /// The capture a pull's bindings were verified against.
@@ -308,13 +342,6 @@ fn receipt(saved: &snapshot::Snapshot) -> (&[u8; 32], u32) {
     (
         &saved.index_receipt_sha256,
         saved.catalog.persisted_media_anchor(),
-    )
-}
-
-fn identity(saved: &snapshot::Snapshot) -> Result<Identity> {
-    Identity::for_saved_device(
-        saved.identity.device_identifier_sha256,
-        &music_protocol::catalogue::identity::parse(&saved.raw_preferences)?,
     )
 }
 
@@ -363,7 +390,8 @@ impl Library {
     }
 }
 
-struct Found {
+/// An earlier journal a pull carries forward.
+pub(crate) struct Found {
     path: PathBuf,
     superseded: bool,
     prior: Prior,
