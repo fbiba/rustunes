@@ -32,8 +32,16 @@ pub use crate::protocol::transfer::hex;
 pub const DB_CAP: u64 = super::MAX_DATABASE_BYTES;
 pub const WAL_CAP: u64 = super::MAX_WAL_BYTES;
 const ENCODED_CAP: usize = 64 << 20;
-/// `Snapshot::layout_hash` of the 45 tables observed on iOS 27.0.1 and 27.2.
+/// `Snapshot::layout_hash` of the 45 tables observed on iOS 27.0.1 and 27.2,
+/// in a database migrated from an older iOS.
 pub const LAYOUT_SHA256: &str = "282f0a1114d01c831e691f47b5071743f530936c81efb3d98c891992dfecdab3";
+/// `Snapshot::layout_hash` of the same 45 tables in a database iOS 27.2
+/// builds new (user_version 2410000; observed on a library the phone
+/// rebuilt): `item_state` has 52 of the 64 columns, most of them without a
+/// default, and `entity_revision.entity_pid` has the default 0 (docs/04,
+/// `item_state`).
+pub const BUILT_NEW_LAYOUT_SHA256: &str =
+    "c2b315ede376aa40cbad756979092addbd49299f327f28f3ae84bb7b475bb0b8";
 
 pub mod values;
 
@@ -172,6 +180,15 @@ impl Snapshot {
     /// full-table models were written against.
     pub fn layout_qualified(&self) -> Result<bool> {
         Ok(self.version >= super::USER_VERSION_FLOOR && self.layout_hash()? == LAYOUT_SHA256)
+    }
+    /// `layout_qualified`, or at or above the floor with the layout of a
+    /// database built new (`BUILT_NEW_LAYOUT_SHA256`). Enough for a check
+    /// that compares two captures of one database and builds no
+    /// `item_state` row.
+    pub fn layout_observed(&self) -> Result<bool> {
+        Ok(self.layout_qualified()?
+            || self.version >= super::USER_VERSION_FLOOR
+                && self.layout_hash()? == BUILT_NEW_LAYOUT_SHA256)
     }
 }
 #[derive(Clone)]
@@ -953,6 +970,43 @@ mod layout_tests {
         }
         for fixture in fixtures {
             fs::remove_dir_all(&fixture.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_database_built_new_has_its_own_observed_layout() {
+        let fixture = NativeFixture::built_new();
+        let built = snapshot(&fixture.before);
+        assert_eq!(built.version, 2_410_000);
+        assert_eq!(built.tables.len(), 45);
+        assert_eq!(built.table("item_state").unwrap().columns.len(), 52);
+        assert_eq!(built.layout_hash().unwrap(), BUILT_NEW_LAYOUT_SHA256);
+        assert!(!built.layout_qualified().unwrap());
+        assert!(built.layout_observed().unwrap());
+        let mut older = built.clone();
+        older.version = 2_400_059;
+        assert!(!older.layout_observed().unwrap());
+        fs::remove_dir_all(&fixture.dir).unwrap();
+
+        let migrated = NativeFixture::index_only_update();
+        let tested = snapshot(&migrated.before);
+        assert!(tested.layout_qualified().unwrap() && tested.layout_observed().unwrap());
+        assert_eq!(tested.table("item_state").unwrap().columns.len(), 64);
+        fs::remove_dir_all(&migrated.dir).unwrap();
+
+        for sql in [
+            "ALTER TABLE item_state ADD COLUMN is_supported_type INTEGER DEFAULT 1",
+            "ALTER TABLE album ADD COLUMN unmodelled TEXT",
+            "DROP TABLE lyrics",
+        ] {
+            let fixture = NativeFixture::built_new();
+            Connection::open(&fixture.before)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+            let changed = snapshot(&fixture.before);
+            fs::remove_dir_all(&fixture.dir).unwrap();
+            assert!(!changed.layout_observed().unwrap(), "{sql}");
         }
     }
 }

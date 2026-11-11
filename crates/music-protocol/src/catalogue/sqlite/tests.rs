@@ -433,6 +433,81 @@ fn schema_missing_columns_and_wrong_versions_fail() {
     }
 }
 
+/// A database iOS 27.2 builds new has the 52-column `item_state`, without
+/// `is_supported_type`; one migrated from an older iOS has it (docs/04).
+#[test]
+fn an_item_state_without_is_supported_type_reads_as_supported() {
+    for has_wal in [false, true] {
+        let fixture = Fixture::new(has_wal);
+        fixture.connection.execute_batch(STREAMED_ENTRY).unwrap();
+        let wide = fixture.read(has_wal).unwrap();
+        fixture
+            .connection
+            .execute_batch("PRAGMA user_version=2410000; ALTER TABLE item_state DROP COLUMN is_supported_type;")
+            .unwrap();
+        let narrow = fixture.read(has_wal).unwrap();
+        assert_eq!(narrow.user_version(), 2_410_000);
+        assert!(narrow.item_state_built_new() && !wide.item_state_built_new());
+        assert_eq!(narrow.tracks().len(), 1);
+        assert!(narrow.tracks()[0].availability.is_supported_type);
+        assert_eq!(narrow.tracks(), wide.tracks());
+        assert_eq!(narrow.unsynced_albums().len(), 1);
+        assert_eq!(narrow.music_paths().unwrap(), wide.music_paths().unwrap());
+    }
+    // Any of the 12 columns only the migration step adds, in any case, makes
+    // the table the migrated shape, which must have the column as spelled.
+    for sql in [
+        "ALTER TABLE item_state DROP COLUMN is_supported_type; ALTER TABLE item_state ADD COLUMN IS_SUPPORTED_TYPE INTEGER DEFAULT 1; UPDATE item_state SET IS_SUPPORTED_TYPE=0",
+        "ALTER TABLE item_state DROP COLUMN is_supported_type; ALTER TABLE item_state ADD COLUMN playable_category INTEGER DEFAULT 0",
+        "ALTER TABLE item_state DROP COLUMN is_supported_type; ALTER TABLE item_state ADD COLUMN Is_Library_Added_Container INTEGER DEFAULT 0",
+    ] {
+        let fixture = Fixture::new(false);
+        fixture.connection.execute_batch(sql).unwrap();
+        let error = format!("{:#}", fixture.read(false).err().unwrap());
+        assert!(
+            error.contains("required catalog column/type differs"),
+            "{sql}: {error}"
+        );
+    }
+    // Present, it is read as stored and must be declared INTEGER.
+    let fixture = Fixture::new(false);
+    fixture
+        .connection
+        .execute_batch("UPDATE item_state SET is_supported_type=0")
+        .unwrap();
+    assert!(
+        !fixture.read(false).unwrap().tracks()[0]
+            .availability
+            .is_supported_type
+    );
+    for sql in [
+        "ALTER TABLE item_state DROP COLUMN is_supported_type; ALTER TABLE item_state ADD COLUMN is_supported_type TEXT DEFAULT 1",
+        "UPDATE item_state SET is_supported_type=NULL",
+        "UPDATE item_state SET is_supported_type=2",
+    ] {
+        let fixture = Fixture::new(false);
+        fixture.connection.execute_batch(sql).unwrap();
+        assert!(fixture.read(false).is_err(), "{sql}");
+    }
+    // The other columns stay required.
+    for column in [
+        "is_placeholder",
+        "is_library_added",
+        "has_non_purgeable_asset",
+    ] {
+        let fixture = Fixture::new(false);
+        fixture
+            .connection
+            .execute_batch(&format!("ALTER TABLE item_state DROP COLUMN {column}"))
+            .unwrap();
+        let error = format!("{:#}", fixture.read(false).err().unwrap());
+        assert!(
+            error.contains("required catalog column"),
+            "{column}: {error}"
+        );
+    }
+}
+
 #[test]
 fn newer_version_with_the_read_tables_is_read_as_untested() {
     let fixture = Fixture::new(false);
@@ -604,6 +679,132 @@ fn an_entry_the_phone_added_with_a_file_or_shared_groups_refuses() {
         fixture.connection.execute_batch(STREAMED_ENTRY).unwrap();
         fixture.connection.execute_batch(sql).unwrap();
         assert!(fixture.read(false).is_err(), "{sql}");
+    }
+}
+
+const FLAGS: &str = "is_placeholder,is_library_added,has_non_purgeable_asset";
+const BUILT_NEW_SHAPE: &str = "ALTER TABLE item_state DROP COLUMN is_supported_type";
+const WRONG_STORAGE: &str = "catalog integer field has wrong storage type";
+
+/// In an item_state of the built-new shape, a flag declared without a default
+/// reads NULL as 0, on an entry the phone added and on a track.
+#[test]
+fn null_item_state_flags_read_as_zero_in_the_built_new_shape() {
+    let fixture = Fixture::new(false);
+    fixture.connection.execute_batch(STREAMED_ENTRY).unwrap();
+    fixture.connection.execute_batch(BUILT_NEW_SHAPE).unwrap();
+    let before = fixture.read(false).unwrap();
+    fixture
+        .connection
+        .execute_batch(&format!(
+            "UPDATE item_state SET ({FLAGS})=(NULL,NULL,NULL) WHERE item_pid=2"
+        ))
+        .unwrap();
+    let catalog = fixture.read(false).unwrap();
+    assert_eq!(catalog.tracks(), before.tracks());
+    assert_eq!(catalog.unsynced_albums().len(), 1);
+
+    fixture
+        .connection
+        .execute_batch(&format!(
+            "UPDATE item_state SET ({FLAGS})=(NULL,NULL,NULL) WHERE item_pid=1"
+        ))
+        .unwrap();
+    let availability = fixture.read(false).unwrap().tracks()[0]
+        .availability
+        .clone();
+    assert!(!availability.is_placeholder);
+    assert!(!availability.is_library_added);
+    assert!(!availability.has_non_purgeable_asset);
+    assert!(availability.is_supported_type);
+
+    for column in FLAGS.split(',') {
+        for value in ["2", "-1", "0.5", "'invalid'", "x'01'"] {
+            let fixture = Fixture::new(false);
+            fixture.connection.execute_batch(BUILT_NEW_SHAPE).unwrap();
+            let sql = format!("UPDATE item_state SET {column}={value}");
+            fixture.connection.execute_batch(&sql).unwrap();
+            assert!(fixture.read(false).is_err(), "{sql}");
+        }
+        // A flag that declares a default holds NULL only if written so.
+        let fixture = Fixture::new(false);
+        fixture
+            .connection
+            .execute_batch(&format!(
+                "{BUILT_NEW_SHAPE}; ALTER TABLE item_state DROP COLUMN {column};
+                ALTER TABLE item_state ADD COLUMN {column} INTEGER DEFAULT 0;
+                UPDATE item_state SET ({FLAGS})=(NULL,NULL,NULL)"
+            ))
+            .unwrap();
+        let error = format!("{:#}", fixture.read(false).err().unwrap());
+        assert!(error.contains(WRONG_STORAGE), "{column}: {error}");
+    }
+}
+
+/// An item_state with `is_supported_type` (the migrated shape) refuses NULL in
+/// every flag of a track and in the one flag read of an entry the phone
+/// added, as before the built-new shape was read.
+#[test]
+fn null_item_state_flags_refuse_in_the_migrated_shape() {
+    let cases = FLAGS
+        .split(',')
+        .map(|column| (column, 1))
+        .chain([("has_non_purgeable_asset", 2)]);
+    for (column, item) in cases {
+        let fixture = Fixture::new(false);
+        fixture.connection.execute_batch(STREAMED_ENTRY).unwrap();
+        let sql = format!("UPDATE item_state SET {column}=NULL WHERE item_pid={item}");
+        fixture.connection.execute_batch(&sql).unwrap();
+        let error = format!("{:#}", fixture.read(false).err().unwrap());
+        assert!(error.contains(WRONG_STORAGE), "{sql}: {error}");
+    }
+}
+
+/// The native-schema fixtures through the catalogue reader: the migrated
+/// shape (DEFAULT 0 flags) and the built-new one, whose rows hold NULL in
+/// `is_placeholder` because the fixture does not name it.
+#[test]
+fn native_schemas_of_both_item_state_shapes_read_through_the_catalogue() {
+    use crate::test_support::catalogue::NativeFixture;
+    let read = |fixture: &NativeFixture| read_snapshot(&fixture.before, None, &fixture.dir);
+    let nulls = |fixture: &NativeFixture| -> i64 {
+        Connection::open(&fixture.before)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM item_state WHERE is_placeholder IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let built_new = NativeFixture::built_new();
+    assert_eq!(nulls(&built_new), 4);
+    let catalog = read(&built_new).unwrap();
+    assert_eq!(catalog.user_version(), 2_410_000);
+    assert!(catalog.item_state_built_new());
+    assert_eq!(catalog.tracks().len(), 4);
+    for track in catalog.tracks() {
+        let a = &track.availability;
+        assert!(
+            !a.is_placeholder
+                && a.is_library_added
+                && a.has_non_purgeable_asset
+                && a.is_supported_type
+        );
+    }
+    let migrated = NativeFixture::index_only_update();
+    assert_eq!(nulls(&migrated), 0);
+    let wide = read(&migrated).unwrap();
+    assert!(!wide.item_state_built_new());
+    assert_eq!(wide.tracks(), catalog.tracks());
+    Connection::open(&migrated.before)
+        .unwrap()
+        .execute_batch("UPDATE item_state SET is_placeholder=NULL WHERE item_pid=2")
+        .unwrap();
+    let error = format!("{:#}", read(&migrated).err().unwrap());
+    assert!(error.contains(WRONG_STORAGE), "{error}");
+    for fixture in [built_new, migrated] {
+        fs::remove_dir_all(&fixture.dir).unwrap();
     }
 }
 

@@ -791,3 +791,80 @@ fn state_scope_rejects_new_revision_device_prefs_cdb_and_raw_artwork_changes() {
     };
     same_scope(&unsynced(69), &unsynced(69)).unwrap();
 }
+
+/// The housekeeping and playback checks compare two captures of one database
+/// and build no item_state row, so they read a database iOS 27.2 built new,
+/// whose layout differs from a migrated one's (docs/04), as well; any other
+/// layout is still refused.
+#[test]
+fn full_table_comparisons_read_a_database_built_new() {
+    use music_protocol::test_support::catalogue::NativeFixture;
+    use sha2::{Digest, Sha256};
+    let snapshot = |fixture: &NativeFixture, database: &std::path::Path, name: &str| {
+        let bytes = std::fs::read(database).unwrap();
+        let capture = Capture {
+            database,
+            database_sha256: Sha256::digest(bytes).into(),
+            wal: None,
+        };
+        reader::materialize(capture, &fixture.dir.join(name), &mut Budget::new()).unwrap()
+    };
+    for fixture in [
+        NativeFixture::built_new(),
+        NativeFixture::index_only_update(),
+    ] {
+        let before = fixture.before.as_path();
+        let (a, b) = (
+            snapshot(&fixture, before, "a"),
+            snapshot(&fixture, before, "b"),
+        );
+        assert!(
+            verify_revision_housekeeping(&a, &b, &Budget::new())
+                .unwrap()
+                .is_empty()
+        );
+        verify_views(&a, &b, &Budget::new()).unwrap();
+        // The phone's renumbering after an import: every live item's full
+        // record above every revision the earlier capture holds (1 to 4).
+        // Leaving one item out is refused.
+        for (sql, renumbered) in [
+            ("UPDATE entity_revision SET revision=revision+10", Some(4)),
+            (
+                "UPDATE entity_revision SET revision=revision+10 WHERE entity_pid<>4",
+                None,
+            ),
+        ] {
+            let path = fixture.dir.join("renumbered.sqlite");
+            std::fs::copy(before, &path).unwrap();
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+            let name = format!("renumbered-{}", renumbered.is_some());
+            let later = snapshot(&fixture, &path, &name);
+            let result = verify_revision_housekeeping(&a, &later, &Budget::new());
+            match renumbered {
+                Some(count) => {
+                    let changes = result.unwrap();
+                    assert_eq!(changes.len(), count, "{sql}");
+                    assert!(
+                        changes
+                            .iter()
+                            .all(|c| c["meaning"] == "live_item_full_record_revision_advanced")
+                    );
+                }
+                None => assert!(result.is_err(), "{sql}"),
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+        rusqlite::Connection::open(before)
+            .unwrap()
+            .execute_batch("ALTER TABLE item_state ADD COLUMN unmodelled INTEGER")
+            .unwrap();
+        let changed = snapshot(&fixture, before, "c");
+        let error = verify_revision_housekeeping(&changed, &changed, &Budget::new()).unwrap_err();
+        assert!(error.to_string().contains("unsupported"), "{error}");
+        assert!(verify_views(&changed, &changed, &Budget::new()).is_err());
+        std::fs::remove_dir_all(&fixture.dir).unwrap();
+    }
+}

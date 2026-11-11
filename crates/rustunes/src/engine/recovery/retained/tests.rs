@@ -1227,15 +1227,24 @@ fn ordinary_full_sql_covers_only_an_insertion_creating_its_groups() {
     let temp = Temp::new();
     let prepared = temp.prepared();
     let source = metadata::read(&temp.0.join("source.m4a")).unwrap();
-    assert!(ordinary_sql::covers(&prepared, &source).unwrap());
+    let before = current().catalog;
+    assert!(ordinary_sql::covers(&prepared, &source, &before).unwrap());
     // Joining an album or artist already on the phone goes by the catalogue
     // verifier instead.
     let mut reused = temp.prepared();
     reused.new_album_pid = None;
-    assert!(!ordinary_sql::covers(&reused, &source).unwrap());
+    assert!(!ordinary_sql::covers(&reused, &source, &before).unwrap());
     let mut reused = temp.prepared();
     reused.new_artist_pid = None;
-    assert!(!ordinary_sql::covers(&reused, &source).unwrap());
+    assert!(!ordinary_sql::covers(&reused, &source, &before).unwrap());
+    // So does any insertion into a database whose item_state has the
+    // built-new shape, which the full SQL model refuses.
+    let built_new = music_protocol::test_support::catalogue::modified_collection_catalog(
+        13,
+        "ALTER TABLE item_state DROP COLUMN is_supported_type",
+    );
+    assert!(built_new.item_state_built_new());
+    assert!(!ordinary_sql::covers(&prepared, &source, &built_new).unwrap());
 }
 
 #[test]

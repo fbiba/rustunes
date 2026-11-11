@@ -344,7 +344,7 @@ where
                 let expected=ExpectedInsert {track_id:attempt.prepared.content.track_pid,album_id:album,artist_id:artist,path:&attempt.prepared.content.path,file_bytes:audio_bytes,metadata:(&source).into(),presented:true};
                 // The full SQL model covers an ordinary insertion's usual
                 // shape; any other is proven as the insertion itself was.
-                if ordinary_sql::covers(&attempt.prepared,&source)? {
+                if ordinary_sql::covers(&attempt.prepared,&source,&retained.before)? {
                     let attributes = afc.stat(&attempt.prepared.content.path).await?.context("ordinary permanent target is absent")?;
                     control.check()?;
                     let proof = ordinary_bridge::verify_catalog(&attempt,&retained,current,&source,

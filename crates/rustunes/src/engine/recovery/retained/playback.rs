@@ -287,10 +287,11 @@ fn materialize_profile(
 /// Current scope, physical files and original transcript before any completion.
 /// Completed plays and skips, Playback History, revision housekeeping and the
 /// maintenance clock are the only accepted differences; no authority follows.
+/// It builds no `item_state` row, so a database built new is read too.
 pub(super) fn verify_views(a: &Snapshot, b: &Snapshot, budget: &Budget) -> Result<Value> {
     budget.check()?;
     ensure!(
-        a.layout_qualified()? && b.version == a.version && a.schema == b.schema,
+        a.layout_observed()? && b.version == a.version && a.schema == b.schema,
         "playback bridge has unsupported or changed full SQL schema"
     );
     verify_tables(&a.tables, &b.tables, budget)
@@ -302,6 +303,7 @@ pub(super) fn verify_views(a: &Snapshot, b: &Snapshot, budget: &Budget) -> Resul
 /// supersedes (observed on iOS 27.2, seconds after an insert batch). Those are
 /// the only accepted differences: no listening, and every other row of every
 /// table must be exact. Returns the revision changes; no authority follows.
+/// A database built new (`layout_observed`) is read as a migrated one.
 pub(crate) fn verify_revision_housekeeping(
     a: &Snapshot,
     b: &Snapshot,
@@ -309,7 +311,7 @@ pub(crate) fn verify_revision_housekeeping(
 ) -> Result<Vec<Value>> {
     budget.check()?;
     ensure!(
-        a.layout_qualified()? && b.version == a.version && a.schema == b.schema,
+        a.layout_observed()? && b.version == a.version && a.schema == b.schema,
         "the catalogue's full SQL schema is unsupported or changed"
     );
     revision_housekeeping(&a.tables, &b.tables, budget)

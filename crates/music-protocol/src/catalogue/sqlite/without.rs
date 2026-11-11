@@ -178,6 +178,7 @@ impl Catalog {
         Ok(Catalog {
             source_hashes: self.source_hashes.clone(),
             user_version: self.user_version,
+            item_state_built_new: self.item_state_built_new,
             database_pid: self.database_pid,
             primary_container_pid: self.primary_container_pid,
             anchor: self.anchor,

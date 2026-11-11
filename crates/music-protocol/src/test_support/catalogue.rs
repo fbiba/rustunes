@@ -276,6 +276,69 @@ const INDEX_ONLY_UPDATE: [&str; 4] = [
     "album",
     "CREATE INDEX AlbumCloudChannelName ON album (cloud_channel_name ASC)",
 ];
+/// The first of the 12 `item_state` columns that only the old migration step
+/// to user_version 2340000 adds; the other 11 follow it.
+const MIGRATION_ONLY_ITEM_STATE: &str = ", has_redownloadable_catalog_asset ";
+/// The 16 `item_state` indexes that only that migration step creates.
+const MIGRATION_ONLY_ITEM_STATE_INDEXES: [&str; 16] = [
+    "ItemStateAdamIDIndex",
+    "ItemStateAssetAvailabilityIndex",
+    "ItemStateCatalogAssetRequiresSubscriptionIndex",
+    "ItemStateCloudIDIndex",
+    "ItemStateContentTypeExplicitIndex",
+    "ItemStateHasExplicitContentIndex",
+    "ItemStateHasRedownloadableCatalogAssetIndex",
+    "ItemStateIsSupportedTypeIndex",
+    "ItemStateKeepLocalStatusIndex",
+    "ItemStateLibraryAddedIndex",
+    "ItemStatePersistentIDIndex",
+    "ItemStatePlayabilityCategoryKindIndex",
+    "ItemStatePlayableCategoryIndex",
+    "ItemStatePlayableItemKindIndex",
+    "ItemStateSubscriptionRequirementIndex",
+    "ItemStateSyncIDIndex",
+];
+/// `schema` (a migrated database's) as a database iOS 27.2 builds new holds
+/// it (docs/04, `item_state`): `item_state` without the migration step's 12
+/// columns and 16 indexes, its nullable INTEGER columns without a default
+/// and `persistent_id` with the default 0; `entity_revision.entity_pid` with
+/// the default 0; and four table names that migrations left quoted unquoted.
+fn built_new(schema: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    const UNQUOTED: [&str; 4] = ["album", "artwork_token", "entity_revision", "library_pins"];
+    schema
+        .into_iter()
+        .filter(|r| {
+            !(r[0] == "index"
+                && MIGRATION_ONLY_ITEM_STATE_INDEXES.contains(&r[1].as_str().unwrap()))
+        })
+        .map(|mut r| {
+            let name = r[1].as_str().unwrap().to_owned();
+            if r[0] == "table" {
+                let mut sql = r[3].as_str().unwrap().to_owned();
+                if UNQUOTED.contains(&name.as_str()) {
+                    sql = sql.replacen(&format!("\"{name}\""), &name, 1);
+                }
+                if name == "item_state" {
+                    sql.truncate(sql.find(MIGRATION_ONLY_ITEM_STATE).unwrap());
+                    sql = sql.replace(" INTEGER DEFAULT 0", " INTEGER").replace(
+                        ", persistent_id INTEGER NOT NULL,",
+                        ", persistent_id INTEGER NOT NULL DEFAULT 0,",
+                    ) + ")";
+                }
+                if name == "entity_revision" {
+                    sql = sql
+                        .replace(
+                            "entity_pid INTEGER NOT NULL,",
+                            "entity_pid INTEGER NOT NULL DEFAULT 0,",
+                        )
+                        .replace("UNIQUE(", "UNIQUE (");
+                }
+                r[3] = sql.into();
+            }
+            r
+        })
+        .collect()
+}
 /// A before/after database pair in the phone's exact native schema
 /// (`schema_fixture.json`; building it fails unless the database reproduces
 /// that schema exactly) with four synthetic tracks, the after state having
@@ -289,13 +352,19 @@ pub struct NativeFixture {
 #[allow(dead_code, reason = "each test crate uses part of this file")]
 impl NativeFixture {
     pub fn new() -> Self {
-        Self::build(2_400_060, None)
+        Self::build(2_400_060, None, false)
     }
     /// As `new`, in the schema after iOS 27.2's index-only update.
     pub fn index_only_update() -> Self {
-        Self::build(2_410_000, Some(INDEX_ONLY_UPDATE))
+        Self::build(2_410_000, Some(INDEX_ONLY_UPDATE), false)
     }
-    fn build(version: i64, index: Option<[&str; 4]>) -> Self {
+    /// As `index_only_update`, in the schema of a database iOS 27.2 builds
+    /// new (`built_new`): its item_state rows hold NULL in every column the
+    /// fixture does not name.
+    pub fn built_new() -> Self {
+        Self::build(2_410_000, Some(INDEX_ONLY_UPDATE), true)
+    }
+    fn build(version: i64, index: Option<[&str; 4]>, new: bool) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "delete-sql-test-{}-{}",
             std::process::id(),
@@ -305,6 +374,9 @@ impl NativeFixture {
         let before = dir.join("before.sqlite");
         let c = Connection::open(&before).unwrap();
         let mut schema: Vec<Vec<Value>> = serde_json::from_str(NATIVE_SCHEMA).unwrap();
+        if new {
+            schema = built_new(schema);
+        }
         if let Some(row) = index {
             schema.push(row.map(Value::from).to_vec());
             schema.sort_by(|a, b| {
@@ -347,7 +419,12 @@ impl NativeFixture {
                 rusqlite::params![id, id + 1000],
             )
             .unwrap();
-            c.execute("INSERT INTO item_state(item_pid,persistent_id,is_library_added,has_non_purgeable_asset,is_supported_type)VALUES(?1,?1,1,1,1)",[id]).unwrap();
+            let state = if new {
+                "INSERT INTO item_state(item_pid,persistent_id,is_library_added,has_non_purgeable_asset)VALUES(?1,?1,1,1)"
+            } else {
+                "INSERT INTO item_state(item_pid,persistent_id,is_library_added,has_non_purgeable_asset,is_supported_type)VALUES(?1,?1,1,1,1)"
+            };
+            c.execute(state, [id]).unwrap();
             for table in [
                 "item_stats",
                 "item_playback",

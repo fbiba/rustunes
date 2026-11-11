@@ -1,8 +1,9 @@
 //! Read-only catalog from a bounded local MediaLibrary database/WAL capture.
 //!
 //! Read from user_version 2400060 on, when the tables and columns in `TABLES`
-//! are present. Wire identities come from sync_id, not SQLite item_pid or
-//! item_state.sync_id.
+//! are present, and `item_state.is_supported_type` too unless `item_state`
+//! has the shape of a database built new (`validate_schema`). Wire identities
+//! come from sync_id, not SQLite item_pid or item_state.sync_id.
 //! This module performs no device I/O and never opens a source file with SQLite.
 
 use anyhow::{Context, Result, bail, ensure};
@@ -55,6 +56,7 @@ pub struct SourceHashes {
 pub struct Catalog {
     source_hashes: SourceHashes,
     user_version: i64,
+    item_state_built_new: bool,
     database_pid: u64,
     primary_container_pid: u64,
     anchor: u32,
@@ -86,6 +88,12 @@ impl Catalog {
     /// Whether `user_version` is in `TESTED_USER_VERSIONS`.
     pub fn user_version_tested(&self) -> bool {
         TESTED_USER_VERSIONS.contains(&self.user_version)
+    }
+    /// Whether `item_state` has the shape of a database built new: none of
+    /// the 12 columns only the migration step to user_version 2340000 adds
+    /// (docs/04, section 4.1).
+    pub fn item_state_built_new(&self) -> bool {
+        self.item_state_built_new
     }
     /// The phone's own registry of audio folders (`iTunes_Control/Music/Fnn`
     /// rows of `base_location`). It keeps them when no track uses them.
@@ -1134,7 +1142,6 @@ const TABLES: &[TableSpec] = &[
             ("is_placeholder", "INTEGER"),
             ("is_library_added", "INTEGER"),
             ("has_non_purgeable_asset", "INTEGER"),
-            ("is_supported_type", "INTEGER"),
         ],
     ),
     (
@@ -1247,12 +1254,44 @@ const TABLES: &[TableSpec] = &[
         ],
     ),
 ];
+/// The 12 `item_state` columns that only the old migration step from
+/// user_version 2320030 to 2340000 adds. A database migrated from an older
+/// iOS has them; the one library seen built new by iOS 27.2 has none
+/// (docs/04, section 4.1).
+const MIGRATION_ONLY_ITEM_STATE: [&str; 12] = [
+    "has_redownloadable_catalog_asset",
+    "has_non_purgeable_subscription_protected_local_asset",
+    "is_home_sharing_asset_available",
+    "catalog_asset_requires_subscription",
+    "catalog_asset_requires_user_upload",
+    "contains_downloaded_or_purchased_content",
+    "has_only_explicit_content",
+    "has_only_explicit_downloaded_content",
+    "playable_category",
+    "playable_item_kind",
+    "is_supported_type",
+    "is_library_added_container",
+];
+/// The `item_state` flags read besides `is_supported_type`.
+const ITEM_STATE_FLAGS: [&str; 3] = [
+    "is_placeholder",
+    "is_library_added",
+    "has_non_purgeable_asset",
+];
 
-/// Returns the user_version and each `TABLES` row count.
-fn validate_schema(
-    connection: &Connection,
-    control: Option<&ReadControl>,
-) -> Result<(i64, BTreeMap<&'static str, usize>)> {
+/// What `validate_schema` found.
+struct Schema {
+    user_version: i64,
+    counts: BTreeMap<&'static str, usize>,
+    /// `item_state` has none of `MIGRATION_ONLY_ITEM_STATE`: the shape of a
+    /// database built new. Otherwise it must have `is_supported_type`.
+    item_state_built_new: bool,
+    /// The `ITEM_STATE_FLAGS` read with NULL as 0 (`state_flag`): those an
+    /// `item_state` of the built-new shape declares without a default.
+    null_flags: BTreeSet<&'static str>,
+}
+
+fn validate_schema(connection: &Connection, control: Option<&ReadControl>) -> Result<Schema> {
     check_control(control)?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     check_control(control)?;
@@ -1282,6 +1321,8 @@ fn validate_schema(
         "SQLite integrity check failed"
     );
     let mut counts = BTreeMap::new();
+    let mut item_state_built_new = false;
+    let mut null_flags = BTreeSet::new();
     let mut total = 0usize;
     for &(table, primary, columns) in TABLES {
         check_control(control)?;
@@ -1310,13 +1351,14 @@ fn validate_schema(
             ensure!(found.len() < 512, "catalog table has too many columns");
             let name: String = row.get(1)?;
             let kind: String = row.get(2)?;
+            let has_default = !matches!(row.get_ref(4)?, ValueRef::Null);
             let pk: i64 = row.get(5)?;
             let hidden: i64 = row.get(6)?;
             if pk != 0 {
                 primary_columns.push(name.clone());
             }
             ensure!(hidden == 0, "generated/hidden catalog columns unsupported");
-            found.insert(name, kind);
+            found.insert(name, (kind, has_default));
         }
         ensure!(
             primary_columns
@@ -1325,14 +1367,33 @@ fn validate_schema(
                 .eq(primary.into_iter()),
             "catalog table primary key differs"
         );
-        for &(name, kind) in columns {
-            check_control(control)?;
+        let required = |name: &str, kind: &str| {
             ensure!(
                 found
                     .get(name)
-                    .is_some_and(|actual| actual.eq_ignore_ascii_case(kind)),
+                    .is_some_and(|(actual, _)| actual.eq_ignore_ascii_case(kind)),
                 "required catalog column/type differs"
             );
+            Ok(())
+        };
+        for &(name, kind) in columns {
+            check_control(control)?;
+            required(name, kind)?;
+        }
+        if table == "item_state" {
+            check_control(control)?;
+            // SQLite column names ignore case, so a spelling in another case
+            // counts as present (and is then refused by `required`).
+            item_state_built_new = !found.keys().any(|name| {
+                MIGRATION_ONLY_ITEM_STATE
+                    .iter()
+                    .any(|column| name.eq_ignore_ascii_case(column))
+            });
+            if item_state_built_new {
+                null_flags.extend(ITEM_STATE_FLAGS.into_iter().filter(|name| !found[*name].1));
+            } else {
+                required("is_supported_type", "INTEGER")?;
+            }
         }
         check_control(control)?;
         let count: i64 =
@@ -1349,7 +1410,12 @@ fn validate_schema(
         counts.insert(table, count);
     }
     check_control(control)?;
-    Ok((version, counts))
+    Ok(Schema {
+        user_version: version,
+        counts,
+        item_state_built_new,
+        null_flags,
+    })
 }
 
 struct TextBudget(usize);
@@ -1404,7 +1470,7 @@ fn wire_id(row: &Row<'_>, name: &str) -> Result<u64> {
 /// without sync identities. No operation can name one, so the catalogue leaves
 /// it out. One that holds a file is refused: new tracks are named against the
 /// catalogue's paths, and its path would not be among them.
-fn unsynced_item(row: &Row<'_>) -> Result<i64> {
+fn unsynced_item(row: &Row<'_>, null_flags: &BTreeSet<&str>) -> Result<i64> {
     let internal_id = integer(row, "item_pid")?;
     ensure!(internal_id != 0, "required track join identity is zero");
     ensure!(
@@ -1413,7 +1479,7 @@ fn unsynced_item(row: &Row<'_>) -> Result<i64> {
                 row.get_ref("location")?,
                 ValueRef::Null | ValueRef::Text(b"")
             )
-            && !flag(row, "has_non_purgeable_asset")?,
+            && !state_flag(row, "has_non_purgeable_asset", null_flags)?,
         "an item no sync made holds a file on the phone"
     );
     Ok(internal_id)
@@ -1425,6 +1491,28 @@ fn flag(row: &Row<'_>, name: &str) -> Result<bool> {
     let value = integer(row, name)?;
     ensure!([0, 1].contains(&value), "catalog boolean outside range");
     Ok(value == 1)
+}
+/// One of `ITEM_STATE_FLAGS`. NULL reads as 0 only in a column of
+/// `null_flags`: one that an `item_state` of the built-new shape declares
+/// without a default. A migrated table declares them DEFAULT 0, so a NULL
+/// there was written explicitly; it refuses, as any value but 0 or 1 does.
+/// Observed in the one library seen built new: its purchase-history rows
+/// held NULL in these flags and in other columns, among them all seven that
+/// the `item_state_*_sync` triggers write, never as NULL, whenever an `item`
+/// row is inserted or updated: `is_library_added`, `has_non_purgeable_asset`,
+/// `media_type`, `exclude_from_shuffle`, `keep_local_enable_state`,
+/// `keep_local_managed_status` and `keep_local_constraints`. A no-op update
+/// of one such `item` row filled `is_library_added` and
+/// `has_non_purgeable_asset`; `is_placeholder`, which no trigger writes,
+/// stayed NULL. The import of `rustunes init`'s session filled all three
+/// (0, 1 and 0): it repopulates `item_state` for all items, as the phone's
+/// log shows. Why the rows held NULL first is OPEN. A track a sync inserts
+/// got integers in all three (observed once; docs/04, section 4.1).
+fn state_flag(row: &Row<'_>, name: &str, null_flags: &BTreeSet<&str>) -> Result<bool> {
+    if null_flags.contains(name) && matches!(row.get_ref(name)?, ValueRef::Null) {
+        return Ok(false);
+    }
+    flag(row, name)
 }
 fn duration(row: &Row<'_>) -> Result<u32> {
     match row.get_ref("total_time_ms")? {
@@ -1474,7 +1562,12 @@ fn parse_catalog(
     check_control(control)?;
     connection.execute_batch("BEGIN DEFERRED")?;
     check_control(control)?;
-    let (user_version, counts) = validate_schema(connection, control)?;
+    let Schema {
+        user_version,
+        counts,
+        item_state_built_new,
+        null_flags,
+    } = validate_schema(connection, control)?;
     // No row: no sync has finished with this phone (a `rustunes init` that
     // stopped before its session finished leaves it so).
     ensure!(
@@ -1686,8 +1779,16 @@ fn parse_catalog(
     let mut comments = BTreeMap::new();
     let mut track_item_artists = BTreeMap::new();
     let mut unsynced_items = BTreeSet::new();
+    // A table of the built-new shape has no `is_supported_type`: every row
+    // reads as 1, the default a migrated table declares and the value the
+    // one migrated library seen held in every row.
+    let is_supported_type = if item_state_built_new {
+        "1 AS is_supported_type"
+    } else {
+        "st.is_supported_type"
+    };
     check_control(control)?;
-    let mut statement = connection.prepare("SELECT i.item_pid,i.media_type,i.album_pid,i.album_artist_pid,i.item_artist_pid,i.genre_id,i.composer_pid,i.base_location_id,i.remote_location_id,i.track_number,i.disc_number,i.is_compilation,i.composer_order,s.sync_id,e.title,e.sort_title,e.comment,e.location,e.total_time_ms,e.file_size,e.track_count,e.disc_count,e.year,e.copyright,e.content_rating,e.content_rating_level,ia.item_artist AS artist,b.path AS base_path,g.genre,c.composer,st.is_placeholder,st.is_library_added,st.has_non_purgeable_asset,st.is_supported_type,ps.play_count_user,ps.play_count_recent,ps.skip_count_user,ps.skip_count_recent,ps.has_been_played,ps.user_rating,ps.user_rating_is_derived,ps.liked_state FROM item i JOIN item_store s USING(item_pid) JOIN item_extra e USING(item_pid) JOIN item_state st USING(item_pid) JOIN item_stats ps USING(item_pid) LEFT JOIN item_artist ia USING(item_artist_pid) LEFT JOIN base_location b USING(base_location_id) LEFT JOIN genre g USING(genre_id) LEFT JOIN composer c USING(composer_pid) ORDER BY s.sync_id")?;
+    let mut statement = connection.prepare(&format!("SELECT i.item_pid,i.media_type,i.album_pid,i.album_artist_pid,i.item_artist_pid,i.genre_id,i.composer_pid,i.base_location_id,i.remote_location_id,i.track_number,i.disc_number,i.is_compilation,i.composer_order,s.sync_id,e.title,e.sort_title,e.comment,e.location,e.total_time_ms,e.file_size,e.track_count,e.disc_count,e.year,e.copyright,e.content_rating,e.content_rating_level,ia.item_artist AS artist,b.path AS base_path,g.genre,c.composer,st.is_placeholder,st.is_library_added,st.has_non_purgeable_asset,{is_supported_type},ps.play_count_user,ps.play_count_recent,ps.skip_count_user,ps.skip_count_recent,ps.has_been_played,ps.user_rating,ps.user_rating_is_derived,ps.liked_state FROM item i JOIN item_store s USING(item_pid) JOIN item_extra e USING(item_pid) JOIN item_state st USING(item_pid) JOIN item_stats ps USING(item_pid) LEFT JOIN item_artist ia USING(item_artist_pid) LEFT JOIN base_location b USING(base_location_id) LEFT JOIN genre g USING(genre_id) LEFT JOIN composer c USING(composer_pid) ORDER BY s.sync_id"))?;
     check_control(control)?;
     let mut rows = statement.query([])?;
     check_control(control)?;
@@ -1698,7 +1799,7 @@ fn parse_catalog(
         );
         let sync_id = integer(row, "sync_id")? as u64;
         if sync_id == 0 {
-            unsynced_items.insert(unsynced_item(row)?);
+            unsynced_items.insert(unsynced_item(row, &null_flags)?);
             continue;
         }
         ensure!(seen.insert(sync_id), "duplicate track sync identity");
@@ -1777,9 +1878,9 @@ fn parse_catalog(
             );
         }
         let availability = Availability {
-            is_placeholder: flag(row, "is_placeholder")?,
-            is_library_added: flag(row, "is_library_added")?,
-            has_non_purgeable_asset: flag(row, "has_non_purgeable_asset")?,
+            is_placeholder: state_flag(row, "is_placeholder", &null_flags)?,
+            is_library_added: state_flag(row, "is_library_added", &null_flags)?,
+            has_non_purgeable_asset: state_flag(row, "has_non_purgeable_asset", &null_flags)?,
             is_supported_type: flag(row, "is_supported_type")?,
         };
         ensure!(
@@ -1860,6 +1961,7 @@ fn parse_catalog(
     Ok(Catalog {
         source_hashes,
         user_version,
+        item_state_built_new,
         database_pid,
         primary_container_pid,
         anchor,

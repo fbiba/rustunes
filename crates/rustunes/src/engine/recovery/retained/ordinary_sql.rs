@@ -103,12 +103,15 @@ struct Observed {
     playback: Option<serde_json::Value>,
 }
 /// Whether the full SQL model covers this insertion: an artless one that
-/// creates its album and artist, with no composer, compilation or rating.
+/// creates its album and artist, with no composer, compilation or rating,
+/// into a database whose `item_state` has the migrated shape (`rows` models
+/// its 64 columns; no insert into the built-new shape has been observed).
 /// Recovery proves any other by the catalogue verifier, as the insertion
 /// itself was checked.
-pub(super) fn covers(p: &PreparedAttempt, source: &Metadata) -> Result<bool> {
+pub(super) fn covers(p: &PreparedAttempt, source: &Metadata, before: &Catalog) -> Result<bool> {
     let scalar = source.projected()?;
-    Ok(p.kind == AttemptKind::Insert
+    Ok(!before.item_state_built_new()
+        && p.kind == AttemptKind::Insert
         && p.content.artwork.is_none()
         && p.new_album_pid.is_some()
         && p.new_artist_pid.is_some()
@@ -284,6 +287,10 @@ fn allocation_facts(
     anchor: u32,
     budget: &Budget,
 ) -> Result<AllocationFacts> {
+    // The new rows (`rows`) model a migrated database's 64-column item_state;
+    // no insert into a database built new has been observed, so its layout
+    // (`layout_observed`) is refused here. `covers` sends an insertion into
+    // one to the catalogue verifier instead.
     ensure!(
         a.layout_qualified()?,
         "unqualified ordinary ALAC SQL schema"
