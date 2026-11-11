@@ -1,5 +1,6 @@
 //! Source expectations exercise read-only planning; no checksum or mutation grant.
 use super::*;
+use crate::engine::state::current::DeviceFile;
 
 fn cover() -> Cover {
     let bytes = b"same payload, different source containers".to_vec();
@@ -69,8 +70,8 @@ async fn new_observers_refuse_invalid_cancelled_and_expired_inputs_before_connec
         catalog,
         raw_preferences: prefs.clone(),
         plist_preferences: prefs,
-        cdb: vec![],
-        artwork_db: None,
+        cdb: DeviceFile::Present(vec![]),
+        artwork_db: DeviceFile::NotCaptured,
         receipt_sha256: [1; 32],
     };
     let called = AtomicBool::new(false);

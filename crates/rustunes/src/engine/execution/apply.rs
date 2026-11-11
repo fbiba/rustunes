@@ -16,12 +16,13 @@ use sha2::{Digest, Sha256};
 use crate::{
     engine::execution::device,
     engine::execution::insert,
-    engine::execution::native_insert::{self, Control, FreshState, Insertion},
+    engine::execution::native_insert::{self, Control, Insertion},
     engine::planning::additive::Decision,
     engine::planning::collections::{CandidateIds, Planner},
     engine::planning::saved_plan,
     engine::planning::source_collection::mp3::preparation::PreparedSource,
     engine::state::current::{self, hex},
+    engine::state::held::{ArtworkDb, HeldState},
     engine::state::journal::{AttemptKind, CompletionEvidence, Content, Journal, PreparedAttempt},
     engine::{ApplyResult, Engine, Event},
 };
@@ -104,7 +105,7 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<ApplyRe
     );
     // Qualify all runtime template fields before creating a journal or reservation.
     templates::build_from_copied_cdb(
-        &current.cdb,
+        current.cdb.bytes(),
         &current.catalog,
         &current.library,
         options.host_name,
@@ -592,18 +593,6 @@ fn verify_planned_composer(
     Ok(())
 }
 
-fn insertion_state(current: &current::Current, input_hash: [u8; 32]) -> Result<FreshState> {
-    let mut state = FreshState::new(
-        &current.device,
-        &current.catalog,
-        &current.raw_preferences,
-        &current.plist_preferences,
-        input_hash,
-    )?;
-    state.bind_copied_cdb(&current.cdb)?;
-    Ok(state)
-}
-
 struct OrdinaryInsert<'a> {
     engine: &'a Engine,
     current_directory: &'a Path,
@@ -660,20 +649,14 @@ async fn ordinary_insert(
         File::open(i.step)?.sync_all()?;
         File::open(i.step.parent().context("insertion trace parent missing")?)?.sync_all()?;
         i.prepared.input_receipt_sha256 = Sha256::digest(&input_bytes).into();
-        let state = insertion_state(current, i.prepared.input_receipt_sha256)?;
-        let templates = templates::build_from_copied_cdb(
-            &current.cdb,
-            &current.catalog,
-            &current.library,
-            i.host_name,
-        )?;
+        let state = HeldState::new(current, i.prepared.input_receipt_sha256, ArtworkDb::NotHeld)?;
         let result = native_insert::execute_new_native_insert(
             journal,
             Insertion {
                 attempt: i.prepared,
                 source: i.source_path,
                 state: &state,
-                templates,
+                host_name: i.host_name,
                 trace: &preflight.join("transfer"),
             },
             &i.step.join("input.json"),

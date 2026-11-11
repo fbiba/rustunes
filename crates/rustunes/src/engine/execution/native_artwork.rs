@@ -22,8 +22,10 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::{
     engine::execution::native_insert::{
-        BoundSource, Control, FreshState, create_trace, durable_write, sync_trace,
+        BoundSource, Control, create_trace, durable_write, sync_trace,
     },
+    engine::state::current::Current,
+    engine::state::held::{ArtworkDb, HeldState},
     engine::state::journal::{
         AttemptId, AttemptKind, AttemptState, Content, Identity, Journal, PreparedAttempt,
         StartEvidence, StartedPermit,
@@ -35,52 +37,35 @@ use music_protocol::media::artwork::{self, Cover};
 use music_protocol::media::artwork_inventory;
 use music_protocol::media::fingerprint::{self, SourceFingerprint};
 use music_protocol::protocol::session::{self, Session};
-use music_protocol::protocol::templates;
 use music_protocol::protocol::transfer::{
-    Attributes, MAX_ASSET, MAX_AUDIO, MAX_BOUNDED_OPS, METADATA, SIGNATURE, Transfer, hex,
-    regular_size,
+    MAX_ASSET, MAX_AUDIO, MAX_BOUNDED_OPS, METADATA, SIGNATURE, Transfer, hex,
 };
 
-const ARTWORK_DB: &str = "iTunes_Control/Artwork/ArtworkDB";
 const CHUNK: u64 = 64 * 1024;
 
-/// Exact caller-captured state. Saved ArtworkDB/CDB are hash-bound evidence,
-/// not authoritative current catalogues or counters. SQL supplies current Media.
+/// Exact caller-captured state, with the ArtworkDB held. Saved ArtworkDB/CDB
+/// are hash-bound evidence, not authoritative current catalogues or counters.
+/// SQL supplies current Media. Either may be absent: only Apple's computers
+/// write them, so a phone `rustunes init` prepared has neither, and must
+/// still have neither at Ready.
 pub struct FreshArtworkState<'a> {
     catalog: &'a Catalog,
-    common: FreshState,
-    copied_cdb: Vec<u8>,
-    artwork_bytes: u64,
-    artwork_sha256: [u8; 32],
-    artwork_inventory: artwork_inventory::Inventory,
+    common: HeldState,
+    /// The saved ArtworkDB's image records the allocation read.
+    inventory: Option<artwork_inventory::Inventory>,
 }
 
 impl<'a> FreshArtworkState<'a> {
-    pub fn new(
-        device: &str,
-        catalog: &'a Catalog,
-        raw_preferences: &[u8],
-        plist_preferences: &[u8],
-        artwork_db: &[u8],
-        copied_cdb: &[u8],
-        input_receipt_sha256: [u8; 32],
-    ) -> Result<Self> {
-        let artwork_inventory = artwork_inventory::parse(artwork_db)?;
-        let mut common = FreshState::new(
-            device,
-            catalog,
-            raw_preferences,
-            plist_preferences,
-            input_receipt_sha256,
-        )?;
-        common.bind_copied_cdb(copied_cdb)?;
+    pub fn new(current: &'a Current, input_receipt_sha256: [u8; 32]) -> Result<Self> {
+        let common = HeldState::new(current, input_receipt_sha256, ArtworkDb::Held)?;
         Ok(Self {
-            catalog,
+            catalog: &current.catalog,
             common,
-            copied_cdb: copied_cdb.to_vec(),
-            artwork_bytes: artwork_db.len() as u64,
-            artwork_sha256: Sha256::digest(artwork_db).into(),
-            artwork_inventory,
+            inventory: current
+                .artwork_db
+                .bytes()
+                .map(artwork_inventory::parse)
+                .transpose()?,
         })
     }
 }
@@ -88,34 +73,45 @@ impl<'a> FreshArtworkState<'a> {
 /// Pure proposal, never reservation. Include all source300 SQL relationships,
 /// saved image IDs/counter and all historical journal reservations. Deliberately
 /// choose ABOVE the maximum, even if the saved host counter itself was unused.
-pub fn allocate_cache_id(catalog: &Catalog, artwork_db: &[u8], journal: &Journal) -> Result<u32> {
+/// Without a saved ArtworkDB the counter is Apple's floor, 100.
+pub fn allocate_cache_id(
+    catalog: &Catalog,
+    artwork_db: Option<&[u8]>,
+    journal: &Journal,
+) -> Result<u32> {
     ensure!(
         journal.outstanding()?.is_none(),
         "reconcile or cancel outstanding attempt before allocation"
     );
     next_cache(
-        &artwork_inventory::parse(artwork_db)?,
+        artwork_db
+            .map(artwork_inventory::parse)
+            .transpose()?
+            .as_ref(),
         catalog.artwork().occupied_cache_ids(),
         &journal.reserved_cache_ids()?,
     )
 }
 
+const SAVED_COUNTER_FLOOR: u32 = 100;
+
 fn next_cache(
-    saved: &artwork_inventory::Inventory,
+    saved: Option<&artwork_inventory::Inventory>,
     sql: &BTreeSet<u32>,
     reserved: &BTreeSet<u32>,
 ) -> Result<u32> {
+    let counter = saved.map_or(SAVED_COUNTER_FLOOR, |saved| saved.next_record_id);
     ensure!(
-        saved.next_record_id >= 100,
+        counter >= SAVED_COUNTER_FLOOR,
         "unsupported saved artwork counter"
     );
     saved
-        .images
-        .keys()
+        .into_iter()
+        .flat_map(|saved| saved.images.keys())
         .chain(sql)
         .chain(reserved)
         .copied()
-        .chain([saved.next_record_id])
+        .chain([counter])
         .max()
         .expect("counter present")
         .checked_add(1)
@@ -202,12 +198,7 @@ where
         state.common.library_identity().library_id(),
         state.common.media_anchor(),
     )?;
-    let templates = templates::build_from_copied_cdb(
-        &state.copied_cdb,
-        state.catalog,
-        state.common.library_identity(),
-        update.host_name,
-    )?;
+    let templates = state.common.templates(update.host_name)?;
     let session_prepared = session::prepare(
         templates.request,
         &templates.finished,
@@ -215,8 +206,7 @@ where
         state.common.media_anchor(),
     )?;
     let operations = operation_budget(
-        state.common.state_read_chunks()?,
-        state.artwork_bytes,
+        state.common.guard_requests(),
         prepared.content.source.file_bytes,
         cover.bytes.len() as u64,
     )?;
@@ -396,7 +386,7 @@ fn validate_preparation(
     // this attempt's own reservation is excluded; historical IDs remain occupied.
     ensure!(
         next_cache(
-            &state.artwork_inventory,
+            state.inventory.as_ref(),
             state.catalog.artwork().occupied_cache_ids(),
             &reserved
         )? == art.cache_id,
@@ -446,14 +436,13 @@ fn validate_preparation(
     Ok(())
 }
 
-fn operation_budget(state_chunks: u64, artwork_db: u64, audio: u64, cover: u64) -> Result<usize> {
+fn operation_budget(guard_requests: u64, audio: u64, cover: u64) -> Result<usize> {
     ensure!(
-        artwork_db <= MAX_ASSET && audio <= MAX_AUDIO && cover <= MAX_ASSET,
+        audio <= MAX_AUDIO && cover <= MAX_ASSET,
         "artwork operation inputs exceed bounds"
     );
-    let operations = state_chunks
+    let operations = guard_requests
         .checked_mul(2)
-        .and_then(|n| n.checked_add(artwork_db.div_ceil(CHUNK) * 2))
         .and_then(|n| n.checked_add(audio.div_ceil(CHUNK) * 3))
         .and_then(|n| n.checked_add(cover.div_ceil(CHUNK) * 2))
         .and_then(|n| n.checked_add(512))
@@ -472,61 +461,33 @@ async fn preflight(
     content: &Content,
     stage: &str,
 ) -> Result<()> {
-    // Bracket the whole combined guard, not only each hash, so a state change
-    // during the permanent audio readback cannot escape the pre-write check.
-    const NAMES: [&str; 7] = [
-        "iTunes_Control/iTunes/iTunesPrefs",
-        "iTunes_Control/iTunes/iTunesPrefs.plist",
-        "iTunes_Control/iTunes/MediaLibrary.sqlitedb",
-        "iTunes_Control/iTunes/MediaLibrary.sqlitedb-wal",
-        "iTunes_Control/iTunes/MediaLibrary.sqlitedb-shm",
-        "iTunes_Control/iTunes/iTunesCDB",
-        ARTWORK_DB,
-    ];
-    let mut before = Vec::new();
-    for name in NAMES {
-        before.push(afc.stat(name).await?);
-    }
-    state.common.verify_state(afc).await?;
-    regular_size(
-        before[6].as_ref().context("saved ArtworkDB missing")?,
-        state.artwork_bytes,
-    )?;
-    ensure!(
-        afc.read_hash(ARTWORK_DB, state.artwork_bytes, MAX_ASSET)
-            .await?
-            == state.artwork_sha256,
-        "saved ArtworkDB changed since allocation"
-    );
-    verify_audio(afc, content).await?;
-    afc.require_directory("iTunes_Control/Sync/Media").await?;
-    afc.require_directory_or_absent(crate::engine::execution::native_insert::STAGING_ARTWORK)
-        .await?;
-    ensure!(
-        afc.names("iTunes_Control/Sync/Media")
-            .await?
-            .iter()
-            .all(|n| n == "." || n == ".."),
-        "metadata namespace contains leftovers; nothing removed"
-    );
-    for path in [METADATA, SIGNATURE, stage] {
-        afc.require_absent(path).await?;
-    }
-    for (name, previous) in NAMES.into_iter().zip(before) {
-        ensure!(
-            stable_attrs(previous) == stable_attrs(afc.stat(name).await?),
-            "artwork preflight state changed across combined readback"
-        );
-    }
-    Ok(())
+    // The state guard's pair of stats brackets the whole combined guard, so a
+    // state change during the permanent audio readback cannot escape the
+    // pre-write check.
+    state
+        .common
+        .guard_around(afc, async |afc| {
+            verify_audio(afc, content).await?;
+            afc.require_directory("iTunes_Control/Sync/Media").await?;
+            afc.require_directory_or_absent(
+                crate::engine::execution::native_insert::STAGING_ARTWORK,
+            )
+            .await?;
+            ensure!(
+                afc.names("iTunes_Control/Sync/Media")
+                    .await?
+                    .iter()
+                    .all(|n| n == "." || n == ".."),
+                "metadata namespace contains leftovers; nothing removed"
+            );
+            for path in [METADATA, SIGNATURE, stage] {
+                afc.require_absent(path).await?;
+            }
+            Ok(())
+        })
+        .await
 }
 
-fn stable_attrs(attrs: Option<Attributes>) -> Option<Attributes> {
-    attrs.map(|mut attrs| {
-        attrs.remove("st_atime");
-        attrs
-    })
-}
 async fn verify_audio(afc: &mut Transfer, content: &Content) -> Result<[u8; 32]> {
     let hash = afc
         .read_hash(&content.path, content.source.file_bytes, MAX_AUDIO)
@@ -562,10 +523,21 @@ fn input_receipt(
         "AncillaryBindingSHA256".into(),
         hex(&state.common.ancillary().binding_sha256()).into(),
     );
-    d.insert("ArtworkDBSHA256".into(), hex(&state.artwork_sha256).into());
+    d.insert(
+        "ArtworkDBSHA256".into(),
+        state
+            .common
+            .artwork_db()
+            .map_or("Absent".into(), |(_, sha256)| hex(&sha256))
+            .into(),
+    );
     d.insert(
         "CopiedCDBSHA256".into(),
-        hex(&Sha256::digest(&state.copied_cdb)).into(),
+        state
+            .common
+            .copied_cdb()
+            .map_or("Absent".into(), |(_, sha256)| hex(&sha256))
+            .into(),
     );
     d.insert(
         "DesiredSourceSHA256".into(),
@@ -580,7 +552,14 @@ fn input_receipt(
         hex(&desired.audio.sha256).into(),
     );
     d.insert("DesiredSourceBytes".into(), desired.file_bytes.into());
-    d.insert("ArtworkDBBytes".into(), state.artwork_bytes.into());
+    d.insert(
+        "ArtworkDBBytes".into(),
+        state
+            .common
+            .artwork_db()
+            .map_or(0, |(bytes, _)| bytes)
+            .into(),
+    );
     d.insert("MediaAnchor".into(), state.common.media_anchor().into());
     d.insert(
         "TrackPID".into(),

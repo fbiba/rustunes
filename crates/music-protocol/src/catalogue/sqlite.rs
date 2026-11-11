@@ -1475,6 +1475,13 @@ fn parse_catalog(
     connection.execute_batch("BEGIN DEFERRED")?;
     check_control(control)?;
     let (user_version, counts) = validate_schema(connection, control)?;
+    // No row: no sync has finished with this phone (a `rustunes init` that
+    // stopped before its session finished leaves it so).
+    ensure!(
+        counts["db_info"] != 0,
+        "the iPhone's music library has no db_info row: no sync has finished with this \
+         iPhone. rustunes init prepares it (rustunes device check shows what it holds)"
+    );
     ensure!(
         counts["db_info"] == 1,
         "catalog db_info cardinality differs"

@@ -38,9 +38,6 @@ pub fn digest(s: &str) -> Result<[u8; 32]> {
     ensure!(out != [0; 32], "zero evidence hash");
     Ok(out)
 }
-pub fn json_hash(v: &serde_json::Value, k: &str) -> Result<[u8; 32]> {
-    digest(v[k].as_str().context("missing JSON hash")?)
-}
 pub fn directory(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
     ensure!(

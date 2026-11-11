@@ -10,15 +10,16 @@
 
 use crate::engine::execution::device::DeviceProvider;
 use crate::{
-    engine::execution::native_insert::{FreshState, create_trace, durable_write},
+    engine::execution::native_insert::{create_trace, durable_write},
     engine::state::current::Current,
+    engine::state::held::{ArtworkDb, HeldState},
     engine::state::journal::{Binding, Identity, Journal},
     engine::verification::artwork::{self, TrackArtworkExpectation, VerifiedTrackArtworkBytes},
 };
 use anyhow::{Context, Result, ensure};
 use music_protocol::catalogue::sqlite::{Catalog, Track};
 use music_protocol::protocol::transfer::{
-    Attributes, MAX_AUDIO, MAX_BOUNDED_OPS, Transfer, hex, regular_size,
+    Attributes, MAX_AUDIO, MAX_BOUNDED_OPS, Transfer, hex, regular_size, same_stat,
 };
 use serde::Serialize;
 use std::{
@@ -41,7 +42,6 @@ pub use mpeg::MpegFrameReport;
 
 const MAX_BINDINGS: usize = 4096;
 const MAX_TOTAL: u64 = 64 * 1024 * 1024 * 1024;
-const CHUNK: u64 = 64 * 1024;
 /// Bytes per AFC read request: an audio read costs one operation per request.
 const REQUEST: u64 = music_protocol::protocol::afc::copy::CHUNK as u64;
 const MAX_DURATION: Duration = Duration::from_secs(1800);
@@ -159,7 +159,7 @@ struct Batch {
     operations: usize,
 }
 struct Prepared {
-    state: FreshState,
+    state: HeldState,
     /// The device digest that keys the fingerprint cache.
     device: [u8; 32],
     bindings: Vec<Binding>,
@@ -480,18 +480,11 @@ fn prepare(journal: &Journal, current: &Current, selection: Selection) -> Result
         "current state identity fields disagree"
     );
     journal.ensure_identity(&identity)?;
-    let mut state = FreshState::new(
-        &current.device,
-        &current.catalog,
-        &current.raw_preferences,
-        &current.plist_preferences,
-        current.receipt_sha256,
-    )?;
+    let state = HeldState::new(current, current.receipt_sha256, ArtworkDb::NotHeld)?;
     ensure!(
         state.library_identity().binding_sha256() == current.library.binding_sha256(),
         "current state preferences differ from library identity"
     );
-    state.bind_copied_cdb(&current.cdb)?;
     state.ensure_catalog(&current.catalog)?;
     let all = journal.active_verified_bindings()?;
     let count = all.len();
@@ -583,7 +576,8 @@ fn prepare(journal: &Journal, current: &Current, selection: Selection) -> Result
         .filter(|(_, t)| t.finding.is_none())
         .map(|(i, t)| (i, t.audio_bytes))
         .collect();
-    let (batches, audio_bytes, total_bytes) = schedule(&eligible, state.state_read_chunks()?)?;
+    let (batches, audio_bytes, total_bytes) =
+        schedule(&eligible, state.guard_requests(), state.guard_read_bytes())?;
     let artwork_indices: Vec<_> = tracks
         .iter()
         .enumerate()
@@ -601,7 +595,7 @@ fn prepare(journal: &Journal, current: &Current, selection: Selection) -> Result
                 .context("planned artwork missing")
         })
         .collect::<Result<_>>()?;
-    let artwork_bytes = artwork_read_budget(&expected_artwork_bytes, state.state_read_chunks()?)?;
+    let artwork_bytes = artwork_read_budget(&expected_artwork_bytes, state.guard_read_bytes())?;
     let total_bytes = total_bytes
         .checked_add(artwork_bytes)
         .context("total verification read bound overflow")?;
@@ -735,14 +729,16 @@ fn observed_artwork_status(
     }
 }
 
-fn artwork_read_budget(original_bytes: &[u64], state_chunks: u64) -> Result<u64> {
+/// The bytes reading `original_bytes` covers may take: each original, a
+/// derivative of at most the image bound, and both state guards around it,
+/// each reading `guard_bytes` at most.
+fn artwork_read_budget(original_bytes: &[u64], guard_bytes: u64) -> Result<u64> {
     ensure!(
         original_bytes.len() <= MAX_BINDINGS,
         "too many artwork bindings"
     );
-    let guards = state_chunks
+    let guards = guard_bytes
         .checked_mul(2)
-        .and_then(|n| n.checked_mul(CHUNK))
         .context("artwork state-read bound overflow")?;
     original_bytes.iter().try_fold(0u64, |total, &bytes| {
         ensure!(
@@ -762,12 +758,18 @@ fn artwork_read_budget(original_bytes: &[u64], state_chunks: u64) -> Result<u64>
     })
 }
 
-fn schedule(files: &[(usize, u64)], state_chunks: u64) -> Result<(Vec<Batch>, u64, u64)> {
+/// Connections for reading `files` (index, size), each between two state
+/// guards of at most `guard_requests` requests and `guard_bytes` bytes.
+fn schedule(
+    files: &[(usize, u64)],
+    guard_requests: u64,
+    guard_bytes: u64,
+) -> Result<(Vec<Batch>, u64, u64)> {
     ensure!(
         files.len() <= MAX_BINDINGS,
         "binding schedule exceeds limit"
     );
-    let fixed = state_chunks
+    let fixed = guard_requests
         .checked_mul(2)
         .and_then(|n| n.checked_add(128))
         .context("state operation budget overflow")?;
@@ -775,9 +777,8 @@ fn schedule(files: &[(usize, u64)], state_chunks: u64) -> Result<(Vec<Batch>, u6
         fixed < MAX_BOUNDED_OPS as u64,
         "state guards exceed one connection budget"
     );
-    let guard_bytes = state_chunks
-        .checked_mul(CHUNK)
-        .and_then(|n| n.checked_mul(2))
+    let guard_bytes = guard_bytes
+        .checked_mul(2)
         .context("state byte budget overflow")?;
     let mut batches = Vec::new();
     let mut indices = Vec::new();
@@ -824,7 +825,7 @@ fn schedule(files: &[(usize, u64)], state_chunks: u64) -> Result<(Vec<Batch>, u6
 }
 
 trait ReadBatch {
-    async fn state_guard(&mut self, state: &FreshState) -> Result<()>;
+    async fn state_guard(&mut self, state: &HeldState) -> Result<()>;
     async fn attributes(&mut self, path: &str) -> Result<Option<Attributes>>;
     /// Each path's attributes; a connection may ask for them all at once.
     async fn attributes_all(&mut self, paths: &[&str]) -> Result<Vec<Option<Attributes>>> {
@@ -838,8 +839,8 @@ trait ReadBatch {
     async fn mpeg_bytes(&mut self, path: &str, size: u64) -> Result<Vec<u8>>;
 }
 impl ReadBatch for Transfer {
-    async fn state_guard(&mut self, state: &FreshState) -> Result<()> {
-        state.verify_state(self).await
+    async fn state_guard(&mut self, state: &HeldState) -> Result<()> {
+        state.guard(self).await
     }
     async fn attributes(&mut self, path: &str) -> Result<Option<Attributes>> {
         self.stat(path).await
@@ -865,7 +866,7 @@ impl ReadBatch for Transfer {
 }
 async fn read_batch(
     reader: &mut impl ReadBatch,
-    state: &FreshState,
+    state: &HeldState,
     device: &[u8; 32],
     bindings: &[Binding],
     reports: &mut [TrackReport],
@@ -956,7 +957,7 @@ async fn read_batch(
             bounded_attributes(attrs)?;
         }
         ensure!(
-            stable_attrs(reports[index].audio_attributes.clone()) == stable_attrs(after),
+            same_stat(reports[index].audio_attributes.as_ref(), after.as_ref()),
             "audio attributes changed across verification readback"
         );
     }
@@ -988,12 +989,6 @@ async fn read_batch(
         }
     }
     Ok(())
-}
-fn stable_attrs(attrs: Option<Attributes>) -> Option<Attributes> {
-    attrs.map(|mut a| {
-        a.remove("st_atime");
-        a
-    })
 }
 fn bounded_attributes(attrs: &Attributes) -> Result<()> {
     ensure!(attrs.len() <= 64, "audio attributes exceed entry bound");

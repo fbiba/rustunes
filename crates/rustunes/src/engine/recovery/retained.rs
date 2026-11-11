@@ -5,21 +5,22 @@
 use crate::engine::execution::device::DeviceProvider;
 use crate::{
     engine::execution::insert,
-    engine::execution::native_insert::{
-        BoundSource, Control, FreshState, create_trace, durable_write,
-    },
+    engine::execution::native_insert::{BoundSource, Control, create_trace, durable_write},
     engine::planning::collections::{CandidateIds, Planner},
-    engine::state::current::Current,
+    engine::recovery::saved::{self, SavedCurrent},
+    engine::state::current::{Current, receipt},
+    engine::state::held::{ArtworkDb, HeldState},
     engine::state::journal::{
         Attempt, AttemptKind, AttemptState, CompletionEvidence, Identity, Journal, StartEvidence,
     },
 };
 use anyhow::{Context, Result, ensure};
+use music_protocol::catalogue::anchor;
 use music_protocol::catalogue::artwork_update;
 use music_protocol::catalogue::artwork_verification;
 use music_protocol::catalogue::identity;
 use music_protocol::catalogue::insert_verification::{self, ExpectedInsert};
-use music_protocol::catalogue::sqlite::{self, Catalog};
+use music_protocol::catalogue::sqlite::Catalog;
 use music_protocol::media::artwork::Cover;
 use music_protocol::media::fingerprint;
 use music_protocol::media::metadata;
@@ -313,17 +314,16 @@ where
             Some(verify_artwork_catalog(&attempt, &retained, current, &options, control.deadline)?)
         } else { None };
         control.check()?;
-        let mut state=FreshState::new(&current.device,&current.catalog,&current.raw_preferences,&current.plist_preferences,current.receipt_sha256)?;
-        state.bind_copied_cdb(&current.cdb)?;
+        let state=HeldState::new(current,current.receipt_sha256,ArtworkDb::NotHeld)?;
         let audio_bytes=attempt.prepared.content.source.file_bytes;
         ensure!(audio_bytes>0&&audio_bytes<=MAX_AUDIO,"prepared audio exceeds bounded recovery readback");
-        let operations=state.state_read_chunks()?.checked_mul(4).and_then(|n|n.checked_add(audio_bytes.div_ceil(65536)*2+256)).context("recovery read budget overflow")?;
+        let operations=state.guard_requests().checked_mul(4).and_then(|n|n.checked_add(audio_bytes.div_ceil(65536)*2+256)).context("recovery read budget overflow")?;
         ensure!(operations<=MAX_BOUNDED_OPS as u64,"recovery read budget exceeds one connection allowance");
         let provider=timeout_at(control.deadline.min(Instant::now()+Duration::from_secs(15)),connect()).await.context("recovery discovery deadline")??;
         ensure!(provider.udid==current.device,"recovery device differs from verified identity");
         let audio_trace=options.trace.join("audio");create_trace(&audio_trace)?;
         let mut afc=Transfer::connect_bounded_readonly_summary(&provider,&audio_trace,control.deadline,operations as usize,Arc::clone(&control.cancelled)).await?;
-        state.verify_state(&mut afc).await?;
+        state.guard(&mut afc).await?;
         let spool=options.trace.join("permanent-audio.m4a");
         let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&spool)?;
         let audio_hash=afc.read_exact(&attempt.prepared.content.path,audio_bytes,MAX_AUDIO,&mut file).await?;file.sync_all()?;
@@ -360,7 +360,7 @@ where
                 artwork_catalog_proof.context("verified artwork catalog proof missing")?
             }
         };
-        state.verify_state(&mut afc).await?;
+        state.guard(&mut afc).await?;
         let permanent_art=if let Some(art)=&attempt.prepared.content.artwork {
             let cover=retained.cover.as_ref().context("retained cover missing")?;
             let policy=retained.artwork_policy.context("an insertion carries no artwork")?;
@@ -393,9 +393,9 @@ where
         } else {None};
         // Recheck audio/state after any image decode/read so all completion
         // inputs remain tied to the same exact SQL/prefs/CDB snapshot.
-        state.verify_state(&mut afc).await?;
+        state.guard(&mut afc).await?;
         ensure!(afc.read_hash(&attempt.prepared.content.path,audio_bytes,MAX_AUDIO).await?==audio_hash,"permanent audio changed during recovery");
-        state.verify_state(&mut afc).await?;
+        state.guard(&mut afc).await?;
         if let Some(attributes) = ordinary_attributes {
             ensure!(afc.stat(&attempt.prepared.content.path).await? == Some(attributes), "ordinary target attributes changed during recovery");
         }
@@ -518,17 +518,12 @@ fn verify_artwork_catalog(
     directory(fresh_dir)?;
     let immediate_dir = fs::canonicalize(immediate_dir)?;
     let fresh_dir = fs::canonicalize(fresh_dir)?;
-    let receipt = read_bounded(&immediate_dir.join("state-receipt.json"), SMALL)?;
-    let immediate = crate::engine::recovery::saved::load_saved_current(
-        &crate::engine::recovery::saved::SavedCurrent {
-            directory: immediate_dir.clone(),
-            receipt_sha256: hex(&Sha256::digest(&receipt)),
-        },
-        &current.device,
-        options.trace,
-    )?;
-    let loaded_fresh = crate::engine::recovery::saved::load_saved_current(
-        &crate::engine::recovery::saved::SavedCurrent {
+    // Nothing earlier pins the step's own After: it loads as its receipt
+    // binds it. The fresh capture is pinned by the receipt it returned.
+    let immediate =
+        saved::load_unpinned_saved_current(&immediate_dir, &current.device, options.trace)?;
+    let loaded_fresh = saved::load_saved_current(
+        &SavedCurrent {
             directory: fresh_dir.clone(),
             receipt_sha256: hex(&current.receipt_sha256),
         },
@@ -769,9 +764,6 @@ pub fn load_run(
         .context("durable start evidence missing")?;
     directory(scratch)?;
     let (step, before_dir, input) = locate_step(run_dir, attempt.prepared.input_receipt_sha256)?;
-    directory(&before_dir)?;
-    let catalog_dir = before_dir.join("catalog");
-    directory(&catalog_dir)?;
     let input: Json = serde_json::from_slice(&input)?;
     check_pre_session(&input, attempt.prepared.kind)?;
     validate_input_schema(&input, attempt.prepared.kind)?;
@@ -780,81 +772,17 @@ pub fn load_run(
             == <[u8; 32]>::from(Sha256::digest(&attempt.prepared.operation)),
         "retained input operation digest differs"
     );
-    let state_bytes = read_bounded(&before_dir.join("state-receipt.json"), SMALL)?;
-    ensure!(
-        json_hash(&input, "current_state_receipt_sha256")?
-            == Sha256::digest(&state_bytes).as_slice(),
-        "retained before-state receipt is not bound to intent"
-    );
-    let state: Json = serde_json::from_slice(&state_bytes)?;
-    ensure!(
-        state["schema"] == "rustunes.current-state"
-            && state["media_anchor"].as_u64()
-                == Some(u64::from(attempt.prepared.current_media_anchor)),
-        "unsupported retained state revision"
-    );
-    ensure!(
-        json_hash(&state, "device_sha256")? == current.identity.device_digest()
-            && json_hash(&state, "library_sha256")? == current.identity.library_digest(),
-        "retained before-state namespace differs"
-    );
-    for (name, key) in [
-        ("iTunesPrefs", "raw_preferences_sha256"),
-        ("iTunesPrefs.plist", "plist_preferences_sha256"),
-        ("iTunesCDB", "cdb_sha256"),
-    ] {
-        let bytes = read_bounded(
-            &before_dir.join(name),
-            if name == "iTunesCDB" {
-                MAX_AUDIO
-            } else {
-                SMALL
-            },
-        )?;
-        ensure!(
-            json_hash(&state, key)? == Sha256::digest(&bytes).as_slice(),
-            "retained state file digest differs"
-        );
-        if name != "iTunesCDB" {
-            current.library.ensure_matches(&identity::parse(&bytes)?)?;
-        }
-    }
-    let database = catalog_dir.join("MediaLibrary.sqlitedb");
-    bounded_file(&database, MAX_AUDIO)?;
-    let wal = catalog_dir.join("MediaLibrary.sqlitedb-wal");
-    let wal = if state["wal_sha256"].is_null() {
-        ensure!(!wal.try_exists()?, "unbound retained WAL exists");
-        None
-    } else {
-        bounded_file(&wal, MAX_AUDIO)?;
-        Some(wal)
-    };
-    let before = sqlite::read_snapshot(&database, wal.as_deref(), scratch)?;
-    ensure!(
-        before.source_hashes().database == json_hash(&state, "database_sha256")?
-            && before.source_hashes().wal
-                == if state["wal_sha256"].is_null() {
-                    None
-                } else {
-                    Some(json_hash(&state, "wal_sha256")?)
-                },
-        "retained catalog hashes differ from state receipt"
-    );
-    ensure!(
-        before.persisted_media_anchor() == attempt.prepared.current_media_anchor
-            && before.database_pid() == current.catalog.database_pid()
-            && before.primary_container_pid() == current.catalog.primary_container_pid(),
-        "retained catalog identity or anchor differs"
-    );
-    let saved = music_protocol::catalogue::anchor::parse(&read_bounded(
-        &before_dir.join("iTunesCDB"),
-        MAX_AUDIO,
-    )?)?;
-    ensure!(
-        saved.database_pid() == before.database_pid()
-            && saved.saved_voice_memo_anchor() == templates::QUALIFIED_VOICE_MEMO_ANCHOR,
-        "retained CDB profile differs from before catalog"
-    );
+    let Before {
+        catalog: before,
+        database,
+        wal,
+    } = load_before(
+        &before_dir,
+        &input,
+        attempt.prepared.current_media_anchor,
+        current,
+        scratch,
+    )?;
     let transfer = if attempt.prepared.kind == AttemptKind::Insert {
         ordinary_preflight_directory(&step, &input)?.join("transfer")
     } else {
@@ -937,6 +865,64 @@ pub fn load_run(
         pending_sha256: pending_bytes.map(|bytes| Sha256::digest(&bytes).into()),
         artwork_policy,
         source: planned_source(run_dir, &input)?,
+    })
+}
+
+/// The Before a retained step was prepared from: its catalogue, and the
+/// paths of that catalogue's database and log.
+pub(crate) struct Before {
+    pub(crate) catalog: Catalog,
+    pub(crate) database: PathBuf,
+    pub(crate) wal: Option<PathBuf>,
+}
+
+/// Load the Before at `before_dir` with the saved Current reader, pinned by
+/// the state receipt `input` names, and check it is the state the attempt
+/// was prepared from on this phone: `current`'s device and library, the
+/// catalogue at `prepared_anchor` with `current`'s database and container,
+/// and a CDB, when the phone had one, saved at VoiceMemo anchor 1.
+pub(crate) fn load_before(
+    before_dir: &Path,
+    input: &Json,
+    prepared_anchor: u32,
+    current: &Current,
+    scratch: &Path,
+) -> Result<Before> {
+    directory(before_dir)?;
+    let before_dir = fs::canonicalize(before_dir)?;
+    let spec = SavedCurrent {
+        directory: before_dir.clone(),
+        receipt_sha256: hex(&json_hash(input, "current_state_receipt_sha256")?),
+    };
+    let loaded = saved::load_saved_current(&spec, &current.device, scratch)
+        .context("retained before-state")?
+        .current;
+    ensure!(
+        loaded.identity.device_digest() == current.identity.device_digest()
+            && loaded.identity.library_digest() == current.identity.library_digest(),
+        "retained before-state namespace differs"
+    );
+    current.library.ensure_matches(&loaded.library)?;
+    let catalog = loaded.catalog;
+    ensure!(
+        catalog.persisted_media_anchor() == prepared_anchor
+            && catalog.database_pid() == current.catalog.database_pid()
+            && catalog.primary_container_pid() == current.catalog.primary_container_pid(),
+        "retained catalog identity or anchor differs"
+    );
+    if let Some(cdb) = loaded.cdb.bytes() {
+        ensure!(
+            anchor::parse(cdb)?.saved_voice_memo_anchor() == templates::QUALIFIED_VOICE_MEMO_ANCHOR,
+            "retained CDB profile differs from before catalog"
+        );
+    }
+    Ok(Before {
+        database: receipt::DATABASE.at(&before_dir),
+        wal: catalog
+            .source_hashes()
+            .wal
+            .map(|_| receipt::WAL.at(&before_dir)),
+        catalog,
     })
 }
 

@@ -19,23 +19,39 @@ use crate::catalogue::identity::LibraryIdentity;
 /// alone cannot authenticate their association. The caller's stable capture
 /// and full identity binding establish that association. The stale CDB Media
 /// anchor is deliberately not substituted for the current SQL/Ready anchor.
+///
+/// `None` is a phone with no iTunesCDB: only Apple's computers write one and
+/// the phone never reads it (docs/10 §5), so a phone `rustunes
+/// init` prepared has none. Its VoiceMemo anchor is then the qualified 1, the
+/// value Apple's host starts every dataclass at (docs/10 §5.3).
 pub fn build_from_copied_cdb(
-    copied_cdb: &[u8],
+    copied_cdb: Option<&[u8]>,
     catalog: &crate::catalogue::sqlite::Catalog,
     identity: &LibraryIdentity,
     host_name: &str,
 ) -> Result<Templates> {
-    let saved = crate::catalogue::anchor::parse(copied_cdb)?;
-    ensure!(
-        saved.database_pid() != 0 && saved.database_pid() == catalog.database_pid(),
-        "saved CDB and current catalog database identities disagree"
-    );
     build(
         identity,
         host_name,
         catalog.persisted_media_anchor(),
-        saved.saved_voice_memo_anchor(),
+        copied_voice_memo_anchor(copied_cdb, catalog.database_pid())?,
     )
+}
+
+/// The saved VoiceMemo anchor of a bounded CDB copy whose database PID is the
+/// current SQL catalogue's `database_pid`, or the qualified 1 when there is no
+/// copy (see `build_from_copied_cdb`). `build` refuses any other value; a
+/// caller that binds the copy without building a request yet checks it here.
+pub fn copied_voice_memo_anchor(copied_cdb: Option<&[u8]>, database_pid: u64) -> Result<u32> {
+    let Some(copied_cdb) = copied_cdb else {
+        return Ok(QUALIFIED_VOICE_MEMO_ANCHOR);
+    };
+    let saved = crate::catalogue::anchor::parse(copied_cdb)?;
+    ensure!(
+        saved.database_pid() != 0 && saved.database_pid() == database_pid,
+        "saved CDB and current catalog database identities disagree"
+    );
+    Ok(saved.saved_voice_memo_anchor())
 }
 
 /// The only non-Media anchor qualified by the closed native and Linux sessions.

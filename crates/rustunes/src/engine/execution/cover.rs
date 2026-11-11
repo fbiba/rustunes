@@ -95,10 +95,7 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         Arc::clone(&capture_control.cancelled),
     )
     .await?;
-    let artwork_db = current
-        .artwork_db
-        .as_deref()
-        .context("artwork database capture absent")?;
+    let artwork_db = current.artwork_db.captured_bytes("artwork database")?;
     let target = current
         .catalog
         .tracks()
@@ -213,15 +210,7 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         return Ok(result);
     }
     let input_hash = Sha256::digest(&bytes).into();
-    let state = FreshArtworkState::new(
-        &current.device,
-        &current.catalog,
-        &current.raw_preferences,
-        &current.plist_preferences,
-        artwork_db,
-        &current.cdb,
-        input_hash,
-    )?;
+    let state = FreshArtworkState::new(&current, input_hash)?;
     let mut content = binding.content.clone();
     content.artwork = Some(Artwork {
         cache_id: cache,

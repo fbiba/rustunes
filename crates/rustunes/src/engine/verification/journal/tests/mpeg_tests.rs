@@ -106,7 +106,7 @@ impl MpegMock {
     }
 }
 impl ReadBatch for MpegMock {
-    async fn state_guard(&mut self, _: &FreshState) -> Result<()> {
+    async fn state_guard(&mut self, _: &HeldState) -> Result<()> {
         self.guards += 1;
         ensure!(
             !(self.fail_final_guard && self.guards == 2),
@@ -286,8 +286,8 @@ fn mpeg_tag_spans_and_native_transfer_size_ceiling_are_explicit() {
     assert_eq!(json["trailing_tag_bytes"], 128);
     assert_eq!(json["encoded_identity_verified"], false);
     // Scheduling uses the same fixed cap as upload/readback, never a new lower cap.
-    assert!(schedule(&[(0, MAX_AUDIO)], 1).is_ok());
-    assert!(schedule(&[(0, MAX_AUDIO + 1)], 1).is_err());
+    assert!(schedule(&[(0, MAX_AUDIO)], 1, CHUNK).is_ok());
+    assert!(schedule(&[(0, MAX_AUDIO + 1)], 1, CHUNK).is_err());
     let c = mpeg_current(MAX_AUDIO + 1);
     let mut oversized = content;
     oversized.source.file_bytes = MAX_AUDIO + 1;
@@ -330,7 +330,7 @@ async fn mixed_alac_mpeg_schedule_keeps_both_typed_paths_and_alac_track_bytes() 
         alac: Mock,
     }
     impl ReadBatch for Mixed {
-        async fn state_guard(&mut self, s: &FreshState) -> Result<()> {
+        async fn state_guard(&mut self, s: &HeldState) -> Result<()> {
             self.mpeg.state_guard(s).await
         }
         async fn attributes(&mut self, path: &str) -> Result<Option<Attributes>> {

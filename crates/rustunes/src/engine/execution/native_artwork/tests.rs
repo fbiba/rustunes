@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::state::current::DeviceFile;
 use crate::engine::state::journal::{Artwork, CompletionEvidence};
 use music_protocol::media::fingerprint;
 use std::{
@@ -105,17 +106,23 @@ fn prefs() -> Vec<u8> {
     raw[20..28].copy_from_slice(&2u64.to_le_bytes());
     raw
 }
-fn state(catalog: &Catalog) -> FreshArtworkState<'_> {
-    FreshArtworkState::new(
-        "synthetic",
+fn current() -> Current {
+    let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
+    let library = music_protocol::catalogue::identity::parse(&prefs()).unwrap();
+    Current {
+        device: "synthetic".into(),
+        identity: Identity::new("synthetic", &library).unwrap(),
+        library,
+        cdb: DeviceFile::Present(cdb(&catalog)),
         catalog,
-        &prefs(),
-        &prefs(),
-        &saved_art(677),
-        &cdb(catalog),
-        [7; 32],
-    )
-    .unwrap()
+        raw_preferences: prefs(),
+        plist_preferences: prefs(),
+        artwork_db: DeviceFile::Present(saved_art(677)),
+        receipt_sha256: [7; 32],
+    }
+}
+fn state(current: &Current) -> FreshArtworkState<'_> {
+    FreshArtworkState::new(current, [7; 32]).unwrap()
 }
 fn journal(temp: &Temp, source: &Path) -> Journal {
     let mut journal = Journal::create(
@@ -158,7 +165,7 @@ fn prepare(journal: &mut Journal, catalog: &Catalog, source: &Path) -> AttemptId
         .remove(0)
         .content;
     content.artwork = Some(Artwork {
-        cache_id: allocate_cache_id(catalog, &saved_art(677), journal).unwrap(),
+        cache_id: allocate_cache_id(catalog, Some(&saved_art(677)), journal).unwrap(),
         bytes: cover.bytes.len() as u64,
         sha256: cover.sha256,
     });
@@ -193,17 +200,35 @@ fn control() -> Control {
 fn allocator_unions_saved_sql_and_all_history_without_reusing_counter() {
     let mut saved = artwork_inventory::parse(&saved_art(677)).unwrap();
     assert_eq!(
-        next_cache(&saved, &BTreeSet::from([0, 677]), &BTreeSet::new()).unwrap(),
+        next_cache(Some(&saved), &BTreeSet::from([0, 677]), &BTreeSet::new()).unwrap(),
         678
     );
     saved.images.insert(800, 42);
     assert_eq!(
-        next_cache(&saved, &BTreeSet::from([900]), &BTreeSet::from([1000])).unwrap(),
+        next_cache(
+            Some(&saved),
+            &BTreeSet::from([900]),
+            &BTreeSet::from([1000])
+        )
+        .unwrap(),
         1001
     );
-    assert!(next_cache(&saved, &BTreeSet::from([u32::MAX]), &BTreeSet::new()).is_err());
+    assert!(next_cache(Some(&saved), &BTreeSet::from([u32::MAX]), &BTreeSet::new()).is_err());
     saved.next_record_id = 99;
-    assert!(next_cache(&saved, &BTreeSet::new(), &BTreeSet::new()).is_err());
+    assert!(next_cache(Some(&saved), &BTreeSet::new(), &BTreeSet::new()).is_err());
+}
+
+#[test]
+fn without_a_saved_artwork_database_the_counter_starts_at_the_floor() {
+    assert_eq!(
+        next_cache(None, &BTreeSet::new(), &BTreeSet::new()).unwrap(),
+        101
+    );
+    assert_eq!(
+        next_cache(None, &BTreeSet::from([0, 300]), &BTreeSet::from([200])).unwrap(),
+        301
+    );
+    assert!(next_cache(None, &BTreeSet::from([u32::MAX]), &BTreeSet::new()).is_err());
 }
 
 #[test]
@@ -214,10 +239,10 @@ fn cancelled_reservation_is_never_reused_and_outstanding_blocks_allocation() {
     let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
     let mut journal = journal(&temp, &original);
     let id = prepare(&mut journal, &catalog, &desired);
-    assert!(allocate_cache_id(&catalog, &saved_art(677), &journal).is_err());
+    assert!(allocate_cache_id(&catalog, Some(&saved_art(677)), &journal).is_err());
     journal.cancel_prepared(id).unwrap();
     assert_eq!(
-        allocate_cache_id(&catalog, &saved_art(677), &journal).unwrap(),
+        allocate_cache_id(&catalog, Some(&saved_art(677)), &journal).unwrap(),
         679
     );
 }
@@ -227,10 +252,11 @@ fn desired_cover_edit_preserves_transferred_audio_and_rebuilds_exact_operation()
     let temp = Temp::new();
     let original = temp.source(false);
     let desired = temp.source(true);
-    let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
-    let state = state(&catalog);
+    let current = current();
+    let catalog = &current.catalog;
+    let state = state(&current);
     let mut journal = journal(&temp, &original);
-    let id = prepare(&mut journal, &catalog, &desired);
+    let id = prepare(&mut journal, catalog, &desired);
     let mut attempt = journal.attempt(id).unwrap();
     let expected = fingerprint::read(&desired).unwrap();
     let cover = artwork::read(&desired).unwrap().cover.unwrap();
@@ -267,10 +293,11 @@ fn wrong_anchor_receipt_audio_cover_and_cache_fail_preparation() {
     let temp = Temp::new();
     let original = temp.source(false);
     let desired = temp.source(true);
-    let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
-    let state = state(&catalog);
+    let current = current();
+    let catalog = &current.catalog;
+    let state = state(&current);
     let mut journal = journal(&temp, &original);
-    let id = prepare(&mut journal, &catalog, &desired);
+    let id = prepare(&mut journal, catalog, &desired);
     let expected = fingerprint::read(&desired).unwrap();
     let cover = artwork::read(&desired).unwrap().cover.unwrap();
     for change in 0..6 {
@@ -295,10 +322,11 @@ async fn guards_and_discovery_failure_leave_prepared_and_never_connect_on_bad_so
     let temp = Temp::new();
     let original = temp.source(false);
     let desired = temp.source(true);
-    let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
-    let state = state(&catalog);
+    let current = current();
+    let catalog = &current.catalog;
+    let state = state(&current);
     let mut journal = journal(&temp, &original);
-    let id = prepare(&mut journal, &catalog, &desired);
+    let id = prepare(&mut journal, catalog, &desired);
     let expected = fingerprint::read(&desired).unwrap();
     let calls = AtomicUsize::new(0);
     for valid in [false, true] {
@@ -341,35 +369,18 @@ async fn guards_and_discovery_failure_leave_prepared_and_never_connect_on_bad_so
 
 #[test]
 fn cdb_binding_and_deadline_budget_are_strict() {
-    let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
-    let mut wrong = cdb(&catalog);
-    wrong[0x48] ^= 1;
-    assert!(
-        FreshArtworkState::new(
-            "synthetic",
-            &catalog,
-            &prefs(),
-            &prefs(),
-            &saved_art(677),
-            &wrong,
-            [7; 32]
-        )
-        .is_err()
-    );
-    let state = state(&catalog);
-    assert!(
-        operation_budget(
-            state.common.state_read_chunks().unwrap(),
-            state.artwork_bytes,
-            12345,
-            4
-        )
-        .unwrap()
-            < 1024
-    );
-    assert!(operation_budget(u64::MAX, 0, 0, 0).is_err());
-    assert!(operation_budget(4000, MAX_ASSET, MAX_AUDIO, MAX_ASSET).is_err());
-    assert!(operation_budget(1, MAX_ASSET + 1, 1, 1).is_err());
+    let mut wrong = current();
+    let mut bytes = cdb(&wrong.catalog);
+    bytes[0x48] ^= 1;
+    wrong.cdb = DeviceFile::Present(bytes);
+    assert!(FreshArtworkState::new(&wrong, [7; 32]).is_err());
+    let current = current();
+    let state = state(&current);
+    assert!(operation_budget(state.common.guard_requests(), 12345, 4).unwrap() < 1024);
+    assert!(operation_budget(u64::MAX, 0, 0).is_err());
+    assert!(operation_budget(4000, MAX_AUDIO, MAX_ASSET).is_err());
+    assert!(operation_budget(1, MAX_AUDIO + 1, 1).is_err());
+    assert!(operation_budget(1, 1, MAX_ASSET + 1).is_err());
 }
 
 #[test]
@@ -411,10 +422,11 @@ async fn interrupted_started_and_cancelled_deadline_never_open_connector() {
     let temp = Temp::new();
     let original = temp.source(false);
     let desired = temp.source(true);
-    let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
-    let state = state(&catalog);
+    let current = current();
+    let catalog = &current.catalog;
+    let state = state(&current);
     let mut journal = journal(&temp, &original);
-    let id = prepare(&mut journal, &catalog, &desired);
+    let id = prepare(&mut journal, catalog, &desired);
     let expected = fingerprint::read(&desired).unwrap();
     let trace = temp.0.join("never-created");
     for expired in [false, true] {

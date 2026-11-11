@@ -1,5 +1,6 @@
-//! The files a computer's music library leaves on the phone, which rustunes
-//! reads, and the error that names one when it is not there.
+//! The files a computer's music library leaves on the phone and the phone's
+//! own catalogue files, which rustunes reads, and the error that names one
+//! when it is not there.
 use std::fmt;
 
 /// The library identity the last computer wrote (`frpd` 1.25, 1,232 bytes).
@@ -10,6 +11,11 @@ pub const PREFS_PLIST: &str = "iTunes_Control/iTunes/iTunesPrefs.plist";
 /// renaming it into place; one is left only by a write that stopped.
 pub const PREFS_TEMPORARY: &str = "iTunes_Control/iTunes/iTunesPrefs.tmp";
 pub const PREFS_PLIST_TEMPORARY: &str = "iTunes_Control/iTunes/iTunesPrefs.plist.tmp";
+/// The phone's own SQL catalogue of its library, and the write-ahead log
+/// and shared-memory index SQLite keeps beside it.
+pub const DATABASE: &str = "iTunes_Control/iTunes/MediaLibrary.sqlitedb";
+pub const DATABASE_WAL: &str = "iTunes_Control/iTunes/MediaLibrary.sqlitedb-wal";
+pub const DATABASE_SHM: &str = "iTunes_Control/iTunes/MediaLibrary.sqlitedb-shm";
 /// The computer's saved catalogue (anchors and database PID).
 pub const CDB: &str = "iTunes_Control/iTunes/iTunesCDB";
 /// The computer's artwork image library (cache-ID counter).

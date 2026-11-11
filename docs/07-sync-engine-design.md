@@ -1299,7 +1299,10 @@ When a run finishes its phone work but the journal is not updated (a crash
 between the phone write and the commit), the retained run directory has the
 signed session, the Before and the transfer record. Recovery rebuilds the
 original operation from retained evidence and the source, checks the fresh
-state, and completes only the local journal.
+state, and completes only the local journal. The Before is loaded by the
+reader every saved Current goes through, pinned by the state receipt the
+attempt's input names: each file that receipt binds must be there with its
+hash, and no file it records as absent.
 
 `resume --run-dir` reconciles a Started attempt from its retained Started
 operation without replay. The fresh state must be exactly one revision past

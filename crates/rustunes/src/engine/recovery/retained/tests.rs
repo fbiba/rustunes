@@ -1,5 +1,11 @@
 use super::*;
+use crate::engine::state::current::{
+    DeviceFile,
+    fixtures::{self, Saved, Shape},
+    receipt::Form,
+};
 use crate::engine::state::journal::{Content, PreparedAttempt};
+use crate::engine::state::retained_files as io;
 use crate::engine::verification::artwork;
 use music_protocol::catalogue::artwork_verification;
 use music_protocol::media::fingerprint;
@@ -90,45 +96,19 @@ impl Drop for Temp {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
-fn prefs() -> Vec<u8> {
-    let mut p = vec![0; 1232];
-    p[..4].copy_from_slice(b"frpd");
-    p[4..6].copy_from_slice(&1u16.to_le_bytes());
-    p[6..8].copy_from_slice(&25u16.to_le_bytes());
-    p[8] = 1;
-    p[12..20].copy_from_slice(&1u64.to_le_bytes());
-    p[20..28].copy_from_slice(&2u64.to_le_bytes());
-    p
-}
-fn put(b: &mut [u8], at: usize, v: u32) {
-    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-}
 fn current() -> Current {
     let catalog = music_protocol::test_support::catalogue::collection_catalog(13);
-    let library = music_protocol::catalogue::identity::parse(&prefs()).unwrap();
-    let mut cdb = vec![0; 388];
-    cdb[..4].copy_from_slice(b"mhbd");
-    put(&mut cdb, 4, 244);
-    put(&mut cdb, 8, 388);
-    put(&mut cdb, 12, 1);
-    put(&mut cdb, 16, 117);
-    put(&mut cdb, 20, 1);
-    cdb[0x48..0x50].copy_from_slice(&catalog.database_pid().to_le_bytes());
-    cdb[244..248].copy_from_slice(b"mhsd");
-    put(&mut cdb, 248, 96);
-    put(&mut cdb, 252, 144);
-    put(&mut cdb, 256, 11);
-    put(&mut cdb, 340, 1);
-    put(&mut cdb, 348, 1);
+    let library = music_protocol::catalogue::identity::parse(&fixtures::prefs()).unwrap();
+    let cdb = fixtures::cdb(catalog.database_pid(), 1);
     Current {
         device: "synthetic".into(),
         identity: Identity::new("synthetic", &library).unwrap(),
         library,
         catalog,
-        raw_preferences: prefs(),
-        plist_preferences: prefs(),
-        cdb,
-        artwork_db: None,
+        raw_preferences: fixtures::prefs(),
+        plist_preferences: fixtures::prefs(),
+        cdb: DeviceFile::Present(cdb),
+        artwork_db: DeviceFile::NotCaptured,
         receipt_sha256: [7; 32],
     }
 }
@@ -1324,4 +1304,130 @@ fn mpeg_started_dispatch_refuses_before_capture_or_replay() {
         _ => panic!("MPEG must refuse before any capture callback"),
     }
     assert_eq!(before, fs::read(directory.join("journal.sqlite")).unwrap());
+}
+
+/// The input of a step prepared from `before`, naming its receipt.
+fn input_of(before: &Saved) -> Json {
+    json!({"current_state_receipt_sha256": hex(&before.current.receipt_sha256)})
+}
+
+/// A capture's Before in a directory of its own.
+fn before(temp: &Temp, shape: Shape) -> Saved {
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    fixtures::write(&temp.0.join(format!("before-{n}")), shape)
+}
+
+/// A Before as a capture leaves it, with a CDB or, on a phone `rustunes
+/// init` prepared, none; with the ArtworkDB a cover session captures; and
+/// as 0.1.1 left it: each loads as the catalogue the attempt was prepared
+/// from, with the paths of its database and log.
+#[test]
+fn a_before_loads_as_the_catalogue_the_attempt_was_prepared_from() {
+    let temp = Temp::new();
+    for shape in [
+        Shape::synced(),
+        Shape {
+            voice_memo: None,
+            artwork_db: DeviceFile::Absent,
+            form: Form::Pretty,
+            released: false,
+        },
+        Shape {
+            artwork_db: DeviceFile::Present(fixtures::artwork_db()),
+            ..Shape::synced()
+        },
+        Shape {
+            form: Form::Pretty,
+            released: true,
+            ..Shape::synced()
+        },
+    ] {
+        let saved = before(&temp, shape);
+        let loaded =
+            load_before(&saved.directory, &input_of(&saved), 13, &current(), &temp.0).unwrap();
+        assert_eq!(
+            loaded.catalog.source_hashes().database,
+            saved.current.catalog.source_hashes().database
+        );
+        assert_eq!(
+            (loaded.database, loaded.wal),
+            (saved.directory.join("catalog/MediaLibrary.sqlitedb"), None)
+        );
+    }
+}
+
+#[test]
+fn a_before_other_than_the_prepared_state_is_refused() {
+    let temp = Temp::new();
+    let refused = |saved: &Saved, input: &Json, anchor: u32, current: &Current, reason: &str| {
+        let error = load_before(&saved.directory, input, anchor, current, &temp.0)
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_default();
+        assert!(error.contains(reason), "{reason}: {error}");
+    };
+    // An iTunesCDB beside a receipt that binds none.
+    let saved = before(
+        &temp,
+        Shape {
+            voice_memo: None,
+            ..Shape::synced()
+        },
+    );
+    io::write(&saved.directory.join("iTunesCDB"), b"unbound").unwrap();
+    refused(
+        &saved,
+        &input_of(&saved),
+        13,
+        &current(),
+        "unbound iTunesCDB",
+    );
+    // A bound file with other bytes.
+    let saved = before(&temp, Shape::synced());
+    let path = saved.directory.join("iTunesCDB");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0x154] ^= 1;
+    fs::remove_file(&path).unwrap();
+    io::write(&path, &bytes).unwrap();
+    refused(
+        &saved,
+        &input_of(&saved),
+        13,
+        &current(),
+        "iTunesCDB differs",
+    );
+    // A receipt the input does not name.
+    let saved = before(&temp, Shape::synced());
+    let other = json!({"current_state_receipt_sha256": hex(&[7; 32])});
+    refused(&saved, &other, 13, &current(), "receipt differs");
+    // Another phone.
+    let mut elsewhere = current();
+    elsewhere.device = "elsewhere".into();
+    elsewhere.identity = Identity::new("elsewhere", &elsewhere.library).unwrap();
+    refused(
+        &saved,
+        &input_of(&saved),
+        13,
+        &elsewhere,
+        "device/library differs",
+    );
+    // The catalogue at another anchor than the prepared one.
+    refused(&saved, &input_of(&saved), 12, &current(), "anchor differs");
+    // A CDB saved at a VoiceMemo anchor other than 1.
+    for voice_memo in [0, 2] {
+        let saved = before(
+            &temp,
+            Shape {
+                voice_memo: Some(voice_memo),
+                ..Shape::synced()
+            },
+        );
+        refused(
+            &saved,
+            &input_of(&saved),
+            13,
+            &current(),
+            "CDB profile differs",
+        );
+    }
 }

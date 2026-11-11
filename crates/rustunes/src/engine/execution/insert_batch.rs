@@ -33,13 +33,14 @@ use crate::{
     engine::execution::device,
     engine::execution::native_artwork,
     engine::execution::native_insert::{
-        self, BoundSource, Control, FreshState, create_trace, durable_write, sync_trace,
+        BoundSource, Control, create_trace, durable_write, sync_trace,
     },
     engine::planning::collections::{CandidateIds, Planner},
     engine::planning::source_collection::mp3::preparation::PreparedSource,
     engine::recovery::retained::playback::{self, Window, between_runs},
     engine::state::audio_index::Absent,
     engine::state::current,
+    engine::state::held::{self, ArtworkDb, HeldState},
     engine::state::journal::{
         Artwork, BatchRecord, BatchState, CompletionEvidence, Content, CoordinationId, Identity,
         InsertBatchId, InsertBatchRecord, InsertBatchState, InsertIntent, InsertTarget, Journal,
@@ -66,13 +67,10 @@ use music_protocol::media::artwork::{self, Cover};
 use music_protocol::media::fingerprint::{SourceFingerprint, TransferredSource};
 use music_protocol::media::metadata::{self, Metadata};
 use music_protocol::protocol::session::{self, Session};
-use music_protocol::protocol::templates;
-use music_protocol::protocol::transfer::{MAX_ASSET, MAX_SESSION_OPS, Transfer};
+use music_protocol::protocol::transfer::{MAX_SESSION_OPS, Transfer};
 
 const AIRLOCK: &str = "Airlock/Media";
 const ARTWORK: &str = "Airlock/Media/Artwork";
-const ARTWORK_DB: &str = "iTunes_Control/Artwork/ArtworkDB";
-const CHUNK: u64 = 64 * 1024;
 const STAGING: &str = "iTunes_Control/Sync/Media";
 
 /// One planned addition: the validated source and the saved plan's
@@ -373,8 +371,7 @@ pub(crate) fn plan(
         let saved = before
             .current
             .artwork_db
-            .as_deref()
-            .context("artwork database capture absent")?;
+            .captured_bytes("artwork database")?;
         Some(native_artwork::allocate_cache_id(catalog, saved, journal)?)
     } else {
         None
@@ -694,16 +691,15 @@ pub(crate) fn hold(members: &[Member]) -> Result<Vec<BoundSource>> {
 /// send: the bound state, the prepared session and each connection's
 /// operation allowance.
 pub(crate) struct Checked {
-    state: FreshState,
+    state: HeldState,
     session: session::Prepared,
     guard_operations: usize,
     upload_connections: Vec<Option<usize>>,
-    artwork_db: Option<(u64, [u8; 32])>,
 }
 
 /// The phone asks for each covered member's audio and artwork together.
 fn audio_policy<'a>(
-    state: &'a FreshState,
+    state: &'a HeldState,
     members: &[Member],
 ) -> Result<music_protocol::protocol::ancillary::AudioPolicy<'a>> {
     let assets: Vec<(String, bool)> = members
@@ -724,18 +720,16 @@ pub(crate) fn check_session(
     input_receipt: [u8; 32],
     host_name: &str,
     hold_artwork: bool,
-    validate: impl FnOnce(&FreshState) -> Result<()>,
+    validate: impl FnOnce(&HeldState) -> Result<()>,
 ) -> Result<Checked> {
     let current = &before.current;
     let base_anchor = before.anchor();
-    let mut state = FreshState::new(
-        &current.device,
-        &current.catalog,
-        &current.raw_preferences,
-        &current.plist_preferences,
-        input_receipt,
-    )?;
-    state.bind_copied_cdb(&current.cdb)?;
+    let covered = members.iter().filter(|m| m.cover.is_some()).count();
+    let artwork = match covered == 0 && !hold_artwork {
+        true => ArtworkDb::NotHeld,
+        false => ArtworkDb::Held,
+    };
+    let state = HeldState::new(current, input_receipt, artwork)?;
     ensure!(
         state.media_anchor() == base_anchor,
         "insert state anchor differs from the snapshot"
@@ -743,38 +737,23 @@ pub(crate) fn check_session(
     validate(&state)?;
     let library_id = current.library.library_id().to_owned();
     audio_policy(&state, members)?.ensure_session(&library_id, base_anchor)?;
-    let covered = members.iter().filter(|m| m.cover.is_some()).count();
-    let artwork_db = match covered == 0 && !hold_artwork {
-        true => None,
-        false => {
-            let saved = current
-                .artwork_db
-                .as_deref()
-                .context("artwork database capture absent")?;
-            Some((saved.len() as u64, sha(saved)))
-        }
-    };
-    let templates = templates::build_from_copied_cdb(
-        &current.cdb,
-        &current.catalog,
-        &current.library,
-        host_name,
-    )?;
+    let templates = state.templates(host_name)?;
     let session = session::prepare(
         templates.request,
         &templates.finished,
         &library_id,
         base_anchor,
     )?;
-    // Covers add, per guard, the saved ArtworkDB readback and each stage's
-    // absence; per upload, the cover's write and readback.
+    // With the ArtworkDB held, covers add per guard the staging folder and
+    // each stage's absence; per upload, the cover's write and readback.
     let guard_operations = crate::engine::execution::native_insert::batch_guard_budget(
         &state,
         members.len(),
         operation.len(),
-    )? + artwork_db.map_or(0, |(bytes, _)| {
-        2 * (bytes.div_ceil(CHUNK) as usize + 4 * covered + 8)
-    });
+    )? + match state.holds_artwork() {
+        true => 2 * (4 * covered + 8),
+        false => 0,
+    };
     ensure!(
         guard_operations <= MAX_SESSION_OPS,
         "insert batch guard allowance exceeds bound"
@@ -801,7 +780,6 @@ pub(crate) fn check_session(
         session,
         guard_operations,
         upload_connections: connections(&upload_operations),
-        artwork_db,
     })
 }
 
@@ -846,7 +824,6 @@ pub(crate) async fn send_session<T: session::StartedOperation>(
         session: session_prepared,
         guard_operations,
         upload_connections,
-        artwork_db,
     } = checked;
     let send = evidence.join("send");
     let policy = match audio_policy(&state, members).and_then(|policy| {
@@ -889,7 +866,7 @@ pub(crate) async fn send_session<T: session::StartedOperation>(
             .await?,
         );
         crate::engine::execution::native_insert::batch_guard(afc, &state, &names).await?;
-        artwork_guard(afc, &covered, artwork_db).await?;
+        cover_stage_guard(afc, &state, &covered).await?;
         for source in held.iter() {
             source.check()?;
         }
@@ -897,7 +874,7 @@ pub(crate) async fn send_session<T: session::StartedOperation>(
         let live = session
             .insert(Session::connect(found, session_prepared, &send, control.deadline).await?);
         crate::engine::execution::native_insert::batch_guard(afc, &state, &names).await?;
-        artwork_guard(afc, &covered, artwork_db).await?;
+        cover_stage_guard(afc, &state, &covered).await?;
         for source in held.iter() {
             source.check()?;
         }
@@ -1031,20 +1008,16 @@ pub(crate) async fn send_session<T: session::StartedOperation>(
     Sent::Started(wire)
 }
 
-/// With covers: the saved ArtworkDB the cache IDs were allocated from is
-/// unchanged, and no member's cover stage exists yet.
-async fn artwork_guard(
+/// With the ArtworkDB held (the state guard holds it as the cache IDs were
+/// allocated from it): no member's cover stage exists yet.
+async fn cover_stage_guard(
     afc: &mut Transfer,
+    state: &HeldState,
     covered: &[&Member],
-    saved: Option<(u64, [u8; 32])>,
 ) -> Result<()> {
-    let Some((bytes, digest)) = saved else {
+    if !state.holds_artwork() {
         return Ok(());
-    };
-    ensure!(
-        afc.read_hash(ARTWORK_DB, bytes, MAX_ASSET).await? == digest,
-        "the phone's ArtworkDB changed since the cover cache IDs were allocated"
-    );
+    }
     afc.require_directory_or_absent(ARTWORK).await?;
     for member in covered {
         afc.require_absent(&member.artwork_stage()).await?;
@@ -2088,7 +2061,7 @@ async fn verify_covers(
                 drift: None,
             });
         }
-        Err(error) if native_insert::is_state_read_drift(&error) => format!("{error:#}"),
+        Err(error) if held::is_refreshable_drift(&error) => format!("{error:#}"),
         Err(error) => return Err(error),
     };
     let again = "current-again";

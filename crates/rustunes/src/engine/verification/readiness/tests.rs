@@ -44,7 +44,11 @@ fn synced_library() -> LibraryState {
 
 /// A phone as Setup Assistant leaves it: a database and nothing else.
 pub(crate) fn fresh() -> Inspection {
-    let present = ["iTunes_Control", "iTunes_Control/iTunes", DATABASE];
+    let present = [
+        "iTunes_Control",
+        "iTunes_Control/iTunes",
+        device_files::DATABASE,
+    ];
     Inspection {
         product_type: "iPhone99,1".into(),
         product_version: "27.2".into(),
@@ -54,7 +58,7 @@ pub(crate) fn fresh() -> Inspection {
             .iter()
             .map(|path| {
                 let state = present.contains(path).then(|| {
-                    if *path == DATABASE {
+                    if *path == device_files::DATABASE {
                         file(4096)
                     } else {
                         directory()

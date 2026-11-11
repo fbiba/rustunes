@@ -149,7 +149,7 @@ mod qualified_factory {
         let catalog = catalogue_fixture::collection_catalog(13);
         let id = identity(1, 2);
         let bytes = cdb(catalog.database_pid(), 1);
-        let pair = templates::build_from_copied_cdb(&bytes, &catalog, &id, "host").unwrap();
+        let pair = templates::build_from_copied_cdb(Some(&bytes), &catalog, &id, "host").unwrap();
         assert_eq!(
             get(&pair.request, &["Params", "DataclassAnchors", "Media"]).as_string(),
             Some("13")
@@ -169,7 +169,25 @@ mod qualified_factory {
             cdb(catalog.database_pid(), 2),
             bytes[..300].to_vec(),
         ] {
-            assert!(templates::build_from_copied_cdb(&bytes, &catalog, &id, "host").is_err());
+            assert!(templates::build_from_copied_cdb(Some(&bytes), &catalog, &id, "host").is_err());
         }
+    }
+
+    /// A phone `rustunes init` prepared has no iTunesCDB: the request is the
+    /// same one a copied CDB with the qualified VoiceMemo anchor gives.
+    #[test]
+    fn without_a_copied_cdb_voice_memo_is_the_qualified_one() {
+        let catalog = catalogue_fixture::collection_catalog(13);
+        let id = identity(1, 2);
+        let without = templates::build_from_copied_cdb(None, &catalog, &id, "host").unwrap();
+        let with = templates::build_from_copied_cdb(
+            Some(&cdb(catalog.database_pid(), 1)),
+            &catalog,
+            &id,
+            "host",
+        )
+        .unwrap();
+        assert_eq!(without.request, with.request);
+        assert_eq!(without.finished, with.finished);
     }
 }

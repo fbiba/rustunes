@@ -1,12 +1,17 @@
 //! Bounded saved-evidence configuration and Current loader. No endpoint access.
 use super::io;
-use crate::{engine::state::current::Current, engine::state::journal::Identity};
+use crate::{
+    engine::state::current::{
+        Current, DeviceFile,
+        receipt::{self, CurrentFile, Recorded, StateReceipt},
+    },
+    engine::state::journal::Identity,
+};
 use anyhow::{Context, Result, ensure};
 use music_protocol::catalogue::anchor;
 use music_protocol::catalogue::sqlite;
 use music_protocol::media::artwork_inventory;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
@@ -16,7 +21,6 @@ use std::{
     },
     time::Instant,
 };
-const SMALL: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,8 +68,8 @@ struct LoadedCurrentFacts {
     catalog: sqlite::Catalog,
     raw_preferences: Vec<u8>,
     plist_preferences: Vec<u8>,
-    cdb: Vec<u8>,
-    artwork_db: Option<Vec<u8>>,
+    cdb: DeviceFile,
+    artwork_db: DeviceFile,
     receipt: Vec<u8>,
 }
 impl LoadedCurrentFacts {
@@ -93,7 +97,9 @@ pub(crate) fn load_current(
     device: &str,
     scratch: &Path,
 ) -> Result<LoadedCurrent> {
-    load_current_checked(spec, device, scratch, None)
+    spec.validate()?;
+    let pin = io::digest(&spec.receipt_sha256)?;
+    load_current_checked(&spec.directory, Some(pin), device, scratch, None)
 }
 pub(crate) fn load_current_with_control(
     spec: &SavedCurrent,
@@ -102,7 +108,35 @@ pub(crate) fn load_current_with_control(
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
 ) -> Result<LoadedCurrent> {
-    load_current_checked(spec, device, scratch, Some((deadline, cancelled)))
+    spec.validate()?;
+    let pin = io::digest(&spec.receipt_sha256)?;
+    let control = Some((deadline, cancelled));
+    load_current_checked(&spec.directory, Some(pin), device, scratch, control)
+}
+/// Load the Current at `directory` whatever receipt it holds, for evidence
+/// nothing earlier pins (a step's immediate After). Every file must still
+/// be the one that receipt binds.
+pub(crate) fn load_unpinned(
+    directory: &Path,
+    device: &str,
+    scratch: &Path,
+) -> Result<LoadedCurrent> {
+    load_current_checked(directory, None, device, scratch, None)
+}
+pub(crate) fn load_unpinned_with_control(
+    directory: &Path,
+    device: &str,
+    scratch: &Path,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+) -> Result<LoadedCurrent> {
+    load_current_checked(
+        directory,
+        None,
+        device,
+        scratch,
+        Some((deadline, cancelled)),
+    )
 }
 fn check_current_control(control: Option<&(Instant, Arc<AtomicBool>)>) -> Result<()> {
     if let Some((deadline, cancelled)) = control {
@@ -118,64 +152,83 @@ fn check_current_control(control: Option<&(Instant, Arc<AtomicBool>)>) -> Result
     Ok(())
 }
 fn load_current_checked(
-    spec: &SavedCurrent,
+    directory: &Path,
+    pin: Option<[u8; 32]>,
     device: &str,
     scratch: &Path,
     controlled: Option<(Instant, Arc<AtomicBool>)>,
 ) -> Result<LoadedCurrent> {
-    let loaded = load_current_facts_checked(spec, device, scratch, controlled.clone())?
+    let loaded = load_current_facts_checked(directory, pin, device, scratch, controlled.clone())?
         .into_loaded_current();
     check_current_control(controlled.as_ref())?;
     Ok(loaded)
 }
 fn load_current_facts_checked(
-    spec: &SavedCurrent,
+    directory: &Path,
+    pin: Option<[u8; 32]>,
     device: &str,
     scratch: &Path,
     controlled: Option<(Instant, Arc<AtomicBool>)>,
 ) -> Result<LoadedCurrentFacts> {
     let control = controlled.as_ref();
     check_current_control(control)?;
-    let read = |path: &Path, cap| {
+    let read = |file: CurrentFile| {
         check_current_control(control)?;
-        let bytes = io::read(path, cap)?;
+        let bytes = io::read(&file.at(directory), file.cap)?;
         check_current_control(control)?;
         Ok::<_, anyhow::Error>(bytes)
     };
-    let hash = |path: &Path, cap| match control {
-        None => io::file_hash(path, cap),
+    let hash = |file: CurrentFile| match control {
+        None => io::file_hash(&file.at(directory), file.cap),
         Some((deadline, cancelled)) => {
-            io::file_hash_with_control(path, cap, *deadline, cancelled.clone())
+            io::file_hash_with_control(&file.at(directory), file.cap, *deadline, cancelled.clone())
         }
     };
-    spec.validate()?;
-    io::directory(&spec.directory)?;
-    let receipt = read(&spec.directory.join("state-receipt.json"), SMALL)?;
-    ensure!(
-        io::sha(&receipt) == io::digest(&spec.receipt_sha256)?,
-        "saved Current receipt differs"
-    );
-    let v: Value = serde_json::from_slice(&receipt)?;
-    ensure!(
-        v["schema"] == "rustunes.current-state"
-            && v["phone_writes"] == 0
-            && v["atomic_snapshot_claimed"] == false,
-        "unsupported Current receipt"
-    );
-    let raw_preferences = read(&spec.directory.join("iTunesPrefs"), 1024 * 1024)?;
-    let plist_preferences = read(&spec.directory.join("iTunesPrefs.plist"), 1024 * 1024)?;
-    let cdb = read(&spec.directory.join("iTunesCDB"), 64 * 1024 * 1024)?;
-    for (key, bytes) in [
-        ("raw_preferences_sha256", &raw_preferences),
-        ("plist_preferences_sha256", &plist_preferences),
-        ("cdb_sha256", &cdb),
-    ] {
+    // A file the receipt binds: read whole, its hash the one recorded.
+    let bound = |file: CurrentFile, sha256: [u8; 32]| {
+        let bytes = read(file)?;
         check_current_control(control)?;
         ensure!(
-            io::json_hash(&v, key)? == io::sha(bytes),
-            "saved Current file differs from receipt"
+            io::sha(&bytes) == sha256,
+            "saved Current {} differs from receipt",
+            file.path
         );
+        Ok::<_, anyhow::Error>(bytes)
+    };
+    // A file the phone may not have had. With no hash recorded, nothing may
+    // lie at its path.
+    let copied = |file: CurrentFile, recorded: Recorded| {
+        let unbound = || {
+            ensure!(
+                !exists(&file.at(directory))?,
+                "saved Current contains an unbound {}",
+                file.path
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        Ok::<_, anyhow::Error>(match recorded {
+            Recorded::Hash(sha256) => DeviceFile::Present(bound(file, sha256)?),
+            Recorded::Absent => {
+                unbound()?;
+                DeviceFile::Absent
+            }
+            Recorded::NotCaptured => {
+                unbound()?;
+                DeviceFile::NotCaptured
+            }
+        })
+    };
+    path(directory)?;
+    io::directory(directory)?;
+    let bytes = read(receipt::RECEIPT)?;
+    if let Some(pin) = pin {
+        ensure!(io::sha(&bytes) == pin, "saved Current receipt differs");
     }
+    let receipt = StateReceipt::decode(&bytes).context("unsupported Current receipt")?;
+    let raw_preferences = bound(receipt::PREFS, receipt.raw_preferences_sha256())?;
+    let plist_preferences = bound(receipt::PREFS_PLIST, receipt.plist_preferences_sha256())?;
+    // No CDB: the phone had none (one `rustunes init` prepared).
+    let cdb = copied(receipt::CDB, receipt.cdb())?;
     check_current_control(control)?;
     let library = music_protocol::catalogue::identity::parse(&raw_preferences)?;
     library.ensure_matches(&music_protocol::catalogue::identity::parse(
@@ -183,41 +236,29 @@ fn load_current_facts_checked(
     )?)?;
     let identity = Identity::new(device, &library)?;
     ensure!(
-        io::json_hash(&v, "device_sha256")? == identity.device_digest()
-            && io::json_hash(&v, "library_sha256")? == identity.library_digest(),
+        receipt.describes_identity(&identity),
         "saved Current device/library differs"
     );
-    let artwork_db = if v["artwork_database_sha256"].is_null() {
-        ensure!(
-            !exists(&spec.directory.join("ArtworkDB"))?,
-            "ordinary Current contains unbound ArtworkDB"
-        );
-        None
-    } else {
-        let bytes = read(&spec.directory.join("ArtworkDB"), 32 * 1024 * 1024)?;
-        ensure!(
-            io::json_hash(&v, "artwork_database_sha256")? == io::sha(&bytes),
-            "Current ArtworkDB differs"
-        );
-        artwork_inventory::parse(&bytes)?;
+    let artwork_db = copied(receipt::ARTWORK_DB, receipt.artwork_db())?;
+    if let Some(bytes) = artwork_db.bytes() {
+        artwork_inventory::parse(bytes)?;
         check_current_control(control)?;
-        Some(bytes)
-    };
-    let database = spec.directory.join("catalog/MediaLibrary.sqlitedb");
-    let wal = spec.directory.join("catalog/MediaLibrary.sqlitedb-wal");
-    let has_wal = !v["wal_sha256"].is_null();
+    }
+    let database = receipt::DATABASE.at(directory);
+    let wal = receipt::WAL.at(directory);
+    let has_wal = receipt.wal_sha256().is_some();
     ensure!(
         exists(&wal)? == has_wal,
         "saved Current WAL presence differs"
     );
-    let (_, database_sha) = hash(&database, sqlite::MAX_DATABASE_BYTES)?;
+    let (_, database_sha) = hash(receipt::DATABASE)?;
     ensure!(
-        database_sha == io::json_hash(&v, "database_sha256")?,
+        database_sha == receipt.database_sha256(),
         "saved Current database differs"
     );
-    if has_wal {
+    if let Some(wal_sha) = receipt.wal_sha256() {
         ensure!(
-            hash(&wal, sqlite::MAX_WAL_BYTES)?.1 == io::json_hash(&v, "wal_sha256")?,
+            hash(receipt::WAL)?.1 == wal_sha,
             "saved Current WAL differs"
         );
     }
@@ -233,20 +274,18 @@ fn load_current_facts_checked(
     };
     check_current_control(control)?;
     ensure!(
-        catalog.source_hashes().database == database_sha
-            && v["wal_sha256"] == json!(catalog.source_hashes().wal.map(|h| io::hex(&h)))
-            && v["media_anchor"] == catalog.persisted_media_anchor()
-            && v["track_count"] == catalog.tracks().len(),
+        receipt.describes_catalog(&catalog),
         "saved Current SQL binding differs"
     );
-    let anchor = anchor::parse(&cdb)?;
-    check_current_control(control)?;
-    ensure!(
-        anchor.database_pid() == catalog.database_pid()
-            && v["saved_cdb_media_anchor"] == anchor.saved_media_anchor()
-            && v["saved_cdb_voice_memo_anchor"] == anchor.saved_voice_memo_anchor(),
-        "saved CDB binding differs"
-    );
+    // The receipt records saved anchors exactly when it binds a CDB.
+    if let Some(cdb) = cdb.bytes() {
+        let anchor = anchor::parse(cdb)?;
+        ensure!(
+            anchor.database_pid() == catalog.database_pid()
+                && receipt.describes_saved_anchors(Some(&anchor)),
+            "saved CDB binding differs"
+        );
+    }
     check_current_control(control)?;
     let loaded = LoadedCurrentFacts {
         device: device.into(),
@@ -257,7 +296,7 @@ fn load_current_facts_checked(
         plist_preferences,
         cdb,
         artwork_db,
-        receipt,
+        receipt: bytes,
     };
     check_current_control(control)?;
     Ok(loaded)

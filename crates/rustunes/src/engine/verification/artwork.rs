@@ -3,8 +3,9 @@
 //! A plan or SQL row is not proof of file bytes, pixels, or source equivalence.
 use crate::engine::execution::device::DeviceProvider;
 use crate::{
-    engine::execution::native_insert::{Control, FreshState, create_trace},
+    engine::execution::native_insert::{Control, create_trace},
     engine::state::current::Current,
+    engine::state::held::{ArtworkDb, HeldState},
 };
 use anyhow::{Context, Result, bail, ensure};
 use music_protocol::catalogue::sqlite::Catalog;
@@ -12,7 +13,7 @@ use music_protocol::media::artwork::Cover;
 pub use music_protocol::media::renditions;
 use music_protocol::protocol::trace::private_write;
 use music_protocol::protocol::transfer::{
-    Attributes, MAX_BOUNDED_OPS, Transfer, hex, regular_size,
+    Attributes, MAX_BOUNDED_OPS, Transfer, hex, regular_size, same_stat,
 };
 
 use serde::Serialize;
@@ -282,7 +283,7 @@ where
     )
     .await?;
     control.check()?;
-    state.verify_state(&mut afc).await?;
+    state.guard(&mut afc).await?;
     drop(afc);
     write_proof(trace, &proof)?;
     control.check()?;
@@ -314,9 +315,10 @@ fn track_ops(original_bytes: u64) -> u64 {
         .saturating_add(TRACK_EXTRA_OPS)
 }
 
-/// How many leading originals one guarded connection's operation bound admits.
-fn group_len(state_chunks: u64, originals: impl IntoIterator<Item = u64>) -> usize {
-    let mut operations = state_chunks
+/// How many leading originals one guarded connection's operation bound
+/// admits, beside two state guards of `guard_requests` requests each.
+fn group_len(guard_requests: u64, originals: impl IntoIterator<Item = u64>) -> usize {
+    let mut operations = guard_requests
         .saturating_mul(2)
         .saturating_add(GUARD_EXTRA_OPS);
     originals
@@ -354,7 +356,7 @@ where
         ensure!(!checks.is_empty(), "no artwork checks");
         let state = current_state(current, control, unfilled)?;
         let count = group_len(
-            state.state_read_chunks()?,
+            state.guard_requests(),
             checks.iter().map(|c| c.expected.bytes),
         );
         Ok((state, count))
@@ -404,7 +406,7 @@ where
         None => {
             async {
                 control.check()?;
-                state.verify_state(&mut afc).await
+                state.guard(&mut afc).await
             }
             .await
         }
@@ -480,7 +482,7 @@ where
         ensure!(!checks.is_empty(), "no artwork checks");
         let state = current_state(current, control, &BTreeSet::new())?;
         let room = (MAX_BOUNDED_OPS as u64)
-            .saturating_sub(state.state_read_chunks()?.saturating_mul(2))
+            .saturating_sub(state.guard_requests().saturating_mul(2))
             .saturating_sub(GUARD_EXTRA_OPS);
         let count = checks
             .len()
@@ -523,7 +525,7 @@ where
     let last = count - 1;
     async {
         control.check()?;
-        state.verify_state(&mut afc).await
+        state.guard(&mut afc).await
     }
     .await
     .map_err(at(last))?;
@@ -689,9 +691,8 @@ async fn reuse_tracks(
                 .flatten()
                 .context("permanent artwork disappeared")?;
             ensure!(
-                stable_attributes(&original_before) == stable_attributes(&original_after)
-                    && stable_attributes(&derivative_before)
-                        == stable_attributes(&derivative_after),
+                same_stat(Some(&original_before), Some(&original_after))
+                    && same_stat(Some(&derivative_before), Some(&derivative_after)),
                 "permanent artwork changed during readback"
             );
             regular_size(&original_before, proof.original.file_bytes)?;
@@ -942,7 +943,7 @@ where
     validate_original(&original, expected)
         .context("album artwork conflict: permanent original differs from desired cover")?;
     control.check()?;
-    state.verify_state(&mut afc).await?;
+    state.guard(&mut afc).await?;
     drop(afc);
     let proof = VerifiedAlbumOriginal {
         schema: "rustunes.permanent-album-original",
@@ -994,7 +995,7 @@ where
     let path = format!("{ARTWORK_ROOT}/Originals/{}", selected.relative_path);
     let (original, _) = read_file(&mut afc, &path, &trace.join("album-original.jpg"), None).await?;
     control.check()?;
-    state.verify_state(&mut afc).await?;
+    state.guard(&mut afc).await?;
     drop(afc);
     if original.bytes != expected.bytes || original.sha256 != hex(&expected.sha256) {
         return Ok(Err(format!(
@@ -1196,7 +1197,7 @@ async fn start_derivative(
             .await?
             .context("permanent artwork disappeared")?;
         ensure!(
-            stable_attributes(&before) == stable_attributes(&after),
+            same_stat(Some(&before), Some(&after)),
             "permanent artwork changed during readback"
         );
         let file = PermanentFile {
@@ -1246,15 +1247,6 @@ fn write_probe_receipt(trace: &Path, path: &str, edge: u16, present: bool) -> Re
     let receipt_path = trace.join(format!("derivative-probe-{edge}.json"));
     private_write(&receipt_path, &serde_json::to_vec_pretty(&receipt)?)?;
     Ok(())
-}
-
-/// AFC attributes without the access time, which reading may change.
-fn stable_attributes(attrs: &Attributes) -> Attributes {
-    attrs
-        .iter()
-        .filter(|(k, _)| k.as_str() != "st_atime")
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
 }
 
 pub(crate) struct DecodedRenditionRaster {
@@ -1529,7 +1521,7 @@ fn current_state(
     current: &Current,
     control: &Control,
     unfilled: &BTreeSet<u64>,
-) -> Result<FreshState> {
+) -> Result<HeldState> {
     control.check()?;
     ensure!(
         control.deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(120),
@@ -1546,21 +1538,17 @@ fn current_state(
             && identity.library_digest() == current.identity.library_digest(),
         "current library identity binding disagrees"
     );
-    let mut state = FreshState::for_unfilled(
-        &current.device,
-        &current.catalog,
-        &current.raw_preferences,
-        &current.plist_preferences,
+    HeldState::with_unfilled(
+        current,
         current.receipt_sha256,
+        ArtworkDb::NotHeld,
         unfilled,
-    )?;
-    state.bind_copied_cdb(&current.cdb)?;
-    Ok(state)
+    )
 }
 
 async fn connect_guarded<F, Fut>(
     current: &Current,
-    state: &FreshState,
+    state: &HeldState,
     trace: &Path,
     control: &Control,
     image_reads: u64,
@@ -1589,7 +1577,7 @@ where
 /// operations, checked by the opening guard.
 async fn connect_guarded_ops<F, Fut>(
     current: &Current,
-    state: &FreshState,
+    state: &HeldState,
     trace: &Path,
     control: &Control,
     image_ops: u64,
@@ -1601,7 +1589,7 @@ where
 {
     let operations = usize::try_from(
         state
-            .state_read_chunks()?
+            .guard_requests()
             .checked_mul(2)
             .and_then(|n| n.checked_add(image_ops))
             .and_then(|n| n.checked_add(GUARD_EXTRA_OPS))
@@ -1632,7 +1620,7 @@ where
         Arc::clone(&control.cancelled),
     )
     .await?;
-    state.verify_state(&mut afc).await?;
+    state.guard(&mut afc).await?;
     Ok(afc)
 }
 
@@ -1692,8 +1680,8 @@ async fn read_observed_file(
         .await?;
     held.sync_all()?;
     ensure!(
-        before.is_none_or(|before| stable_attributes(&before) == stable_attributes(&read.before))
-            && stable_attributes(&read.before) == stable_attributes(&read.after),
+        before.is_none_or(|before| same_stat(Some(&before), Some(&read.before)))
+            && same_stat(Some(&read.before), Some(&read.after)),
         "permanent artwork changed during readback"
     );
     let (sha, before, after) = (read.sha256, read.before, read.after);
@@ -1977,6 +1965,7 @@ fn cleanup<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::state::current::DeviceFile;
     use std::{
         collections::BTreeMap, os::unix::fs::DirBuilderExt, path::PathBuf,
         sync::atomic::AtomicUsize,
@@ -2487,8 +2476,8 @@ mod tests {
             catalog,
             raw_preferences: prefs.clone(),
             plist_preferences: prefs,
-            cdb: vec![],
-            artwork_db: None,
+            cdb: DeviceFile::Present(vec![]),
+            artwork_db: DeviceFile::NotCaptured,
             receipt_sha256: [1; 32],
         };
         let control = Control {

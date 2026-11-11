@@ -1310,10 +1310,7 @@ impl Transfer {
         ensure!(same_file(&before, &after), "readback attributes changed");
         if self.readonly_summary {
             ensure!(
-                before
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != "st_atime")
-                    .eq(after.iter().filter(|(key, _)| key.as_str() != "st_atime")),
+                same_stat(Some(&before), Some(&after)),
                 "readback attributes changed"
             );
             let mut record = Dictionary::new();
@@ -1605,6 +1602,19 @@ pub fn same_file(before: &Attributes, after: &Attributes) -> bool {
     ["st_size", "st_mtime", "st_birthtime", "st_ifmt"]
         .iter()
         .all(|key| before.get(*key) == after.get(*key))
+}
+
+/// Whether two stats of a path agree in every key but the access time, which
+/// reading the file may change: nothing wrote, replaced, created or removed
+/// it between them. `None` is a stat that found nothing.
+pub fn same_stat(before: Option<&Attributes>, after: Option<&Attributes>) -> bool {
+    fn stable(attrs: &Attributes) -> impl Iterator<Item = (&String, &String)> {
+        attrs.iter().filter(|(key, _)| key.as_str() != "st_atime")
+    }
+    match (before, after) {
+        (Some(before), Some(after)) => stable(before).eq(stable(after)),
+        (before, after) => before.is_none() && after.is_none(),
+    }
 }
 
 /// A full read's SHA-256, with the file's stat just before it was opened and
@@ -2306,6 +2316,26 @@ mod tests {
             assert_eq!(transfer.sequence, 0);
             assert!(std::fs::read_dir(&trace.0).unwrap().next().is_none());
         }
+    }
+
+    #[test]
+    fn two_stats_agree_when_only_the_access_time_moved() {
+        let before = Attributes::from([
+            ("st_ifmt".into(), "S_IFREG".into()),
+            ("st_size".into(), "10".into()),
+            ("st_atime".into(), "1".into()),
+        ]);
+        let mut after = before.clone();
+        after.insert("st_atime".into(), "2".into());
+        assert!(same_stat(Some(&before), Some(&after)));
+        assert!(same_stat(None, None));
+        for changed in [("st_size", "11"), ("st_mtime", "3")] {
+            let mut other = after.clone();
+            other.insert(changed.0.into(), changed.1.into());
+            assert!(!same_stat(Some(&before), Some(&other)), "{changed:?}");
+        }
+        assert!(!same_stat(Some(&before), None));
+        assert!(!same_stat(None, Some(&after)));
     }
 
     mod bounded;

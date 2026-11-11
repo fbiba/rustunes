@@ -747,8 +747,8 @@ fn state_scope_rejects_new_revision_device_prefs_cdb_and_raw_artwork_changes() {
             catalog: music_protocol::test_support::catalogue::collection_catalog(anchor),
             raw_preferences: prefs.clone(),
             plist_preferences: prefs,
-            cdb: vec![1, 2, 3],
-            artwork_db: Some(vec![4, 5, 6]),
+            cdb: DeviceFile::Present(vec![1, 2, 3]),
+            artwork_db: DeviceFile::Present(vec![4, 5, 6]),
             receipt_sha256: [9; 32],
         }
     };
@@ -765,12 +765,29 @@ fn state_scope_rejects_new_revision_device_prefs_cdb_and_raw_artwork_changes() {
     bad.plist_preferences[100] ^= 1;
     assert!(same_scope(&old, &bad).is_err());
     let mut bad = current(69);
-    bad.cdb.push(1);
+    bad.cdb = DeviceFile::Present(vec![1, 2, 3, 1]);
     assert!(same_scope(&old, &bad).is_err());
     let mut bad = current(69);
-    bad.artwork_db = None;
+    bad.artwork_db = DeviceFile::NotCaptured;
     assert!(same_scope(&old, &bad).is_err());
     let mut bad = current(69);
-    bad.artwork_db.as_mut().unwrap().push(1);
+    bad.artwork_db = DeviceFile::Present(vec![4, 5, 6, 1]);
     assert!(same_scope(&old, &bad).is_err());
+    // A phone `rustunes init` prepared has neither file, and keeps neither.
+    for (cdb, artwork) in [
+        (DeviceFile::Absent, DeviceFile::Present(vec![4, 5, 6])),
+        (DeviceFile::Present(vec![1, 2, 3]), DeviceFile::Absent),
+    ] {
+        let mut bad = current(69);
+        bad.cdb = cdb;
+        bad.artwork_db = artwork;
+        assert!(same_scope(&old, &bad).is_err());
+    }
+    let unsynced = |anchor| {
+        let mut current = current(anchor);
+        current.cdb = DeviceFile::Absent;
+        current.artwork_db = DeviceFile::Absent;
+        current
+    };
+    same_scope(&unsynced(69), &unsynced(69)).unwrap();
 }

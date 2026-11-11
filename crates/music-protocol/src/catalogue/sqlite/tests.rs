@@ -499,6 +499,25 @@ fn zero_or_duplicate_wire_ids_fail() {
     }
 }
 
+#[test]
+fn a_library_no_sync_finished_names_init() {
+    let fixture = Fixture::new(false);
+    fixture
+        .connection
+        .execute_batch("DELETE FROM db_info")
+        .unwrap();
+    let error = format!("{:#}", fixture.read(false).err().unwrap());
+    assert!(error.contains("no db_info row"), "{error}");
+    assert!(error.contains("rustunes init"), "{error}");
+    let fixture = Fixture::new(false);
+    fixture
+        .connection
+        .execute_batch("INSERT INTO db_info(db_pid, primary_container_pid) SELECT db_pid + 1, primary_container_pid FROM db_info")
+        .unwrap();
+    let error = format!("{:#}", fixture.read(false).err().unwrap());
+    assert!(error.contains("cardinality"), "{error}");
+}
+
 /// The observed shape of an entry the phone adds outside the library: an
 /// Apple Music track it streamed, with a remote location and no file, under an
 /// album and album artist of its own, none of the three with a sync id. Its

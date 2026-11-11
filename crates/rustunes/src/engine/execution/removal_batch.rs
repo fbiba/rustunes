@@ -32,12 +32,11 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::{
     engine::execution::device,
-    engine::execution::native_insert::{
-        Control, FreshState, create_trace, durable_write, sync_trace,
-    },
+    engine::execution::native_insert::{Control, create_trace, durable_write, sync_trace},
     engine::recovery::retained::playback::{Window, between_runs},
     engine::state::audio_index::Absent,
     engine::state::current::{self, Current},
+    engine::state::held::{ArtworkDb, HeldState},
     engine::state::journal::{
         AttemptId, BatchId, BatchRecord, BatchState, CoordinationId, Identity, InsertBatchId,
         Journal, PlaylistTarget, RemovalIntent, RemovalTarget, StartedBatch,
@@ -56,22 +55,9 @@ use crate::{
 use music_protocol::catalogue::identity::{self, LibraryIdentity};
 use music_protocol::catalogue::mutation;
 use music_protocol::protocol::session::{self, Session, StartedOperation};
-use music_protocol::protocol::templates;
-use music_protocol::protocol::transfer::{
-    Attributes, MAX_ASSET, MAX_BOUNDED_OPS, METADATA, SIGNATURE, Transfer, regular_size,
-};
+use music_protocol::protocol::transfer::{MAX_BOUNDED_OPS, METADATA, SIGNATURE, Transfer};
 
-const ARTWORK_DB: &str = "iTunes_Control/Artwork/ArtworkDB";
 const STAGING: &str = "iTunes_Control/Sync/Media";
-const STATE_FILES: [&str; 7] = [
-    "iTunes_Control/iTunes/iTunesPrefs",
-    "iTunes_Control/iTunes/iTunesPrefs.plist",
-    "iTunes_Control/iTunes/MediaLibrary.sqlitedb",
-    "iTunes_Control/iTunes/MediaLibrary.sqlitedb-wal",
-    "iTunes_Control/iTunes/MediaLibrary.sqlitedb-shm",
-    "iTunes_Control/iTunes/iTunesCDB",
-    ARTWORK_DB,
-];
 const CHUNK: u64 = 64 * 1024;
 /// The phone removes deleted audio files shortly after the session ends.
 const ASSET_WAIT: Duration = Duration::from_secs(120);
@@ -454,7 +440,7 @@ pub(crate) async fn run(
         "operation_sha256":hex(&sha(&operation)),
         "before_index_sha256":hex(&before.snapshot.index_receipt_sha256),
         "before_current_sha256":hex(&current.receipt_sha256),
-        "artwork_database_sha256":hex(&sha(current.artwork_db.as_deref().unwrap_or_default())),
+        "artwork_database_sha256":current.artwork_db.bytes().map(|bytes| hex(&sha(bytes))),
         "host_name":host_name,
         "compensates":match purpose {
             Purpose::Remove => serde_json::Value::Null,
@@ -544,7 +530,7 @@ pub(crate) async fn run_playlists(
         "operation_sha256":hex(&sha(&operation)),
         "before_index_sha256":hex(&before.snapshot.index_receipt_sha256),
         "before_current_sha256":hex(&current.receipt_sha256),
-        "artwork_database_sha256":hex(&sha(current.artwork_db.as_deref().unwrap_or_default())),
+        "artwork_database_sha256":current.artwork_db.bytes().map(|bytes| hex(&sha(bytes))),
         "host_name":host_name,
         "playlists":playlists.iter().map(|p| json!({
             "container":format!("{:016x}",p.container),"name":p.name,
@@ -726,53 +712,33 @@ pub(crate) async fn send_metadata_only<T: StartedOperation>(
 ) -> Sent {
     let current = &before.current;
     let prepared = (|| {
-        let artwork = current
-            .artwork_db
-            .clone()
-            .context("a metadata-only session requires the copied ArtworkDB")?;
-        ensure!(
-            !artwork.is_empty() && artwork.len() as u64 <= MAX_ASSET,
-            "ArtworkDB exceeds bound"
-        );
-        // A compensating batch's rows have no file location.
-        let mut state = FreshState::for_unfilled(
-            &current.device,
-            &current.catalog,
-            &current.raw_preferences,
-            &current.plist_preferences,
+        // The ArtworkDB is held as it is, absent on a phone `rustunes init`
+        // prepared. A compensating batch's rows have no file location.
+        let state = HeldState::with_unfilled(
+            current,
             input_receipt,
+            ArtworkDb::Held,
             before.snapshot.index.unfilled(),
         )?;
-        state.bind_copied_cdb(&current.cdb)?;
         ensure!(
             state.media_anchor() == before.anchor(),
             "session state anchor differs from the snapshot"
         );
-        let templates = templates::build_from_copied_cdb(
-            &current.cdb,
-            &current.catalog,
-            &current.library,
-            host_name,
-        )?;
+        let templates = state.templates(host_name)?;
         let session = session::prepare(
             templates.request,
             &templates.finished,
             current.library.library_id(),
             before.anchor(),
         )?;
-        let operations = operation_budget(
-            state.state_read_chunks()?,
-            artwork.len() as u64,
-            operation.len(),
-        )?;
+        let operations = operation_budget(state.guard_requests(), operation.len())?;
         create_trace(send)?;
-        Ok((artwork, state, session, operations))
+        Ok((state, session, operations))
     })();
-    let (artwork, state, session_prepared, operations) = match prepared {
+    let (state, session_prepared, operations) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return Sent::Unsent(error),
     };
-    let artwork_sha = sha(&artwork);
     let ancillary = state.ancillary();
     let policy = match match requests {
         Requests::Refuse(first) => ancillary.metadata(&(first as i64).to_string()),
@@ -816,11 +782,11 @@ pub(crate) async fn send_metadata_only<T: StartedOperation>(
             )
             .await?,
         );
-        guard(afc, &state, artwork.len() as u64, artwork_sha).await?;
+        guard(afc, &state).await?;
         control.check()?;
         let live = session
             .insert(Session::connect(&provider, session_prepared, send, control.deadline).await?);
-        guard(afc, &state, artwork.len() as u64, artwork_sha).await?;
+        guard(afc, &state).await?;
         let signature = live.sign_metadata(operation)?;
         durable_write(send, "operation.cig", &signature)?;
         sync_trace(send)?;
@@ -1374,59 +1340,28 @@ async fn read_only(
     .await
 }
 
-/// Unchanged state and ArtworkDB, an empty staging namespace, all stable
-/// across this combined readback.
-async fn guard(
-    afc: &mut Transfer,
-    state: &FreshState,
-    artwork_bytes: u64,
-    artwork_sha: [u8; 32],
-) -> Result<()> {
-    let mut before = Vec::new();
-    for name in STATE_FILES {
-        before.push(afc.stat(name).await?);
-    }
-    state.verify_state(afc).await?;
-    regular_size(
-        before[6].as_ref().context("ArtworkDB missing")?,
-        artwork_bytes,
-    )?;
-    ensure!(
-        afc.read_hash(ARTWORK_DB, artwork_bytes, MAX_ASSET).await? == artwork_sha,
-        "ArtworkDB changed since the removal was prepared"
-    );
-    afc.require_directory(STAGING).await?;
-    ensure!(
-        afc.names(STAGING)
-            .await?
-            .iter()
-            .all(|name| name == "." || name == ".."),
-        "the staging folder holds leftovers; nothing was removed"
-    );
-    for path in [METADATA, SIGNATURE] {
-        afc.require_absent(path).await?;
-    }
-    for (name, previous) in STATE_FILES.into_iter().zip(before) {
-        ensure!(
-            stable(previous) == stable(afc.stat(name).await?),
-            "the phone's state changed during the guard readback"
-        );
-    }
-    Ok(())
+/// Unchanged state and ArtworkDB, and an empty staging namespace, all within
+/// the state guard's pair of stats.
+async fn guard(afc: &mut Transfer, state: &HeldState) -> Result<()> {
+    state
+        .guard_around(afc, async |afc| {
+            afc.require_directory(STAGING).await?;
+            ensure!(
+                afc.names(STAGING)
+                    .await?
+                    .iter()
+                    .all(|name| name == "." || name == ".."),
+                "the staging folder holds leftovers; nothing was removed"
+            );
+            for path in [METADATA, SIGNATURE] {
+                afc.require_absent(path).await?;
+            }
+            Ok(())
+        })
+        .await
 }
 
-fn stable(attrs: Option<Attributes>) -> Option<Attributes> {
-    attrs.map(|mut attrs| {
-        attrs.remove("st_atime");
-        attrs
-    })
-}
-
-fn operation_budget(
-    state_chunks: u64,
-    artwork_bytes: u64,
-    operation_bytes: usize,
-) -> Result<usize> {
+fn operation_budget(guard_requests: u64, operation_bytes: usize) -> Result<usize> {
     ensure!(
         operation_bytes > 0
             && operation_bytes <= music_protocol::protocol::signing::MAX_OPERATION_BYTES,
@@ -1434,9 +1369,8 @@ fn operation_budget(
     );
     // Two complete guards, write and readback of metadata and signature, and a
     // generous margin: exhaustion after Started strands a staged operation.
-    let operations = state_chunks
-        .checked_add(artwork_bytes.div_ceil(CHUNK))
-        .and_then(|n| n.checked_add(64))
+    let operations = guard_requests
+        .checked_add(64)
         .and_then(|n| n.checked_mul(2))
         .and_then(|n| n.checked_add((operation_bytes as u64).div_ceil(CHUNK) * 4 + 512))
         .context("removal operation budget overflow")?;

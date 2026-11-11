@@ -1,7 +1,7 @@
 //! The add-only album-image check, without a phone: a connection that fails
 //! stands in for one that cannot finish.
 use super::*;
-use crate::engine::state::current::Current;
+use crate::engine::state::current::{Current, DeviceFile};
 use sha2::Digest;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -21,8 +21,8 @@ fn current(catalog: music_protocol::catalogue::sqlite::Catalog) -> Current {
         catalog,
         raw_preferences: prefs.clone(),
         plist_preferences: prefs,
-        cdb: vec![],
-        artwork_db: None,
+        cdb: DeviceFile::Present(vec![]),
+        artwork_db: DeviceFile::NotCaptured,
         receipt_sha256: [1; 32],
     }
 }

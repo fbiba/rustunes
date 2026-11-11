@@ -4,7 +4,7 @@
 //! transport, replay, journal transition, or permission to normalize snapshots.
 use crate::{
     engine::execution::native_insert::Control,
-    engine::state::current::Current,
+    engine::state::current::{Current, DeviceFile, receipt},
     engine::verification::sql_tables::{
         Capture, SqlHashes,
         reader::{self, Budget, Cell, Row, Snapshot, Table},
@@ -107,7 +107,7 @@ fn same_scope(a: &Current, b: &Current) -> Result<()> {
             && a.raw_preferences == b.raw_preferences
             && a.plist_preferences == b.plist_preferences
             && a.cdb == b.cdb
-            && a.artwork_db.is_some()
+            && a.artwork_db.captured()
             && a.artwork_db == b.artwork_db
             && a.catalog.database_pid() == b.catalog.database_pid()
             && a.catalog.primary_container_pid() == b.catalog.primary_container_pid()
@@ -154,9 +154,15 @@ pub(super) fn ordinary_raw_artwork_comparison(
     fresh: &Current,
 ) -> Result<&'static str> {
     match (&immediate.artwork_db, &fresh.artwork_db) {
-        (Some(before), Some(after)) if before == after => Ok("captured_equal"),
-        (None, Some(_)) => Ok("not_captured_in_immediate_state"),
-        (None, None) => Ok("absent_from_both_captures"),
+        (DeviceFile::Present(before), DeviceFile::Present(after)) if before == after => {
+            Ok("captured_equal")
+        }
+        // A phone `rustunes init` prepared, which no Apple computer has synced.
+        (DeviceFile::Absent, DeviceFile::Absent) => Ok("captured_absent_from_phone"),
+        (DeviceFile::NotCaptured, DeviceFile::Present(_) | DeviceFile::Absent) => {
+            Ok("not_captured_in_immediate_state")
+        }
+        (DeviceFile::NotCaptured, DeviceFile::NotCaptured) => Ok("absent_from_both_captures"),
         _ => anyhow::bail!("ordinary playback captured artwork changed or is missing"),
     }
 }
@@ -251,8 +257,8 @@ fn materialize_profile(
     budget: &mut Budget,
     controlled: bool,
 ) -> Result<Snapshot> {
-    let database = directory.join("catalog/MediaLibrary.sqlitedb");
-    let wal = directory.join("catalog/MediaLibrary.sqlitedb-wal");
+    let database = receipt::DATABASE.at(directory);
+    let wal = receipt::WAL.at(directory);
     let h = current.catalog.source_hashes();
     let capture = Capture {
         database: &database,

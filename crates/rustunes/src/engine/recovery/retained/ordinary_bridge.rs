@@ -29,8 +29,8 @@ pub(super) fn verify_catalog(
     let original_sql = |catalog: &Catalog, directory: &Path, output: &Path, window: Window| {
         let before = retained.before.source_hashes();
         let after = catalog.source_hashes();
-        let db = directory.join("catalog/MediaLibrary.sqlitedb");
-        let wal = directory.join("catalog/MediaLibrary.sqlitedb-wal");
+        let db = receipt::DATABASE.at(directory);
+        let wal = receipt::WAL.at(directory);
         ordinary_sql::verify(
             &attempt.prepared,
             source,
@@ -51,11 +51,12 @@ pub(super) fn verify_catalog(
             attributes,
         )
     };
-    let load = |directory: &Path, receipt_sha256: String| {
-        crate::engine::recovery::saved::load_saved_current_with_control(
-            &crate::engine::recovery::saved::SavedCurrent {
-                directory: directory.to_owned(),
-                receipt_sha256,
+    // The fresh capture is pinned by the receipt it returned.
+    let load_fresh = || {
+        saved::load_saved_current_with_control(
+            &SavedCurrent {
+                directory: fresh_dir.clone(),
+                receipt_sha256: hex(&current.receipt_sha256),
             },
             &current.device,
             options.trace,
@@ -80,7 +81,7 @@ pub(super) fn verify_catalog(
             let projection = if listened {
                 // As the bridge does, the saved fresh evidence must be the
                 // captured Current in every scope the SQL proof does not read.
-                let fresh = load(&fresh_dir, hex(&current.receipt_sha256))?;
+                let fresh = load_fresh()?;
                 ensure_loaded_fresh(current, &fresh.current)?;
                 insert_verification::verify_insert_after_listening(
                     &retained.before,
@@ -118,10 +119,17 @@ pub(super) fn verify_catalog(
         Ok(_) => directory(&immediate_dir)?,
     }
     let immediate_dir = fs::canonicalize(immediate_dir)?;
-    let receipt = read_bounded(&immediate_dir.join("state-receipt.json"), SMALL)?;
     control.check()?;
-    let immediate = load(&immediate_dir, hex(&Sha256::digest(&receipt)))?;
-    let fresh = load(&fresh_dir, hex(&current.receipt_sha256))?;
+    // Nothing earlier pins the step's own After: it loads as its receipt
+    // binds it.
+    let immediate = saved::load_unpinned_saved_current_with_control(
+        &immediate_dir,
+        &current.device,
+        options.trace,
+        control.deadline.into_std(),
+        Arc::clone(&control.cancelled),
+    )?;
+    let fresh = load_fresh()?;
     ensure_loaded_fresh(current, &fresh.current)?;
     playback::same_ordinary_scope(&immediate.current, current)?;
     let sql = original_sql(

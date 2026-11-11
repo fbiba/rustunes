@@ -1,5 +1,10 @@
 //! Fresh read-only pre/poststate for a journaled sync step. All copied inputs
 //! come from one checked USB provider; the writer rechecks exact hashes at Ready.
+//!
+//! A capture leaves a Current directory: the files it copied and the state
+//! receipt binding them, which the `receipt` module encodes and names with
+//! the layout of the directory. The saved Current reader
+//! (`engine::recovery::saved`) loads every saved or retained one again.
 use std::{
     ffi::{CString, OsStr, OsString},
     fs::{self, File},
@@ -30,6 +35,11 @@ use music_protocol::protocol::trace::private_write;
 use music_protocol::protocol::transfer::{
     CaptureControl, Transfer, bounded_error, current_json_bytes, regular_size, write_current_json,
 };
+use receipt::{Form, StateReceipt};
+
+#[cfg(test)]
+pub(crate) mod fixtures;
+pub(crate) mod receipt;
 
 pub struct Current {
     pub device: String,
@@ -38,9 +48,48 @@ pub struct Current {
     pub catalog: Catalog,
     pub raw_preferences: Vec<u8>,
     pub plist_preferences: Vec<u8>,
-    pub cdb: Vec<u8>,
-    pub artwork_db: Option<Vec<u8>>,
+    /// Always captured: present, or absent on a phone no Apple computer has
+    /// synced (one `rustunes init` prepared).
+    pub cdb: DeviceFile,
+    /// Captured only for insert and removal batches and covers.
+    pub artwork_db: DeviceFile,
     pub receipt_sha256: [u8; 32],
+}
+
+/// A file a computer's music library leaves on the phone (iTunesCDB,
+/// ArtworkDB), as one capture saw it. Only Apple's computers write these, and
+/// the phone never reads them (docs/10 §5), so a phone
+/// `rustunes init` prepared never has them; rustunes then uses their defaults:
+/// VoiceMemo anchor 1, the database PID from SQL, artwork cache IDs from 100.
+#[derive(Clone, PartialEq, Eq)]
+pub enum DeviceFile {
+    /// The capture did not ask for it.
+    NotCaptured,
+    /// Asked for, and not on the phone.
+    Absent,
+    Present(Vec<u8>),
+}
+
+impl DeviceFile {
+    /// The bytes, when the file is on the phone.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Present(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+    pub fn captured(&self) -> bool {
+        !matches!(self, Self::NotCaptured)
+    }
+    /// The bytes of a captured file, or None when it is absent; an error when
+    /// the capture did not ask for it.
+    pub fn captured_bytes(&self, name: &str) -> Result<Option<&[u8]>> {
+        ensure!(self.captured(), "{name} capture absent");
+        Ok(self.bytes())
+    }
+    fn from_copy(bytes: Option<Vec<u8>>) -> Self {
+        bytes.map_or(Self::Absent, Self::Present)
+    }
 }
 
 /// A stricter enclosing deadline is retained across both complete attempts.
@@ -564,19 +613,26 @@ async fn capture_inner_options(
         device_files::CDB,
     ];
     let mut caps = vec![
-        1024 * 1024,
-        1024 * 1024,
-        music_protocol::catalogue::anchor::MAX_INPUT_BYTES as u64,
+        receipt::PREFS.cap,
+        receipt::PREFS_PLIST.cap,
+        receipt::CDB.cap,
     ];
     if include_artwork {
         names.push(device_files::ARTWORK_DB);
-        caps.push(32 * 1024 * 1024);
+        caps.push(receipt::ARTWORK_DB.cap);
     }
+    // The prefs pair is required; Apple's CDB and ArtworkDB may be absent.
+    let optional = |name: &str| [device_files::CDB, device_files::ARTWORK_DB].contains(&name);
     let mut attrs = Vec::new();
     let mut copies = Vec::new();
     for (index, name) in names.iter().enumerate() {
         check_capture(control)?;
         let Some(observed) = afc.stat(name).await? else {
+            if optional(name) {
+                attrs.push(None);
+                copies.push(None);
+                continue;
+            }
             let mut folder = None;
             for parent in device_files::folders(name) {
                 if afc.stat(parent).await?.is_none() {
@@ -605,12 +661,15 @@ async fn capture_inner_options(
         let path = trace.join(name.rsplit('/').next().unwrap());
         private_write(&path, &bytes)?;
         check_capture(control)?;
-        attrs.push(observed);
-        copies.push(bytes);
+        attrs.push(Some(observed));
+        copies.push(Some(bytes));
     }
     check_capture(control)?;
-    let library = identity::parse(&copies[0])?;
-    library.ensure_matches(&identity::parse(&copies[1])?)?;
+    let (Some(raw), Some(plist)) = (&copies[0], &copies[1]) else {
+        anyhow::bail!("prefs copies missing");
+    };
+    let library = identity::parse(raw)?;
+    library.ensure_matches(&identity::parse(plist)?)?;
     let identity = Identity::new(&device, &library)?;
     ensure!(
         identity.device_digest() == expected.device_digest()
@@ -627,11 +686,18 @@ async fn capture_inner_options(
             .await?
     };
     for (index, name) in names.iter().enumerate() {
+        let (Some(before), Some(copy)) = (&attrs[index], &copies[index]) else {
+            ensure!(
+                afc.stat(name).await?.is_none(),
+                "{name} appeared on the phone during capture"
+            );
+            continue;
+        };
         let mut after = afc
             .stat(name)
             .await?
             .context("device library input disappeared")?;
-        let mut before = attrs[index].clone();
+        let mut before = before.clone();
         before.remove("st_atime");
         after.remove("st_atime");
         ensure!(
@@ -639,42 +705,49 @@ async fn capture_inner_options(
             "device library input attributes changed during capture"
         );
         ensure!(
-            afc.read_hash(name, copies[index].len() as u64, caps[index])
-                .await?
-                == <[u8; 32]>::from(Sha256::digest(&copies[index])),
+            afc.read_hash(name, copy.len() as u64, caps[index]).await?
+                == <[u8; 32]>::from(Sha256::digest(copy)),
             "device library input bytes changed during capture"
         );
     }
     drop(afc);
-    let artwork_db = if include_artwork { copies.pop() } else { None };
-    let cdb = copies.pop().unwrap();
-    let plist_preferences = copies.pop().unwrap();
-    let raw_preferences = copies.pop().unwrap();
-    check_capture(control)?;
-    let anchors = music_protocol::catalogue::anchor::parse(&cdb)?;
-    check_capture(control)?;
-    ensure!(
-        anchors.database_pid() == catalog.database_pid(),
-        "copied CDB and SQL catalogue identities differ"
-    );
-    let receipt = serde_json::json!({
-        "schema":"rustunes.current-state", "device_sha256":hex(&identity.device_digest()),
-        "library_sha256":hex(&identity.library_digest()), "database_sha256":hex(&catalog.source_hashes().database),
-        "wal_sha256":catalog.source_hashes().wal.map(|h|hex(&h)), "media_anchor":catalog.persisted_media_anchor(),
-        "track_count":catalog.tracks().len(), "raw_preferences_sha256":hex(&Sha256::digest(&raw_preferences)),
-        "plist_preferences_sha256":hex(&Sha256::digest(&plist_preferences)), "cdb_sha256":hex(&Sha256::digest(&cdb)),
-        "artwork_database_sha256":artwork_db.as_ref().map(|bytes|hex(&Sha256::digest(bytes))),
-        "saved_cdb_media_anchor":anchors.saved_media_anchor(), "saved_cdb_voice_memo_anchor":anchors.saved_voice_memo_anchor(),
-        "atomic_snapshot_claimed":false, "phone_writes":0
-    });
-    check_capture(control)?;
-    let bytes = if control.is_some() {
-        current_json_bytes(&receipt)?
+    let artwork_db = if include_artwork {
+        DeviceFile::from_copy(copies.pop().unwrap())
     } else {
-        serde_json::to_vec_pretty(&receipt)?
+        DeviceFile::NotCaptured
     };
+    let cdb = DeviceFile::from_copy(copies.pop().unwrap());
+    let plist_preferences = copies.pop().unwrap().unwrap();
+    let raw_preferences = copies.pop().unwrap().unwrap();
     check_capture(control)?;
-    private_write(&trace.join("state-receipt.json"), &bytes)?;
+    let anchors = cdb
+        .bytes()
+        .map(music_protocol::catalogue::anchor::parse)
+        .transpose()?;
+    check_capture(control)?;
+    if let Some(anchors) = &anchors {
+        ensure!(
+            anchors.database_pid() == catalog.database_pid(),
+            "copied CDB and SQL catalogue identities differ"
+        );
+    }
+    let receipt = StateReceipt::describe(
+        &identity,
+        &catalog,
+        &raw_preferences,
+        &plist_preferences,
+        &cdb,
+        &artwork_db,
+        anchors.as_ref(),
+    );
+    check_capture(control)?;
+    let bytes = receipt.encode(if control.is_some() {
+        Form::Capped
+    } else {
+        Form::Pretty
+    })?;
+    check_capture(control)?;
+    private_write(&receipt::RECEIPT.at(trace), &bytes)?;
     check_capture(control)?;
     File::open(trace)?.sync_all()?;
     check_capture(control)?;

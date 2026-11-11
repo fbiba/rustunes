@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::state::current::Current;
+use crate::engine::state::current::{Current, DeviceFile};
 use crate::engine::state::journal::{AttemptState, Content, StartEvidence, test_support};
 use music_protocol::catalogue::identity;
 use std::time::Duration;
@@ -220,8 +220,8 @@ impl Fixture {
             catalog: music_protocol::test_support::catalogue::collection_catalog(anchor),
             raw_preferences: prefs.clone(),
             plist_preferences: prefs,
-            cdb: Vec::new(),
-            artwork_db: None,
+            cdb: DeviceFile::Present(Vec::new()),
+            artwork_db: DeviceFile::NotCaptured,
             receipt_sha256: [7; 32],
         }
     }

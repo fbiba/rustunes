@@ -6,7 +6,11 @@ use crate::{
 
 #[test]
 fn ordinary_missing_raw_artwork_does_not_widen_artwork_policy() {
-    for artwork in [None, Some(vec![1])] {
+    for artwork in [
+        DeviceFile::NotCaptured,
+        DeviceFile::Absent,
+        DeviceFile::Present(vec![1]),
+    ] {
         let a = current();
         let mut b = current();
         b.artwork_db = artwork;
@@ -30,7 +34,7 @@ fn ordinary_missing_raw_artwork_does_not_widen_artwork_policy() {
 
 #[test]
 fn ordinary_scope_rejects_identity_preferences_cdb_anchor_and_artwork_drift() {
-    for field in 0..7 {
+    for field in 0..9 {
         let mut a = current();
         let mut b = current();
         match field {
@@ -38,11 +42,21 @@ fn ordinary_scope_rejects_identity_preferences_cdb_anchor_and_artwork_drift() {
             1 => b.identity = Identity::new("other", &b.library).unwrap(),
             2 => b.raw_preferences[20] ^= 1,
             3 => b.plist_preferences[20] ^= 1,
-            4 => b.cdb[48] ^= 1,
+            4 => {
+                let DeviceFile::Present(cdb) = &mut b.cdb else {
+                    unreachable!()
+                };
+                cdb[48] ^= 1;
+            }
             5 => b.catalog = music_protocol::test_support::catalogue::collection_catalog(14),
             6 => {
-                a.artwork_db = Some(vec![1]);
-                b.artwork_db = Some(vec![2]);
+                a.artwork_db = DeviceFile::Present(vec![1]);
+                b.artwork_db = DeviceFile::Present(vec![2]);
+            }
+            7 => b.cdb = DeviceFile::Absent,
+            8 => {
+                a.artwork_db = DeviceFile::Present(vec![1]);
+                b.artwork_db = DeviceFile::Absent;
             }
             _ => unreachable!(),
         }
@@ -56,11 +70,40 @@ fn ordinary_scope_rejects_identity_preferences_cdb_anchor_and_artwork_drift() {
 #[test]
 fn ordinary_raw_artwork_policy_discloses_uncaptured_baseline_and_preserves_known_bytes() {
     for (before, after, expected) in [
-        (None, None, Some("absent_from_both_captures")),
-        (None, Some(vec![1]), Some("not_captured_in_immediate_state")),
-        (Some(vec![1]), Some(vec![1]), Some("captured_equal")),
-        (Some(vec![1]), Some(vec![2]), None),
-        (Some(vec![1]), None, None),
+        (
+            DeviceFile::NotCaptured,
+            DeviceFile::NotCaptured,
+            Some("absent_from_both_captures"),
+        ),
+        (
+            DeviceFile::NotCaptured,
+            DeviceFile::Present(vec![1]),
+            Some("not_captured_in_immediate_state"),
+        ),
+        (
+            DeviceFile::NotCaptured,
+            DeviceFile::Absent,
+            Some("not_captured_in_immediate_state"),
+        ),
+        (
+            DeviceFile::Present(vec![1]),
+            DeviceFile::Present(vec![1]),
+            Some("captured_equal"),
+        ),
+        (
+            DeviceFile::Absent,
+            DeviceFile::Absent,
+            Some("captured_absent_from_phone"),
+        ),
+        (
+            DeviceFile::Present(vec![1]),
+            DeviceFile::Present(vec![2]),
+            None,
+        ),
+        (DeviceFile::Present(vec![1]), DeviceFile::NotCaptured, None),
+        (DeviceFile::Present(vec![1]), DeviceFile::Absent, None),
+        (DeviceFile::Absent, DeviceFile::Present(vec![1]), None),
+        (DeviceFile::Absent, DeviceFile::NotCaptured, None),
     ] {
         let mut immediate = current();
         let mut fresh = current();
@@ -79,21 +122,22 @@ fn ordinary_raw_artwork_policy_discloses_uncaptured_baseline_and_preserves_known
 
 #[test]
 fn ordinary_saved_fresh_artwork_must_exactly_match_the_captured_current() {
-    for artwork in [None, Some(vec![1])] {
+    let all = [
+        DeviceFile::NotCaptured,
+        DeviceFile::Absent,
+        DeviceFile::Present(vec![1]),
+        DeviceFile::Present(vec![2]),
+    ];
+    for artwork in &all {
         let mut captured = current();
         captured.artwork_db = artwork.clone();
-        let mut loaded = current();
-        loaded.artwork_db = artwork;
-        assert!(ordinary_bridge::ensure_loaded_fresh(&captured, &loaded).is_ok());
-        loaded.artwork_db = if captured.artwork_db.is_some() {
-            None
-        } else {
-            Some(vec![1])
-        };
-        assert!(ordinary_bridge::ensure_loaded_fresh(&captured, &loaded).is_err());
-        if captured.artwork_db.is_some() {
-            loaded.artwork_db = Some(vec![2]);
-            assert!(ordinary_bridge::ensure_loaded_fresh(&captured, &loaded).is_err());
+        for other in &all {
+            let mut loaded = current();
+            loaded.artwork_db = other.clone();
+            assert_eq!(
+                ordinary_bridge::ensure_loaded_fresh(&captured, &loaded).is_ok(),
+                artwork == other
+            );
         }
     }
 }

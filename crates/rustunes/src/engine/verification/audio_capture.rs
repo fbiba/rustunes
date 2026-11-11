@@ -802,7 +802,7 @@ mod missing_tests {
             (
                 AfcOpcode::Data,
                 Vec::new(),
-                b"st_ifmt\0S_IFDIR\0st_size\0128\0st_mtime\01\0".to_vec(),
+                b"st_ifmt\0S_IFDIR\0st_size\x00128\0st_mtime\x001\0".to_vec(),
             )
         } else {
             (AfcOpcode::Status, 8u64.to_le_bytes().to_vec(), Vec::new())

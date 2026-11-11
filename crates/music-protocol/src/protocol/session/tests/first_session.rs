@@ -339,7 +339,7 @@ mod whole {
         ]);
         leftover
             .tree
-            .insert(format!("{SIGNATURE}"), Node::File(vec![0; 21]));
+            .insert(SIGNATURE.to_owned(), Node::File(vec![0; 21]));
         let ran = run(leftover, false, false).await;
         assert!(ran.result.is_err());
         assert!(!ran.finished_sent);

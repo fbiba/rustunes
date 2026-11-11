@@ -21,7 +21,6 @@ use crate::engine::{
     verification::catalogue_capture,
 };
 
-const DATABASE: &str = "iTunes_Control/iTunes/MediaLibrary.sqlitedb";
 pub(crate) const SYNC_MEDIA: &str = "iTunes_Control/Sync/Media";
 const MUSIC: &str = "iTunes_Control/Music";
 
@@ -34,9 +33,9 @@ const PATHS: [&str; 17] = [
     device_files::PREFS_TEMPORARY,
     device_files::PREFS_PLIST_TEMPORARY,
     device_files::CDB,
-    DATABASE,
-    "iTunes_Control/iTunes/MediaLibrary.sqlitedb-wal",
-    "iTunes_Control/iTunes/MediaLibrary.sqlitedb-shm",
+    device_files::DATABASE,
+    device_files::DATABASE_WAL,
+    device_files::DATABASE_SHM,
     "iTunes_Control/Artwork",
     device_files::ARTWORK_DB,
     MUSIC,
@@ -421,7 +420,7 @@ pub(crate) async fn inspect(
     };
     let library = if paths
         .iter()
-        .any(|(name, attributes)| *name == DATABASE && attributes.is_some())
+        .any(|(name, attributes)| *name == device_files::DATABASE && attributes.is_some())
     {
         catalogue_capture::library_state(provider, &trace.join("database"), deadline).await?
     } else {

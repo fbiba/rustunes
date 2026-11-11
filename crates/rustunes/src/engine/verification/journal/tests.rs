@@ -1,8 +1,11 @@
 use super::*;
+use crate::engine::state::current::DeviceFile;
 use crate::engine::state::journal::{Artwork, CompletionEvidence, Content, test_support};
 use crate::engine::verification::artwork;
 use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf, sync::atomic::AtomicU64};
 
+/// The bytes a state guard's request bound counts per read request.
+const CHUNK: u64 = 64 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Temp(PathBuf);
 impl Temp {
@@ -98,8 +101,8 @@ fn current() -> Current {
         catalog,
         raw_preferences: prefs(),
         plist_preferences: prefs(),
-        cdb,
-        artwork_db: None,
+        cdb: DeviceFile::Present(cdb),
+        artwork_db: DeviceFile::NotCaptured,
         receipt_sha256: [7; 32],
     }
 }
@@ -145,7 +148,7 @@ impl Mock {
     }
 }
 impl ReadBatch for Mock {
-    async fn state_guard(&mut self, _: &FreshState) -> Result<()> {
+    async fn state_guard(&mut self, _: &HeldState) -> Result<()> {
         self.guards += 1;
         ensure!(
             !(self.fail_final_guard && self.guards == 2),
@@ -183,7 +186,7 @@ impl ReadBatch for Mock {
 #[test]
 fn schedule_bounds_every_connection_and_counts_state_bytes_toward_total() {
     let files: Vec<_> = (0..512).map(|i| (i, MAX_AUDIO)).collect();
-    let (batches, audio, total) = schedule(&files, 10).unwrap();
+    let (batches, audio, total) = schedule(&files, 10, 10 * CHUNK).unwrap();
     assert!(batches.len() > 1);
     assert_eq!(audio, 512 * MAX_AUDIO);
     assert!(total > audio);
@@ -200,15 +203,23 @@ fn schedule_bounds_every_connection_and_counts_state_bytes_toward_total() {
             .collect::<Vec<_>>(),
         (0..512).collect::<Vec<_>>()
     );
-    assert!(schedule(&(0..1024).map(|i| (i, MAX_AUDIO)).collect::<Vec<_>>(), 10).is_err());
-    assert!(schedule(&[(0, MAX_AUDIO + 1)], 10).is_err());
-    assert!(schedule(&[(0, 1)], u64::MAX).is_err());
-    assert!(schedule(&[(0, MAX_AUDIO)], 4000).is_err());
-    assert!(schedule(&vec![(0, 1); 4097], 0).is_err());
-    assert!(schedule(&[], 0).unwrap().0.is_empty());
+    assert!(
+        schedule(
+            &(0..1024).map(|i| (i, MAX_AUDIO)).collect::<Vec<_>>(),
+            10,
+            10 * CHUNK
+        )
+        .is_err()
+    );
+    assert!(schedule(&[(0, MAX_AUDIO + 1)], 10, 10 * CHUNK).is_err());
+    assert!(schedule(&[(0, 1)], u64::MAX, 0).is_err());
+    assert!(schedule(&[(0, 1)], 0, u64::MAX).is_err());
+    assert!(schedule(&[(0, MAX_AUDIO)], 4000, 4000 * CHUNK).is_err());
+    assert!(schedule(&vec![(0, 1); 4097], 0, 0).is_err());
+    assert!(schedule(&[], 0, 0).unwrap().0.is_empty());
     // A library of 400 typical tracks needs two connections, not seventeen.
     let typical: Vec<_> = (0..400).map(|i| (i, 20 << 20)).collect();
-    assert_eq!(schedule(&typical, 10).unwrap().0.len(), 2);
+    assert_eq!(schedule(&typical, 10, 10 * CHUNK).unwrap().0.len(), 2);
     assert!(bounded_attributes(&attrs()).is_ok());
     assert!(bounded_attributes(&BTreeMap::from([("oversize".into(), "a".repeat(1025))])).is_err());
 }
@@ -405,13 +416,13 @@ fn journal_success_requires_permanent_track_proof_but_not_album_cover_equality()
 #[test]
 fn artwork_budget_covers_original_derivative_and_both_state_guards() {
     assert_eq!(
-        artwork_read_budget(&[4, 9], 3).unwrap(),
+        artwork_read_budget(&[4, 9], 3 * CHUNK).unwrap(),
         13 + 2 * artwork::MAX_IMAGE_BYTES + 12 * CHUNK
     );
     assert!(artwork_read_budget(&[0], 0).is_err());
     assert!(artwork_read_budget(&[artwork::MAX_IMAGE_BYTES + 1], 0).is_err());
     assert!(artwork_read_budget(&[1], u64::MAX).is_err());
-    assert!(artwork_read_budget(&vec![artwork::MAX_IMAGE_BYTES; MAX_BINDINGS], 1).is_err());
+    assert!(artwork_read_budget(&vec![artwork::MAX_IMAGE_BYTES; MAX_BINDINGS], CHUNK).is_err());
 }
 
 #[tokio::test]

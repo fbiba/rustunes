@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::state::current::DeviceFile;
 use std::{
     path::PathBuf,
     sync::{
@@ -109,6 +110,51 @@ fn before_copy_is_bounded_hash_checked_nonreplacing_and_symlink_safe() {
     std::os::unix::fs::symlink(&source, &link).unwrap();
     assert!(copy_file(&link, &temp.0.join("linked"), h, 13, &control()).is_err());
 }
+/// A copy of a capture holds every file its receipt binds, the ArtworkDB
+/// too when the capture holds one, and loads as the Before it is.
+#[test]
+fn a_copied_before_loads_as_the_capture() {
+    use crate::engine::recovery::retained::load_before;
+    use crate::engine::state::current::{
+        fixtures::{self, Shape},
+        hex,
+        receipt::Form,
+    };
+    let temp = Temp::new();
+    let shapes = [
+        Shape::synced(),
+        Shape {
+            voice_memo: None,
+            artwork_db: DeviceFile::Absent,
+            form: Form::Pretty,
+            released: false,
+        },
+        Shape {
+            artwork_db: DeviceFile::Present(fixtures::artwork_db()),
+            ..Shape::synced()
+        },
+        Shape {
+            released: true,
+            ..Shape::synced()
+        },
+    ];
+    for (n, shape) in shapes.into_iter().enumerate() {
+        let capture = fixtures::write(&temp.0.join(format!("capture-{n}")), shape);
+        let copy = temp.0.join(format!("copy-{n}"));
+        copy_before(&capture.directory, &copy, &capture.current, &control()).unwrap();
+        let input = serde_json::json!({"current_state_receipt_sha256": hex(&capture.current.receipt_sha256)});
+        let before = load_before(&copy, &input, 13, &capture.current, &temp.0).unwrap();
+        assert_eq!(
+            before.catalog.source_hashes().database,
+            capture.current.catalog.source_hashes().database
+        );
+        let artwork_db = copy.join("ArtworkDB");
+        match capture.current.artwork_db.bytes() {
+            Some(bytes) => assert_eq!(fs::read(artwork_db).unwrap(), bytes),
+            None => assert!(!artwork_db.exists()),
+        }
+    }
+}
 #[tokio::test]
 async fn refresh_capture_shares_deadline_and_cancellation_without_polling_after_expiry() {
     let mut c = control();
@@ -183,8 +229,8 @@ fn current() -> Current {
         catalog: music_protocol::test_support::catalogue::collection_catalog(89),
         raw_preferences: prefs.clone(),
         plist_preferences: prefs,
-        cdb: vec![1, 2, 3],
-        artwork_db: None,
+        cdb: DeviceFile::Present(vec![1, 2, 3]),
+        artwork_db: DeviceFile::NotCaptured,
         receipt_sha256: [7; 32],
     }
 }
@@ -198,8 +244,8 @@ fn refresh_does_not_replace_library_prefs_cdb_or_artwork_identity() {
             0 => fresh.device = "other".into(),
             1 => fresh.raw_preferences[20] ^= 1,
             2 => fresh.plist_preferences[20] ^= 1,
-            3 => fresh.cdb.push(4),
-            4 => fresh.artwork_db = Some(vec![1]),
+            3 => fresh.cdb = DeviceFile::Present(vec![1, 2, 3, 4]),
+            4 => fresh.artwork_db = DeviceFile::Present(vec![1]),
             _ => {
                 fresh.identity =
                     crate::engine::state::journal::Identity::new("other", &fresh.library).unwrap()

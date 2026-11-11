@@ -3,7 +3,7 @@
 use crate::{
     engine::execution::native_insert::{Control, PreSessionStateDrift},
     engine::planning::source_collection::{self, SourceCollection},
-    engine::state::current::Current,
+    engine::state::current::{Current, receipt},
 };
 use anyhow::{Context, Result, ensure};
 use music_protocol::catalogue::sqlite::Catalog;
@@ -205,8 +205,10 @@ pub(super) fn ensure_sources(frozen: &SourceCollection, control: &Control) -> Re
     control.check()
 }
 
-/// Copy only the fixed files consumed by retained insertion recovery. The
-/// original capture/previous verified after is never changed or relabelled.
+/// Copy the files of the capture at `source` its receipt binds, as the
+/// state receipt module lists them (the ArtworkDB too, when the capture
+/// holds one), so the copy loads as the capture would. The original
+/// capture/previous verified after is never changed or relabelled.
 pub(super) fn copy_before(
     source: &Path,
     target: &Path,
@@ -215,52 +217,16 @@ pub(super) fn copy_before(
 ) -> Result<()> {
     control.check()?;
     fs::DirBuilder::new().mode(0o700).create(target)?;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(target.join("catalog"))?;
-    let h = current.catalog.source_hashes();
-    for (name, hash, size) in [
-        (
-            "catalog/MediaLibrary.sqlitedb",
-            h.database,
-            h.database_bytes,
-        ),
-        ("state-receipt.json", current.receipt_sha256, 1024 * 1024),
-        (
-            "iTunesPrefs",
-            Sha256::digest(&current.raw_preferences).into(),
-            current.raw_preferences.len() as u64,
-        ),
-        (
-            "iTunesPrefs.plist",
-            Sha256::digest(&current.plist_preferences).into(),
-            current.plist_preferences.len() as u64,
-        ),
-        (
-            "iTunesCDB",
-            Sha256::digest(&current.cdb).into(),
-            current.cdb.len() as u64,
-        ),
-    ] {
-        copy_file(&source.join(name), &target.join(name), hash, size, control)?;
+    let catalog = target.join(receipt::CATALOG);
+    fs::DirBuilder::new().mode(0o700).create(&catalog)?;
+    for (file, hash) in receipt::bound_files(current) {
+        copy_file(&file.at(source), &file.at(target), hash, file.cap, control)?;
     }
-    if let Some(hash) = h.wal {
-        copy_file(
-            &source.join("catalog/MediaLibrary.sqlitedb-wal"),
-            &target.join("catalog/MediaLibrary.sqlitedb-wal"),
-            hash,
-            h.wal_bytes.context("WAL size missing")?,
-            control,
-        )?;
-    } else {
-        ensure!(
-            !source
-                .join("catalog/MediaLibrary.sqlitedb-wal")
-                .try_exists()?,
-            "unbound WAL beside before capture"
-        );
-    }
-    File::open(target.join("catalog"))?.sync_all()?;
+    ensure!(
+        current.catalog.source_hashes().wal.is_some() || !receipt::WAL.at(source).try_exists()?,
+        "unbound WAL beside before capture"
+    );
+    File::open(&catalog)?.sync_all()?;
     File::open(target)?.sync_all()?;
     File::open(target.parent().context("before parent missing")?)?.sync_all()?;
     control.check()
