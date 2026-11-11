@@ -630,9 +630,10 @@ async fn namespace_guard(
         .rsplit_once('/')
         .context("missing destination folder")?
         .0;
-    for directory in ["iTunes_Control/Sync/Media", folder] {
-        afc.require_directory(directory).await?;
-    }
+    afc.require_directory("iTunes_Control/Sync/Media").await?;
+    // The phone creates a missing Music folder when it moves the file in
+    // (docs/04 §4.4); a phone `rustunes init` prepared has none.
+    afc.require_directory_or_absent(folder).await?;
     afc.require_directory_or_absent(STAGING_MEDIA).await?;
     let names = afc.names("iTunes_Control/Sync/Media").await?;
     ensure!(
@@ -676,8 +677,9 @@ pub(crate) async fn batch_guard(
 }
 async fn shared_namespace_guard(afc: &mut Transfer, folders: &BTreeSet<&str>) -> Result<()> {
     afc.require_directory("iTunes_Control/Sync/Media").await?;
+    // The phone creates a missing Music folder at the move, as above.
     for folder in folders {
-        afc.require_directory(folder).await?;
+        afc.require_directory_or_absent(folder).await?;
     }
     afc.require_directory_or_absent(STAGING_MEDIA).await?;
     let names = afc.names("iTunes_Control/Sync/Media").await?;

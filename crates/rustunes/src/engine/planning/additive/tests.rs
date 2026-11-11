@@ -761,6 +761,93 @@ fn metadata_difference_and_plausibility_rules_do_not_turn_titles_into_identity()
     assert!(differences(&s, &track).is_empty());
 }
 
+/// A phone `rustunes init` prepared holds no track and no Music folder; the
+/// planner accepts the allocator's destinations there, Apple's F00 to F49.
+#[test]
+fn a_library_without_music_folders_plans_into_apples_folders() {
+    let source = sources();
+    let catalog = music_protocol::test_support::catalogue::modified_collection_catalog(
+        1,
+        "DELETE FROM item; DELETE FROM item_extra; DELETE FROM item_store;
+         DELETE FROM item_state; DELETE FROM item_stats; DELETE FROM base_location;",
+    );
+    assert!(catalog.tracks().is_empty() && catalog.music_folders().is_empty());
+    let other = different(fingerprint::read(&fixture()).unwrap());
+    let mut empty = receipt(
+        &music_protocol::test_support::catalogue::collection_catalog(1),
+        &other,
+        false,
+    );
+    let h = catalog.source_hashes();
+    empty["catalog"] = json!({"database_sha256":hex(&h.database),"database_bytes":h.database_bytes,
+        "wal_sha256":null,"wal_bytes":null,"persisted_media_anchor":1});
+    empty["records"] = json!([]);
+    empty["track_count"] = json!(0);
+    empty["total_bytes"] = json!(0);
+    empty["alac_track_count"] = json!(0);
+    let index = load(&catalog, &empty).unwrap();
+    let plan = build(
+        &source,
+        &catalog,
+        &index,
+        &identity(),
+        None,
+        &candidates(&source),
+    )
+    .unwrap();
+    let Decision::Add { path, .. } = &plan.sources[0].decision else {
+        panic!(
+            "expected additive proposal: {}",
+            serde_json::to_value(&plan.sources[0]).unwrap()
+        )
+    };
+    assert_eq!(path, "iTunes_Control/Music/F39/ABCD.m4a");
+    let mut outside = candidates(&source);
+    outside.values_mut().next().unwrap().path = "iTunes_Control/Music/F50/ABCD.m4a".into();
+    let plan = build(&source, &catalog, &index, &identity(), None, &outside).unwrap();
+    assert!(matches!(
+        &plan.sources[0].decision,
+        Decision::Conflict { code, .. } if *code == "candidate_or_grouping_conflict"
+    ));
+}
+
+/// After a first track went into one folder, a library built new (the shape
+/// `rustunes init` prepares) still takes new tracks in any of Apple's F00 to
+/// F49, as Apple's sync spreads them; a migrated library keeps to the
+/// folders it uses, and neither takes a folder outside them.
+#[test]
+fn a_library_built_new_plans_into_all_of_apples_folders() {
+    let source = sources();
+    let other = different(fingerprint::read(&fixture()).unwrap());
+    let built_new = "ALTER TABLE item_state DROP COLUMN is_supported_type;";
+    let plan = |sql: &str, folder: &str| {
+        let catalog = music_protocol::test_support::catalogue::modified_collection_catalog(1, sql);
+        assert_eq!(catalog.item_state_built_new(), !sql.is_empty());
+        assert_eq!(
+            catalog.music_folders().iter().collect::<Vec<_>>(),
+            ["iTunes_Control/Music/F39"]
+        );
+        let index = load(&catalog, &receipt(&catalog, &other, false)).unwrap();
+        let mut proposed = candidates(&source);
+        proposed.values_mut().next().unwrap().path =
+            format!("iTunes_Control/Music/{folder}/ABCD.m4a");
+        build(&source, &catalog, &index, &identity(), None, &proposed)
+            .unwrap()
+            .sources
+            .remove(0)
+            .decision
+    };
+    let refused = |decision: &Decision| matches!(decision, Decision::Conflict { code, .. } if *code == "candidate_or_grouping_conflict");
+    assert!(matches!(
+        plan(built_new, "F07"),
+        Decision::Add { path, .. } if path == "iTunes_Control/Music/F07/ABCD.m4a"
+    ));
+    assert!(matches!(plan(built_new, "F39"), Decision::Add { .. }));
+    assert!(refused(&plan(built_new, "F50")));
+    assert!(refused(&plan("", "F07")));
+    assert!(matches!(plan("", "F39"), Decision::Add { .. }));
+}
+
 #[test]
 fn collision_checks_are_casefolded_and_pending_groups_keep_predetermined_ids() {
     let catalog = music_protocol::test_support::catalogue::collection_catalog(13);

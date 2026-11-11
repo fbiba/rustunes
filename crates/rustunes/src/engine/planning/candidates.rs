@@ -82,7 +82,7 @@ fn allocation_context(catalog: &Catalog, journal: Option<&Journal>) -> Result<Al
         occupied.extend(journal.reserved_pids()?);
         paths.extend(journal.reserved_paths()?);
     }
-    let folders: Vec<_> = catalog
+    let known: Vec<_> = catalog
         .music_paths()?
         .iter()
         .map(|p| {
@@ -96,12 +96,36 @@ fn allocation_context(catalog: &Catalog, journal: Option<&Journal>) -> Result<Al
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    ensure!(
-        !folders.is_empty(),
-        "the phone registers no Music folders; directory discovery is required before allocating destinations"
-    );
     let random = File::open("/dev/urandom")?;
-    Ok((random, occupied, paths, folders))
+    Ok((
+        random,
+        occupied,
+        paths,
+        destination_folders(known, catalog.item_state_built_new()),
+    ))
+}
+
+/// The folders new tracks go in. On a phone with no folder (one `rustunes
+/// init` prepared), and on any library the phone built new (`built_new`,
+/// the shape `init` prepares), Apple's own set `F00` to `F49` (docs/02 §12)
+/// besides the folders in use, so tracks spread over them as Apple's sync
+/// spreads them, not into the one folder a first track went in. The phone
+/// creates a missing folder and registers it in `base_location` when it
+/// moves the first file in (observed on iOS 27.2,
+/// docs/04 §4.4). A migrated library keeps to the folders it uses: the
+/// recovery model of a single insertion (`ordinary_sql`) expects its folder
+/// registered already. The planner accepts the same folders.
+pub(crate) fn destination_folders(known: Vec<String>, built_new: bool) -> Vec<String> {
+    if !known.is_empty() && !built_new {
+        return known;
+    }
+    let apple = (0..50).map(|group| format!("iTunes_Control/Music/F{group:02}"));
+    known
+        .into_iter()
+        .chain(apple)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn word(random: &mut impl Read) -> Result<u64> {
@@ -147,6 +171,27 @@ fn next_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_phone_without_music_folders_or_built_new_gets_apples_fifty() {
+        for built_new in [false, true] {
+            let folders = destination_folders(Vec::new(), built_new);
+            assert_eq!(folders.len(), 50);
+            assert_eq!(folders[0], "iTunes_Control/Music/F00");
+            assert_eq!(folders[49], "iTunes_Control/Music/F49");
+        }
+        // A migrated library keeps to its folders.
+        let known = vec!["iTunes_Control/Music/F07".to_owned()];
+        assert_eq!(destination_folders(known.clone(), false), known);
+        // A library built new spreads over Apple's fifty besides its own.
+        let folders = destination_folders(known, true);
+        assert_eq!(folders.len(), 50);
+        assert!(folders.contains(&"iTunes_Control/Music/F07".to_owned()));
+        let odd = vec!["iTunes_Control/Music/F77".to_owned()];
+        let folders = destination_folders(odd, true);
+        assert_eq!(folders.len(), 51);
+        assert_eq!(folders[50], "iTunes_Control/Music/F77");
+    }
+
     #[test]
     fn skips_reserved_ids_and_casefolded_paths_without_recycling() {
         let words = [0u64, 1000, 1001];

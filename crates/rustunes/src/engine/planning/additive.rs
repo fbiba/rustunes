@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
+    engine::planning::candidates::destination_folders,
     engine::planning::collections::{CandidateIds, PlannedTrack, Planner},
     engine::planning::source_collection::mp3::preparation::PreparedSource,
     engine::planning::source_collection::{SourceCollection, SourceTrack},
@@ -445,12 +446,18 @@ fn build_inner_with_control(
     );
     let paths = catalog.music_paths()?;
     // Folders tracks use, and the phone's own registry: an emptied library
-    // keeps its folders but no track names them.
-    let folders: BTreeSet<_> = paths
+    // keeps its folders but no track names them. A phone with neither (one
+    // `rustunes init` prepared), and a library built new, also take Apple's
+    // set, as the allocator does.
+    let known: BTreeSet<_> = paths
         .iter()
         .filter_map(|p| p.rsplit_once('/').map(|(parent, _)| parent.to_owned()))
         .chain(catalog.music_folders().iter().cloned())
         .collect();
+    let folders: BTreeSet<_> =
+        destination_folders(known.into_iter().collect(), catalog.item_state_built_new())
+            .into_iter()
+            .collect();
     let journal_evidence = journal.as_ref().map(|e| (e.journal, e.identity));
     let mut managed_context = None;
     let mut journal = JournalView::read(journal, identity, index)?;
@@ -2074,8 +2081,9 @@ fn candidate_path(
 ) -> Result<()> {
     candidate_path_for(path, folders, occupied, ".m4a")
 }
-/// A candidate destination: an `Fnn` folder the catalogue uses, four
-/// uppercase letters and `extension` (its dot included), unused.
+/// A candidate destination: an `Fnn` folder of `folders` (those the catalogue
+/// uses, or Apple's set when it uses none), four uppercase letters and
+/// `extension` (its dot included), unused.
 fn candidate_path_for(
     path: &str,
     folders: &BTreeSet<String>,
