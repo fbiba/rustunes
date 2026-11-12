@@ -94,14 +94,14 @@ None of these refers to iTunes, to setup by a computer or to an earlier sync. Th
 
 Two related facts from the same reading:
 
-- **`iTunesSetupComplete` gates nothing.** Apple's host writes `com.apple.mobile.iTunes / iTunesSetupComplete = true` through lockdown (chapter 10, section 6.5). On the phone the name occurs once, in the table of `lockdownd` that makes the key readable by a host. No code on the phone reads its value.
+- **`iTunesSetupComplete` gates nothing.** Apple's host writes `com.apple.mobile.iTunes / iTunesSetupComplete = true` through lockdown (chapter 10, section 6.5). On the phone the name occurs once, in the table of `lockdownd` that makes the key readable by a host. No code on the phone reads its value. INFERRED: when a host reads a key of `com.apple.mobile.iTunes`, `lockdownd` first asks ManagedConfiguration (`MCCopyCheckpointValue`, `0x1000215f0`) and only then its own stored values.
 - **Pair records do not survive Setup Assistant.** When a new boot session starts while the phone is still in Setup Assistant, `lockdownd` deletes every pair record (`0x10001267c`, "Device is in buddy upon new boot session, deleting all existing pair records."). It also removes them when a USB host disconnects during setup (`0x10001751c`). A host should pair after the owner has finished setting the phone up.
 
 ## 4. USB transport on Linux
 
 ### 4.1 usbmuxd and pairing
 
-CONFIRMED. Over USB the host speaks to the system usbmuxd daemon on its Unix socket. usbmuxd lists devices with a `ConnectionType` of `USB` (and `Network` for Wi-Fi devices it knows). A pairing record, created when the phone was first trusted, lives in `/var/lib/lockdown/<UDID>.plist` on this host and is readable by users. It holds the HostID, the host and root certificates and keys, and `WiFiMACAddress`. With this record alone a client can start a lockdown session without any new pairing step.
+CONFIRMED. Over USB the host speaks to the system usbmuxd daemon on its Unix socket. usbmuxd lists devices with a `ConnectionType` of `USB` (and `Network` for Wi-Fi devices it knows). A pairing record, created when the phone was first trusted, lives in `/var/lib/lockdown/<UDID>.plist` on this host and is readable by users. It holds the HostID, the host and root certificates and keys, and `WiFiMACAddress`. With this record alone a client can start a lockdown session without any new pairing step. CONFIRMED (static): Apple's agent validates the pairing at attach and pairs an unpaired phone with `AMDevicePairWithOptions` and `{ExtendedPairingErrors: true}` (AMP 1.6.4.94 `0x1405b9440`-`0x1405b94eb`), and `AirTrafficHost.dll` validates it again before it starts `com.apple.atc` and otherwise gives up with "failed to validate pairing - refusing to connect" (4026.110.1.6, string `0x18003ad30`).
 
 A Linux host that already had a record needed no new Trust prompt. The phone reported ProductType `iPhone17,2`, ProductVersion `27.0.1`, BuildVersion `24A446`.
 
@@ -133,6 +133,8 @@ CONFIRMED from reading an open-source AFC client (the Rust `idevice` crate, vers
 ### 4.5 Services needed before the host does anything else
 
 CONFIRMED over Wi-Fi (not tested over USB): `com.apple.atc` and `com.apple.mobile.assertion_agent` close the connection on the first message unless the host also has a `com.apple.mobile.heartbeat` connection open. The phone's syslog shows `atc` registering with `heartbeatd` for each link (`Watching: ... [pid=53 (atc ...)]`, `ATLegacyMessageLink ... wifi=1`).
+
+No other service has to come first. CONFIRMED (static, AirTrafficHost 4026.110.1.6 and AMP 1.6.4.94): `AirTrafficHost.dll` opens `com.apple.atc` after it validates the pairing and starts a lockdown session, with no `com.apple.mobilesync` step, and Apple's sync runs its backup and MobileSync stages only after it has sent `RequestingSync` (`0x140570291`, then `0x14057044e` and `0x1405704f0`; chapter 08, section 4). The Linux host opens no MobileSync service, and its sessions complete (CONFIRMED).
 
 ## 5. Wi-Fi transport
 
@@ -226,7 +228,7 @@ Sections 5.1 to 5.7 are about a host that reaches a phone. Apple's automatic Wi-
 | --- | --- |
 | `com.apple.iTunes` / `WiFiSyncingUserIDs` | Array of host user IDs as 16 hex digits. The host adds its own (`0x1405c5048`). |
 | `com.apple.iTunes` / `WiFiSyncingLibraries` | `{<LibraryID>: {SyncedDataclasses: [...], SyncedAssetTypes: [...]}}` (`0x1405c5ba8`). The key is the `LibraryID` of `HostInfo` (chapter 02, section 7.2). |
-| `com.apple.mobile.wireless_lockdown` / `WirelessBuddyID` | An ID the host generated once and keeps in its own preferences (`AMDeviceSetWirelessBuddyFlags`, MD2 `0x1800ef3ea`). |
+| `com.apple.mobile.wireless_lockdown` / `WirelessBuddyID` | An ID the host generated once and keeps in its own preferences (`AMDeviceSetWirelessBuddyFlags`, MD2 `0x1800ef3ea`). MD2 creates it when the host preference `com.apple.iTunes` / `WirelessBuddyID` is absent: four `rand()` values written with `%d%d%d%d`, after `srand` with the time and the process ID (`0x1801100f0`). |
 | `com.apple.mobile.wireless_lockdown` / `EnableWifiConnections` | `true`, by the same call. |
 
 The call first requires `SupportsWifiSyncing` to be true. Turning the switch off removes the keys. The host also advertises a Bonjour service `_atc._tcp` whose TXT record holds `libid`, its `LibraryID` (AT2, "Advertising wake service for libraryIdentifier"). None of these keys is needed for a host that opens the session itself (section 5.1).

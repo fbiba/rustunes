@@ -74,6 +74,7 @@ from the protocol analysis to the code.
 | --- | --- | --- |
 | **Linux** (x86_64 tested) | Required | rustunes is Linux-only. |
 | **An iPhone** paired with and trusting this computer | Required | See [Supported phones](#supported-phones) and [Getting started](#getting-started). |
+| **An iPhone synced once**, by Finder, Apple Devices, iTunes or `rustunes init` | Required | rustunes uses the music library identity a sync leaves on the phone. A phone no computer has synced stops with `iTunes_Control/iTunes/iTunesPrefs is not on the iPhone`: run [`rustunes init`](#rustunes-init) once to prepare it. |
 | **usbmuxd** | Required | Talks to the phone over USB, and saves the pairing record that Wi-Fi uses too. Most distributions start it automatically when an iPhone is plugged in. |
 | **FFmpeg** on `PATH` | Required to send covers | Verifies covers on the phone. Also used by `--flac-to-alac` and `validate --decode`. Without it, a sync that has covers to send stops before sending anything. |
 | **libimobiledevice tools** (`idevicepair`) | Optional | Only needed if the phone never shows the **Trust** prompt. |
@@ -216,14 +217,23 @@ also remove rustunes' settings and records, delete `~/.config/rustunes` and
 
 **1. Pair the phone (once).** Plug the iPhone in over USB, unlock it and tap
 **Trust** when asked. If no prompt appears, run `idevicepair pair`. rustunes
-uses this existing pairing; it never pairs or starts a service itself.
+uses this existing pairing and never pairs the phone itself. Through Lockdown
+it reads the phone's device information, which it never changes, and starts
+the phone services it uses: the file service (AFC), the sync service
+(`com.apple.atc`), over Wi-Fi the heartbeat and power-assertion services that
+keep the phone awake, and for `rustunes syslog` the system log relay.
 
 **2. Check that rustunes sees it.**
 
 ```bash
 rustunes device list     # the phone's identifier
 rustunes device info     # its model and iOS version
+rustunes device check    # whether rustunes can sync it
 ```
+
+If `device check` says the phone has never been synced with a music library
+(no computer has synced its Music), prepare it once with
+[`rustunes init`](#rustunes-init).
 
 **3. Tell rustunes where your music lives (once).**
 
@@ -239,6 +249,26 @@ rustunes sync            # do it
 ```
 
 That's it. From now on, run `rustunes sync` whenever your music folder changes.
+
+> [!WARNING]
+> Syncing the phone's music with Finder, Apple Devices or iTunes afterwards can
+> remove the tracks rustunes sent.
+>
+> - **A phone `rustunes init` prepared:** connecting it to Apple's software
+>   starts no sync, but pressing **Sync** there removes every track rustunes
+>   sent. With music sync off it asks nothing first.
+> - **A phone Apple's software synced before:** pressing **Sync** on that
+>   computer, or connecting the phone to it while automatic sync is on, puts
+>   back what the computer holds and removes the tracks only rustunes added.
+>
+> The first was tried on a phone: one press of **Sync** in Apple Devices removed
+> every track rustunes had sent, within seconds. The second comes from
+> reading Apple's code. Both are in
+> [chapter 10, section 9](docs/10-library-ownership-and-first-sync.md#9-a-phone-filled-by-another-program-then-connected-to-apples-host).
+>
+> Apple Devices has no setting that stops it syncing every phone. The switch
+> is per phone: "Automatically sync when this iPhone is connected" on the
+> phone's page, which is off for a phone `rustunes init` prepared.
 
 ## Everyday use
 
@@ -306,6 +336,11 @@ alone. To check a single file, use `rustunes validate FILE`. See
   finish. Only one run can use a phone at a time.
 - **A command failed?** Its log is kept and its path printed. See
   [Logs](#logs), and attach the log when reporting a bug.
+- **The phone's library identity is unusable, or only
+  `iTunesPrefs.plist` is there?** Restoring a phone from a backup with
+  Apple's software is expected to leave it so, with settings that name no
+  music library. rustunes neither syncs nor initialises such a phone, and
+  `rustunes device check` reports it as unclear.
 
 > [!WARNING]
 > rustunes keeps no backup of the phone. A removed track exists only in your
@@ -318,7 +353,7 @@ describes each in full. The sections below cover every command and flag.
 
 | Task | Commands |
 | --- | --- |
-| [Sync](#sync) | `sync`, `push`, `pull`, `config library` |
+| [Sync](#sync) | `sync`, `push`, `pull`, `init`, `config library` |
 | [Remove tracks](#removing-tracks) | `delete`, `prune`, `clear` |
 | [Edit tracks on the phone](#editing-tracks-on-the-phone) | `metadata set`, `metadata plan`, `artwork` |
 | [Look at the phone](#looking-at-the-phone) | `device list`, `device info`, `library list`, `library show`, `library stats`, `catalog` |
@@ -427,6 +462,46 @@ the phone.
 | `--seconds N` | Time limit for reading the phone, and for copying each track. |
 | `--state-dir DIR` | See [shared options](#options-shared-by-many-commands). |
 
+#### `rustunes init`
+
+Prepare an iPhone that no computer has synced, once, before its first `sync`
+or `push`. Such a phone has no music library identity, and every other command
+stops on it. `init` gives it what Apple Devices gives a phone it takes on with
+Music sync off, and nothing more:
+
+- a new library identity in `iTunes_Control/iTunes/iTunesPrefs` and
+  `iTunesPrefs.plist`, kept in rustunes' state directory too;
+- one sync session that sends no track: it records the library in the phone's
+  database and adds the library playlist, hidden and empty.
+
+`init` first reads the phone and refuses one it cannot place: a phone synced
+already (rustunes syncs it as it is), or one that holds another library's
+files. It shows its plan and asks before writing anything. If it is
+interrupted, run it again: it recognises what it wrote and finishes. After
+the session it reads the phone's database back, waiting while the phone is
+still writing it, and only then reports the phone initialised; if it cannot
+confirm that, `rustunes device check` shows whether the session took.
+
+The phone then holds rustunes' library and no track: Media revision 1, the
+hidden library playlist, and no Music folder yet. Add music with `sync` or
+`push` (start with `rustunes sync --dry-run`); the first one needs no `pull`.
+
+Finder, Apple Devices and iTunes treat the phone afterwards as synced with
+another computer's library. Connecting it to Apple Devices starts no sync,
+but pressing Sync there removes every track rustunes sent, and with music
+sync off it asks nothing first. Turning music sync on there asks first
+("Sync and Replace"), then makes that computer's library the phone's own
+([chapter 10, section
+9](docs/10-library-ownership-and-first-sync.md#9-a-phone-filled-by-another-program-then-connected-to-apples-host);
+seen on a phone with Apple Devices).
+
+| Option | What it does |
+| --- | --- |
+| `--dry-run` | Read the phone and save the plan. Nothing is written to it. |
+| `--yes` | Do not ask before writing. |
+| `--seconds N` | Time limit for reading the phone, again for the session, and again for reading its result back (default 120). |
+| `--host-name NAME`, `--state-dir DIR` | See [shared options](#options-shared-by-many-commands). |
+
 #### `rustunes config library [DIR]`
 
 Set the library folder that `sync` mirrors and that `push`, `pull` and `plan`
@@ -516,6 +591,7 @@ as for `sync`.
 
 ```bash
 rustunes device info
+rustunes device check
 rustunes library stats
 rustunes library list --artist 'Artist'
 rustunes library show 0123456789abcdef --json
@@ -525,6 +601,7 @@ rustunes catalog --output ~/rustunes-checks/catalog.csv
 | Command | What it does | Options |
 | --- | --- | --- |
 | `device list` | List connected phones by identifier. With `--wifi`, the paired phones answering on this network. | `--json` |
+| `device check` | Show the files and folders the phone holds for music syncing, what its music database records, and whether rustunes can sync it or it has never been synced. Read-only. | `--json`, `--trace-dir DIR` (keep the database copy) |
 | `device info` | Show the phone's model and iOS version. | `--json`; `--domain DOMAIN` prints every value of this Lockdown domain as an XML plist instead (for example `com.apple.mobile.iTunes`, which lists the audio codecs the phone accepts) |
 | `library list` | List the tracks on the phone, with their IDs. | `--query TEXT` (case-insensitive search in title, artist and album), `--artist NAME` (exact artist or album artist), `--album NAME` (exact album) |
 | `library show ID` | Show a track's metadata and its location on the phone. | |
@@ -729,8 +806,8 @@ result. Prompts become records answered on stdin. The format is specified in
 | Path | Contents |
 | --- | --- |
 | `~/.config/rustunes/config.json` | The library folder |
-| `~/.local/state/rustunes/devices/` | One journal per phone and library: what rustunes sent and verified |
-| `~/.local/state/rustunes/runs/` | One directory per run: its plan, snapshot and receipts. Trimmed once its work is finished, and removed once no journal needs it |
+| `~/.local/state/rustunes/devices/` | One journal per phone and library: what rustunes sent and verified. For a phone `init` prepared, also its library identity and the name of its latest `init` run |
+| `~/.local/state/rustunes/runs/` | One directory per run: its plan, snapshot and receipts. Trimmed once its work is finished, and removed once no journal needs it. Each phone's latest `init` run is kept whole |
 | `~/.local/state/rustunes/*-cache/` | Fingerprints of local files and phone files already proven |
 | `~/.local/state/rustunes/wifi/` | Each phone's last Wi-Fi address |
 | `~/.local/state/rustunes/logs/` | The logs of the last 20 runs, and in `failed/` those of the last 20 that failed |
@@ -811,6 +888,9 @@ covers).
 ## Limitations
 
 - **No backup.** Removed tracks exist only in your source files.
+- **Apple's sync software can undo it.** Syncing the phone's music with
+  Finder, Apple Devices or iTunes afterwards can remove the tracks rustunes
+  sent (see the warning under [Getting started](#getting-started)).
 - **Tested on one phone and two iOS versions** (see [Supported phones](#supported-phones)).
 - **No playlist editing.** rustunes does not create or edit playlists. It
   removes members of ordinary playlists when it removes a track, and refuses to

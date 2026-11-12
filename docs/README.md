@@ -48,8 +48,9 @@ behaviour. Chapter 7 describes the design of the sync tool itself, chapter
 8 how Apple's host structures a sync, compared with the tool, chapter 9
 how an iOS update changes the library database, and chapter 10 how Apple's
 host decides which library a phone belongs to and what a first sync does.
-Chapter 10 rests on code and on one capture that was stopped before the
-phone could act: no phone that had never been synced was available. Chapter 1
+Chapter 10 rests on code, on one capture that was stopped before the phone
+could act, and on `rustunes init` run on a phone whose library the phone had
+rebuilt: no phone fresh from setup was available. Chapter 1
 explains the methods and the retention policy in section 10.
 
 The raw evidence is private and is not published: the traces, database

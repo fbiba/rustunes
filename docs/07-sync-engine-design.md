@@ -371,6 +371,17 @@ DESIGN, CONFIRMED on the phone.
   once (section 4.5).
   `verify`, `resume` and `status` name `pull` when they meet a superseded
   journal.
+- **A phone `init` prepared.** With no journal and none to carry, those
+  commands write the journal a pull would write, binding nothing, when the
+  state directory's `init` record owns the phone's library identity and
+  database and the capture shows no track a sync made, and report that they
+  started it (`journal_started`, section 10.5). Only a capture the
+  command took itself counts, as a pull's always does: a saved snapshot
+  (`--snapshot`) may predate tracks the phone holds now, so it starts no
+  journal. A dry run writes that journal into its run directory and plans
+  against it there, as `pull --dry-run` does; the phone's journal stays
+  absent until a real run. Any other phone without a journal still needs
+  `pull` before an insert batch.
 - **What is carried.** Each track the earlier journal bound and the capture
   still shows keeps its cover record, source path and FLAC conversion.
   A recorded source path that no longer exists gives way to the FLAC the track
@@ -892,10 +903,18 @@ For each batch:
    catalogue read shows it unchanged; a snapshot whose catalogue differs is set
    aside and captured again.
 2. Run read-only guards before any journal row exists: the namespace and the
-   state agree with the plan. A catalogue that drifted costs nothing,
-   because no reservation was made. If the first guard fails with a typed size
-   or digest mismatch, one refresh is allowed within the original deadline,
-   rebuilding the same operation from the same identifiers.
+   state agree with the plan. One state guard holds every state file the
+   capture bound: the prefs pair, the catalogue and its log, the iTunesCDB
+   (or its absence), the catalogue's index by its stat, and the ArtworkDB
+   when the session allocates cover identifiers or must leave it as it was.
+   It stats them all, reads each bound file back whole and stats them all
+   again; a removal or cover session checks its namespace between the two
+   stats. A file that differs fails the guard with a typed drift naming it.
+   A catalogue that drifted costs nothing, because no reservation was made.
+   If the first guard finds a bound file of another size or digest, one
+   refresh is allowed within the original deadline, rebuilding the same
+   operation from the same identifiers. A file that appeared, disappeared or
+   changed while the guard ran allows none.
 3. Check each target against the removal or insert model on that state. Refuse
    shapes the model does not cover.
 4. Journal Prepared (immutable operation, anchor, Before receipts, reserved
@@ -1944,7 +1963,7 @@ its details.
 | `atc_connected` | info | `ping_sent` (`probe`) |
 | `pong` | info | `session` (`probe --ping`) |
 | `cache_counts` | info | `cache` (`fingerprints`, `cover_proofs`, `source_reads`), `reused`, `stored` |
-| `runs_pruned` | info | `removed`, `trimmed`, `bytes`: after the command, earlier run directories no journal needs were removed and finished ones trimmed to what planning reads |
+| `runs_pruned` | info | `removed`, `trimmed`, `bytes`: after the command, earlier run directories no journal needs were removed and finished ones trimmed to what planning reads. Each phone's latest `init` run, named in `devices/<device>/init-run`, is kept whole |
 | `sync_blocked` | warning | `holds`: what must be fixed first, each with its source `path` (`null` for the journal), `code` and plain `reason`; `hint`: how to send the rest now, or `null` |
 | `removal_blocked` | warning | |
 | `removals_held` | warning | `tracks`, `sources`: `sync` could not read or fingerprint these sources, so it removes nothing this run and sends the rest; exit code 3 |
@@ -2070,18 +2089,22 @@ from every `message`, and its summary from the last `report` and the `result`.
 
 Known limits (all DESIGN unless noted):
 
-- A phone that no Apple host has synced is not supported. The tool takes the
-  library identity from the two prefs files Apple's host writes, and it
-  requires that host's saved catalogue, a `db_info` row and the staging
-  folder. Such a phone has none of them, and the tool stops at the first
-  missing file before it sends anything. The phone's own code would accept a
-  first session from any host; what that takes, and what Apple's host later
-  does to a phone another program filled, is in chapter 10. Nothing in that
-  chapter about a first session has been tried on a phone.
-- The tool sends the identity it finds and writes none of the host's files,
-  so Apple's host still sees its own phone with an older anchor. A later
-  sync with Apple's host resets the phone to what that host holds (chapter
-  10, section 11.1; INFERRED).
+- A phone that no Apple host has synced needs `rustunes init` once. The tool
+  takes the library identity from the two prefs files Apple's host writes,
+  and needs a `db_info` row and the staging folder. Such a phone has none of
+  them: every other command stops at the missing prefs and names `init`.
+  `init` writes a prefs pair with a library identity it mints, creates the
+  staging folder and runs one Delta session holding `update_db_info` and the
+  hidden library playlist (README). It writes no `iTunesCDB` or `ArtworkDB`;
+  every command takes Apple's defaults where those are absent. What the phone
+  allows a first host is in chapter 10, section 10.
+- On a phone Apple's host synced, the tool sends the identity it finds and
+  writes none of the host's files, so Apple's host still sees its own phone
+  with an older anchor. A later sync with Apple's host resets the phone to
+  what that host holds (chapter 10, section 11.1; INFERRED). On a phone
+  `init` prepared, pressing Sync in Apple's host with music sync off removes
+  every track the tool sent, with no question first (chapter 10, section 9;
+  read in code and observed once).
 - Group collection: the phone collects emptied albums, artists, composers and
   genres by its own rules, seen in sessions of 16 to 499 targets but not in
   smaller ones or in one of 90 (chapter 05, section 3). The tool cannot force
