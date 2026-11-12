@@ -134,7 +134,7 @@ AAC is 502 for every common AAC-LC file, not 501. FLAC and PCM are separate numb
   | "WAV audio file" | 45 | test insert |
   | "FLAC audio file" | 0 (the phone does not know the string) | test insert |
 
-  Kind 0 does not stop the track from being supported (`is_supported_type` was 1) or from playing.
+  Kind 0 does not stop the track from playing. Its `is_supported_type` was 1, which says little: no code examined writes that column, which a migrated library declares with the default 1 and a library built new lacks (chapter 04, section 4.1).
 - Not tried: Protected AAC, Purchased AAC, Audible. Their strings are INFERRED from iTunes naming and their phone ids are unknown.
 - Apple's own `location` dictionary is larger than a kind alone: `location_type` `"FILE"`, `extension` (OSType text such as `"M4A "`, `"MP3 "`), `date_created`, `file_size` and the full permanent path, for example `iTunes_Control/Music/F02/KWZT.m4a` and `.../F40/HQVN.mp3` (so the host, not the phone, picks `Fxx/XXXX.ext`). The builder code is at `0x140462421` to `0x140462518`. A location with only `kind` and the destination path was enough for every format sent.
 
