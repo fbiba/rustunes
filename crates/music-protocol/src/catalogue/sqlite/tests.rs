@@ -666,19 +666,162 @@ fn an_entry_the_phone_added_outside_the_library_is_left_out() {
     assert_eq!(catalog.artists()[&21].live_track_count, 1);
 }
 
+/// The observed shape of a purchase-history entry played on the phone: the
+/// Music app keeps a low-quality copy in its streaming cache, a folder
+/// at AFC's root beside `iTunes_Control`, and may purge it.
+const CACHED_ENTRY: &str = "INSERT INTO base_location VALUES(100,'Music/Cache_LoFi');
+    UPDATE item SET base_location_id=100,remote_location_id=100 WHERE item_pid=2;
+    UPDATE item_extra SET location='0f2b6a1e-7c3d-4e5f-9a8b-1c2d3e4f5a6b.m4a',file_size=2500000 WHERE item_pid=2;
+    UPDATE item_state SET is_library_added=1 WHERE item_pid=2;";
+
 #[test]
-fn an_entry_the_phone_added_with_a_file_or_shared_groups_refuses() {
-    for sql in [
-        "UPDATE item SET base_location_id=51 WHERE item_pid=2",
-        "UPDATE item_extra SET location='STREAM.m4a' WHERE item_pid=2",
-        "UPDATE item_state SET has_non_purgeable_asset=1 WHERE item_pid=2",
-        "UPDATE item SET album_pid=33,album_artist_pid=23 WHERE item_pid=1",
-        "UPDATE album SET album_artist_pid=23 WHERE album_pid=32",
+fn an_entry_the_phone_added_with_a_file_in_its_streaming_cache_is_left_out() {
+    let fixture = Fixture::new(false);
+    fixture.connection.execute_batch(STREAMED_ENTRY).unwrap();
+    let streamed = fixture.read(false).unwrap();
+    fixture.connection.execute_batch(CACHED_ENTRY).unwrap();
+    let catalog = fixture.read(false).unwrap();
+    assert_eq!(catalog.tracks(), streamed.tracks());
+    assert_eq!(
+        catalog.music_paths().unwrap(),
+        streamed.music_paths().unwrap()
+    );
+    assert_eq!(
+        catalog.represented_sync_ids(),
+        streamed.represented_sync_ids()
+    );
+    assert_eq!(
+        catalog.music_folders(),
+        &BTreeSet::from(["iTunes_Control/Music/F39".to_owned()])
+    );
+    assert_eq!(catalog.unsynced_albums().keys().collect::<Vec<_>>(), [&33]);
+    assert_eq!(catalog.unsynced_artists().keys().collect::<Vec<_>>(), [&23]);
+    assert_eq!(
+        catalog.stats_except_recent_play(),
+        streamed.stats_except_recent_play()
+    );
+    // The same in the built-new shape, whose flags may hold NULL.
+    fixture.connection.execute_batch(BUILT_NEW_SHAPE).unwrap();
+    fixture
+        .connection
+        .execute_batch("UPDATE item_state SET has_non_purgeable_asset=NULL WHERE item_pid=2")
+        .unwrap();
+    assert_eq!(fixture.read(false).unwrap().tracks(), streamed.tracks());
+    // The full-size cache, seen later in another folder, with the first
+    // folder's row gone.
+    fixture
+        .connection
+        .execute_batch(
+            "UPDATE base_location SET base_location_id=200,path='Music/Cache' WHERE base_location_id=100;
+            UPDATE item SET base_location_id=200 WHERE item_pid=2;
+            UPDATE item_extra SET file_size=9500000 WHERE item_pid=2;",
+        )
+        .unwrap();
+    let catalog = fixture.read(false).unwrap();
+    assert_eq!(catalog.tracks(), streamed.tracks());
+    assert_eq!(catalog.music_folders(), streamed.music_folders());
+}
+
+/// An entry the phone added refuses when its file could be where rustunes
+/// names one, when its location does not join cleanly, when the phone keeps
+/// its file for good (a shape not yet seen), or when it shares a group with
+/// the library.
+#[test]
+fn an_entry_the_phone_added_with_a_file_it_could_name_or_shared_groups_refuses() {
+    const MALFORMED: &str = "malformed media location join";
+    const UNDER: &str = "holds a file under iTunes_Control";
+    let cached = |sql: &str| format!("{CACHED_ENTRY} {sql}");
+    let base = |path: &str| {
+        cached(&format!(
+            "UPDATE base_location SET path='{path}' WHERE base_location_id=100"
+        ))
+    };
+    let leaf = |leaf: &str| {
+        cached(&format!(
+            "UPDATE item_extra SET location='{leaf}' WHERE item_pid=2"
+        ))
+    };
+    let plain = |sql: &str| sql.to_owned();
+    for (sql, message) in [
+        // No file, but half a location, or a kept asset.
+        (
+            plain("UPDATE item SET base_location_id=51 WHERE item_pid=2"),
+            MALFORMED,
+        ),
+        (
+            plain("UPDATE item_extra SET location='STREAM.m4a' WHERE item_pid=2"),
+            MALFORMED,
+        ),
+        (
+            plain("UPDATE item_state SET has_non_purgeable_asset=1 WHERE item_pid=2"),
+            "kept file with no location",
+        ),
+        // A file in a music folder, where a new track could be named.
+        (
+            plain(
+                "UPDATE item SET base_location_id=51 WHERE item_pid=2; UPDATE item_extra SET location='STREAM.m4a' WHERE item_pid=2",
+            ),
+            UNDER,
+        ),
+        (base("iTunes_Control/Music/Cache_LoFi"), UNDER),
+        (base("itunes_control/music/F39"), UNDER),
+        (base("ITUNES_CONTROL"), UNDER),
+        // A path that is not plainly outside iTunes_Control.
+        (base("Music/../iTunes_Control/Music/F39"), UNDER),
+        (base("./iTunes_Control/Music/F39"), UNDER),
+        (base("/iTunes_Control/Music/F39"), UNDER),
+        (base("Music//Cache_LoFi"), UNDER),
+        (base("Music/Cache_LoFi/"), UNDER),
+        (base("Music/Cache LoFi"), UNDER),
+        (base("Music/Caché"), UNDER),
+        (leaf("../../iTunes_Control/Music/F39/TEST.m4a"), UNDER),
+        (leaf(".."), UNDER),
+        // A location that does not join cleanly.
+        (leaf(""), MALFORMED),
+        (
+            cached("UPDATE item_extra SET location=NULL WHERE item_pid=2"),
+            MALFORMED,
+        ),
+        (
+            cached("UPDATE item SET base_location_id=0 WHERE item_pid=2"),
+            MALFORMED,
+        ),
+        (
+            cached("UPDATE item SET base_location_id=101 WHERE item_pid=2"),
+            MALFORMED,
+        ),
+        (
+            cached("UPDATE base_location SET path=NULL WHERE base_location_id=100"),
+            MALFORMED,
+        ),
+        (
+            cached("UPDATE base_location SET path=X'4D75736963' WHERE base_location_id=100"),
+            MALFORMED,
+        ),
+        (
+            cached("UPDATE item_extra SET location=X'41' WHERE item_pid=2"),
+            "wrong storage type",
+        ),
+        // A file the phone keeps for good, a shape not yet seen.
+        (
+            cached("UPDATE item_state SET has_non_purgeable_asset=1 WHERE item_pid=2"),
+            "has_non_purgeable_asset 1",
+        ),
+        // Groups shared with the library.
+        (
+            plain("UPDATE item SET album_pid=33,album_artist_pid=23 WHERE item_pid=1"),
+            "",
+        ),
+        (
+            plain("UPDATE album SET album_artist_pid=23 WHERE album_pid=32"),
+            "",
+        ),
     ] {
         let fixture = Fixture::new(false);
         fixture.connection.execute_batch(STREAMED_ENTRY).unwrap();
-        fixture.connection.execute_batch(sql).unwrap();
-        assert!(fixture.read(false).is_err(), "{sql}");
+        fixture.connection.execute_batch(&sql).unwrap();
+        let error = format!("{:#}", fixture.read(false).err().expect(&sql));
+        assert!(error.contains(message), "{sql}: {error}");
     }
 }
 

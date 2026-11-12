@@ -1465,24 +1465,76 @@ fn wire_id(row: &Row<'_>, name: &str) -> Result<u64> {
     Ok(value)
 }
 /// An item no sync made (`item_store.sync_id` 0), which the phone adds itself
-/// for an entry outside the library. Observed: an Apple Music track it
-/// streamed, with a remote location, no file, and an album and album artist
-/// without sync identities. No operation can name one, so the catalogue leaves
-/// it out. One that holds a file is refused: new tracks are named against the
-/// catalogue's paths, and its path would not be among them.
+/// for an entry outside the library. No operation can name one, so the
+/// catalogue leaves it out. Two shapes are read:
+/// - No file: base location 0 and an empty location. Observed: an Apple Music
+///   track it streamed, with a remote location, and an album and album
+///   artist without sync identities.
+/// - A file the phone may purge (`has_non_purgeable_asset` 0) in a folder
+///   outside `iTunes_Control`. Observed: a purchase-history
+///   track played on the phone, whose copy the Music app keeps in its
+///   streaming cache, a folder at AFC's root beside `iTunes_Control`: a
+///   low-quality one in base
+///   location `Music/Cache_LoFi` (one item), and later full-size ones in
+///   `Music/Cache` (every item of a purchase history). The folder varies, so
+///   none is named here.
+///
+/// New tracks are named against the catalogue's paths, all under
+/// `iTunes_Control/Music`, and no item no sync made is among them. So one
+/// whose file is under `iTunes_Control`, or whose location does not join
+/// cleanly, is refused, and the catalogue is not read. One whose file the
+/// phone keeps for good (`has_non_purgeable_asset` 1, such as an Apple Music
+/// download, presumably) could not collide either, but no such row has been
+/// seen, so it is refused too until one is.
 fn unsynced_item(row: &Row<'_>, null_flags: &BTreeSet<&str>) -> Result<i64> {
+    const MALFORMED: &str = "an item no sync made has a malformed media location join";
     let internal_id = integer(row, "item_pid")?;
     ensure!(internal_id != 0, "required track join identity is zero");
+    let kept = state_flag(row, "has_non_purgeable_asset", null_flags)?;
+    let base_id = integer(row, "base_location_id")?;
+    let leaf = match row.get_ref("location")? {
+        ValueRef::Null | ValueRef::Text(b"") => {
+            ensure!(base_id == 0, MALFORMED);
+            ensure!(
+                !kept,
+                "an item no sync made has a kept file with no location"
+            );
+            return Ok(internal_id);
+        }
+        ValueRef::Text(leaf) => leaf,
+        _ => bail!("catalog text field has wrong storage type"),
+    };
+    let ValueRef::Text(base) = row.get_ref("base_path")? else {
+        bail!(MALFORMED);
+    };
+    ensure!(base_id != 0, MALFORMED);
     ensure!(
-        integer(row, "base_location_id")? == 0
-            && matches!(
-                row.get_ref("location")?,
-                ValueRef::Null | ValueRef::Text(b"")
-            )
-            && !state_flag(row, "has_non_purgeable_asset", null_flags)?,
-        "an item no sync made holds a file on the phone"
+        outside_itunes_control(base, leaf),
+        "an item no sync made holds a file under iTunes_Control"
+    );
+    ensure!(
+        !kept,
+        "an item no sync made holds a file the phone keeps (has_non_purgeable_asset 1)"
     );
     Ok(internal_id)
+}
+/// Whether `base`/`leaf` names a file outside `iTunes_Control`, under which
+/// every file rustunes names lies: a relative path of printable ASCII whose
+/// components are plain names, the leaf a single one, and the first not
+/// `iTunes_Control` in any case.
+fn outside_itunes_control(base: &[u8], leaf: &[u8]) -> bool {
+    let plain = |part: &[u8]| {
+        !part.is_empty()
+            && part != b"."
+            && part != b".."
+            && part.iter().all(|b| b.is_ascii_graphic() && *b != b'/')
+    };
+    let mut parts = base.split(|b| *b == b'/');
+    parts.clone().all(plain)
+        && parts
+            .next()
+            .is_some_and(|first| !first.eq_ignore_ascii_case(b"iTunes_Control"))
+        && plain(leaf)
 }
 fn number(row: &Row<'_>, name: &str) -> Result<u32> {
     u32::try_from(integer(row, name)?).context("catalog number outside u32 range")

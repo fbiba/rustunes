@@ -16,7 +16,7 @@
 //! child playlists, artwork, any other table's `container_pid`) refuses.
 use super::{
     ANCHOR, BetweenRuns, GENERATION, HERO, LAST_SYNCED, Tables, decimal, fill_phone_entries,
-    playlists, property, property_changes, recent_counter_resets, table,
+    phone_entry_file_note, playlists, property, property_changes, recent_counter_resets, table,
 };
 use crate::catalogue::sqlite::tables::{Cell, Row, values as typed};
 use anyhow::{Context, Result, bail, ensure};
@@ -282,8 +282,9 @@ fn verify_deletion_with(
         .collect();
     ensure!(
         mismatches.is_empty(),
-        "unmodelled playlist deletion rows in tables: {}",
-        mismatches.join(", ")
+        "unmodelled playlist deletion rows in tables: {}{}",
+        mismatches.join(", "),
+        phone_entry_file_note(before, after)
     );
     Ok(PlaylistDeletionReceipt {
         schema: "music-protocol.playlist-deletion-sql",

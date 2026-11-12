@@ -723,8 +723,9 @@ fn verify_with(
         .collect();
     ensure!(
         mismatches.is_empty(),
-        "unmodelled removal rows in tables: {}",
-        mismatches.join(", ")
+        "unmodelled removal rows in tables: {}{}",
+        mismatches.join(", "),
+        phone_entry_file_note(before, after)
     );
     Ok(RemovalReceipt {
         schema: "music-protocol.removal-sql",
@@ -863,6 +864,47 @@ pub fn fill_phone_entries(
         }
     }
     Ok(filled_items)
+}
+
+/// For a refusal: the entries the phone added itself (`item_store` sync ID
+/// 0) whose file changed between `before` and `after`, that is whose
+/// `item.base_location_id` or `item_extra.location` differs. The Music app
+/// keeps a played purchase-history entry in its streaming cache, outside the
+/// music folders, and may purge it (docs/04, section 3.1). No model takes
+/// that change, which the phone makes on its own, so a verifier that refuses
+/// names it here; an empty string when there is none.
+pub fn phone_entry_file_note(before: &Tables, after: &Tables) -> String {
+    let files = |tables: &Tables| -> BTreeMap<i64, (Cell, Cell)> {
+        let (Some(store), Some(items), Some(extras)) = (
+            tables.get("item_store"),
+            tables.get("item"),
+            tables.get("item_extra"),
+        ) else {
+            return BTreeMap::new();
+        };
+        let file = |row: &Row| -> Result<(i64, (Cell, Cell))> {
+            ensure!(typed::int(store, row, "sync_id")? == 0);
+            let id = typed::int(store, row, "item_pid")?;
+            let base = items.at(items.one("item_pid", id)?, "base_location_id")?;
+            let leaf = extras.at(extras.one("item_pid", id)?, "location")?;
+            Ok((id, (base.clone(), leaf.clone())))
+        };
+        store.rows.keys().filter_map(|row| file(row).ok()).collect()
+    };
+    let now = files(after);
+    let changed: Vec<_> = files(before)
+        .into_iter()
+        .filter(|(id, file)| now.get(id).is_some_and(|now| now != file))
+        .map(|(id, _)| id.to_string())
+        .collect();
+    if changed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; the file of item {}, which no sync made, changed meanwhile: the phone's \
+         streaming cache took or dropped a played track, which no model takes",
+        changed.join(", ")
+    )
 }
 
 /// The sync properties' new values, taken into `expected` whatever they are;

@@ -106,11 +106,19 @@ phone runs. Names in examples are placeholders.
   change, and removes members when it removes a track.
 - **No cloud, purchase or subscription handling.** Rows that are placeholders,
   cloud items, or of an unsupported type are blocked, not guessed at. Rows the
-  phone made itself have sync ID 0: an Apple Music track it streamed, and the
-  album and album artist it files one under
+  phone made itself have sync ID 0: an Apple Music track it streamed, a
+  purchase-history track, and the album and album artist it files one under
   ([chapter 4](04-media-library-database.md), section 3.1). They are left
-  alone: no command lists, changes or removes them. One that holds a file on
-  the phone is refused, and the catalogue is not read.
+  alone: no command lists, changes or removes them. One may hold a file the
+  phone can purge in a folder outside `iTunes_Control`, as the Music app's
+  streaming cache keeps a track played on the phone (`Music/Cache_LoFi` or
+  `Music/Cache`);
+  rustunes never names a file there, so the file is left alone too. Any other
+  file is refused, and the catalogue is not read: one under `iTunes_Control`,
+  where new tracks are named, a location that does not join cleanly, or a file
+  the phone keeps for good (`has_non_purgeable_asset` 1, not yet seen). A
+  session verifier refuses when such a file appears, changes or goes between
+  its two captures, and names the entry.
 - **No transcoding by default.** A file is sent as it is. The one exception
   for audio is FLAC to ALAC, behind an explicit flag (section 9.5). A PNG,
   GIF, BMP or TIFF cover is sent as a JPEG of the same raster, because the

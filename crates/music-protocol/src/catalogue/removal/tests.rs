@@ -192,6 +192,38 @@ fn a_session_fills_in_the_state_of_an_entry_the_phone_added() {
     }
 }
 
+/// The phone's streaming cache taking a played entry it added (item 5)
+/// during the session is not modelled: the removal refuses and says why.
+#[test]
+fn a_cache_file_the_phone_gave_its_own_entry_refuses_and_is_named() {
+    const BOTH: &str = "INSERT OR IGNORE INTO item_extra(item_pid) VALUES(5);
+        UPDATE item_extra SET location='' WHERE item_pid=5;
+        INSERT OR REPLACE INTO base_location(base_location_id,path) VALUES(100,'Music/Cache_LoFi');";
+    const CACHED: &str = "UPDATE item SET base_location_id=100 WHERE item_pid=5;
+        UPDATE item_extra SET location='0f2b6a1e.m4a' WHERE item_pid=5;";
+    let both = format!("{PHONE_ENTRY} {BOTH}");
+    let pair = Pair::new(&both, CACHED);
+    let (before, after) = pair.tables();
+    let error = format!("{:#}", verify(&before, &after, &[1], 10).unwrap_err());
+    assert!(error.contains("unmodelled removal rows"), "{error}");
+    assert!(
+        error.contains("the file of item 5, which no sync made"),
+        "{error}"
+    );
+    // Already cached in both captures, it is left alone.
+    let pair = Pair::new(&format!("{both} {CACHED}"), "");
+    let (before, after) = pair.tables();
+    verify(&before, &after, &[1], 10).unwrap();
+    // Another refusal does not name it.
+    let pair = Pair::new(
+        &both,
+        "UPDATE item_extra SET title='Elsewhere' WHERE item_pid=5;",
+    );
+    let (before, after) = pair.tables();
+    let error = format!("{:#}", verify(&before, &after, &[1], 10).unwrap_err());
+    assert!(!error.contains("no sync made"), "{error}");
+}
+
 #[test]
 fn removal_refuses_partial_or_extra_changes() {
     let cases = [

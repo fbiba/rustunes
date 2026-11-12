@@ -58,7 +58,10 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, bail, ensure};
-use music_protocol::catalogue::{metadata_edit::decode, removal::fill_phone_entries};
+use music_protocol::catalogue::{
+    metadata_edit::decode,
+    removal::{fill_phone_entries, phone_entry_file_note},
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1325,10 +1328,14 @@ fn model_session(
         .collect();
     ensure!(
         mismatches.is_empty(),
-        "unmodelled metadata edit rows:\n{}{}",
+        "unmodelled metadata edit rows:\n{}{}{}",
         mismatches.join("\n"),
         not_housekeeping
             .map(|e| format!("\nnot the phone's revision housekeeping: {e:#}"))
+            .unwrap_or_default(),
+        phone_entry_file_note(before, after)
+            .strip_prefix("; ")
+            .map(|note| format!("\n{note}"))
             .unwrap_or_default()
     );
     Ok(MetadataEditReceipt {
