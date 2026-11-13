@@ -689,7 +689,7 @@ pub(crate) fn session_or_removal(batch: &crate::engine::state::journal::BatchRec
 /// The `resume` that settles `attempt`, with the run holding its input. A run
 /// outside this host's runs (a cover `rustunes artwork` traced where it was
 /// told) is named by the options that placed it.
-fn resume_command(
+pub(crate) fn resume_command(
     journal: &Path,
     state: &Path,
     attempt: &crate::engine::state::journal::Attempt,
@@ -718,7 +718,7 @@ fn resume_command(
 
 /// The run directory holding an `input.json` (in the run itself, as
 /// `cover-0001/` or as `audio/step-0001/`) whose SHA-256 is `digest`.
-fn run_holding(runs: &Path, digest: [u8; 32]) -> Option<PathBuf> {
+pub(crate) fn run_holding(runs: &Path, digest: [u8; 32]) -> Option<PathBuf> {
     use sha2::{Digest, Sha256};
     fn holds(directory: &Path, digest: &[u8; 32], depth: usize) -> bool {
         let input = directory.join("input.json");

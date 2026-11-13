@@ -20,7 +20,7 @@ use crate::{
     engine::state::snapshot,
     engine::{
         Engine, Event, Hold, PlanRequest, SkipStage, Skipped, SyncHolds, SyncOutcome, SyncResult,
-        execution::{insert_batch, metadata_batch},
+        execution::{insert_batch, metadata_batch, settle},
         planning::change::MAX_BATCH,
     },
 };
@@ -66,6 +66,19 @@ const CONTINUATIONS: usize = 3;
 
 pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<SyncResult> {
     let mut result = Box::pin(run_with(options, None, engine)).await;
+    // Work an earlier run left unfinished was settled first: the sync plans
+    // again from a fresh capture, since its plan described the phone before.
+    if result.as_ref().err().is_some_and(settled_first) {
+        result = Box::pin(run_with(
+            Options {
+                snapshot: None,
+                ..options
+            },
+            None,
+            engine,
+        ))
+        .await;
+    }
     let mut removed = 0;
     if let Some(first) = result.as_ref().err().and_then(removed_first) {
         removed += first.0;
@@ -131,6 +144,26 @@ impl std::fmt::Display for RemovedFirst {
 }
 impl std::error::Error for RemovedFirst {}
 
+/// Work an earlier run left unfinished was settled before this sync planned
+/// (`settle::Earlier::settle`); the sync plans again from a fresh capture.
+#[derive(Debug)]
+struct SettledFirst;
+impl std::fmt::Display for SettledFirst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "work an earlier run left unfinished was settled first; run this command again"
+        )
+    }
+}
+impl std::error::Error for SettledFirst {}
+
+fn settled_first(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<SettledFirst>().is_some())
+}
+
 fn removed_first(error: &anyhow::Error) -> Option<&RemovedFirst> {
     error
         .chain()
@@ -166,13 +199,23 @@ pub(crate) async fn run_with(
     crate::engine::planning::source_collection::select(options.source, options.selection)?;
     let run = layout::new_run(options.state)?;
     engine.emit(Event::RunEvidence(&run))?;
+    // An interrupted insertion leaves rows without audio; once the journal is
+    // known they must be its targets, which settling removes. A replacement's
+    // sync begins on a journal its coordination settled.
+    let absent = match coordination {
+        None => Absent {
+            any_unfilled: true,
+            ..Absent::NONE
+        },
+        Some(_) => Absent::NONE,
+    };
     let captured = match options.snapshot {
-        Some(path) => Captured::saved(path, Absent::NONE)?,
+        Some(path) => Captured::saved(path, absent)?,
         None => {
             engine.emit(Event::ReadingDeviceSnapshot)?;
             Captured::take(
                 run.join("snapshot"),
-                Absent::NONE,
+                absent,
                 &engine.control(options.seconds),
             )
             .await?
@@ -199,14 +242,35 @@ pub(crate) async fn run_with(
         ..
     } = captured;
     let journal = resolved.path().to_path_buf();
-    if coordination.is_none() && resolved.exists()? {
-        crate::engine::execution::replace::ensure_no_unfinished_attempt(
-            &journal,
-            &identity,
-            options.state,
-            &snapshot_path,
-            &engine.command_options(),
-        )?;
+    if coordination.is_none() {
+        // Work an earlier run left unfinished is settled first, as resume
+        // would, and the sync plans again from a fresh capture (`run`). A dry
+        // run changes nothing, so it names what settles it.
+        let earlier = settle::Earlier {
+            journal: &journal,
+            identity: &identity,
+            state: options.state,
+            snapshot: &snapshot_path,
+        };
+        earlier.only_unfinished(saved.index.unfilled())?;
+        if options.dry_run {
+            earlier.refuse(&engine.command_options())?;
+        } else if earlier
+            .settle(
+                &run.join("settle"),
+                options.host_name,
+                engine,
+                options.seconds,
+            )
+            .await?
+            .is_some()
+        {
+            return Err(SettledFirst.into());
+        }
+        ensure!(
+            saved.index.unfilled().is_empty(),
+            "the phone holds tracks without audio that no unfinished insertion explains; nothing was sent"
+        );
     }
     let plan = run.join("plan.json");
     let plan_options = options.selection.clone();

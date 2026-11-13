@@ -281,9 +281,6 @@ pub(super) fn line(event: &Event<'_>) -> Option<String> {
         Event::Step { number, total } => format!(
             "Removal batch {number}/{total} verified: catalogue, surviving audio and removed files"
         ),
-        Event::Settled { batch, state } => format!(
-            "Removal batch {batch} from an earlier run settled: {state}; no operation was sent again"
-        ),
         Event::Selection { .. } | Event::Completed { .. } => return None,
     })
 }

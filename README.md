@@ -331,7 +331,8 @@ alone. To check a single file, use `rustunes validate FILE`. See
 
 - **A run was interrupted?** Run the same command again. rustunes reads the
   phone, works out what the last run finished, and carries on without sending
-  anything twice.
+  anything twice. `sync`, `push`, `delete`, `prune` and `clear` do this
+  themselves. Other commands print the `rustunes resume` to run first.
 - **"another rustunes run is using this phone"?** Wait for the other run to
   finish. Only one run can use a phone at a time.
 - **A command failed?** Its log is kept and its path printed. See

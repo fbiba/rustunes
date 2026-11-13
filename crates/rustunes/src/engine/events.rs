@@ -45,6 +45,16 @@ pub enum Event<'a> {
     /// An insert batch was cut short and undone, for the given reason; a fresh
     /// sync adds the rest.
     SyncResuming(&'a str),
+    /// Work an earlier run left unfinished, settled from the phone before
+    /// this run went on, as `resume` would; nothing was sent again. `kind` is
+    /// `removal` (a session's, through its insert half), `insert` or
+    /// `metadata` for a batch, `attempt` for a single insert or cover; `state`
+    /// is how it settled.
+    EarlierSettled {
+        kind: &'static str,
+        id: i64,
+        state: &'a str,
+    },
     /// Add-only left this new track's cover out of its batch: its album on
     /// the phone shows another image, which it keeps.
     CoverLeftOut(&'a str),

@@ -100,6 +100,13 @@ pub(super) fn line(event: &Event<'_>) -> Result<Option<String>> {
         Event::SyncResuming(reason) => {
             format!("{reason}; planning again from a fresh capture for the rest.")
         }
+        Event::EarlierSettled { kind, id, state } => {
+            let what = match *kind {
+                "attempt" => format!("Attempt {id}"),
+                kind => format!("{}{} batch {id}", kind[..1].to_uppercase(), &kind[1..]),
+            };
+            format!("{what} from an earlier run settled: {state}; no operation was sent again")
+        }
         Event::FlacRefused { source, reason } => format!("Not sending {source:?}: {reason}"),
         Event::ConvertingFlacs { directory } => format!(
             "Converting FLACs to ALAC with FFmpeg in {}, a few at a time, ahead of their batches.",

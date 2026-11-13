@@ -35,7 +35,7 @@ use crate::{
     engine::state::snapshot,
     engine::verification::audio_capture,
     engine::{
-        execution::{insert_batch, removal_batch},
+        execution::{removal_batch, settle},
         planning::change::MAX_BATCH,
         verification::removal_sql,
     },
@@ -210,11 +210,6 @@ pub enum Event<'a> {
         number: usize,
         total: usize,
     },
-    /// An earlier run's unfinished removal batch, settled before selecting.
-    Settled {
-        batch: i64,
-        state: &'static str,
-    },
     Completed {
         removed: usize,
         deleted_playlists: usize,
@@ -338,20 +333,22 @@ async fn remove(
     let journal_path = resolved.path().to_path_buf();
     *chosen = Some(journal_path.clone());
     removal_batch::only_taken(&saved, &removal_batch::taken(&journal_path, &identity)?)?;
-    only_unfinished(saved.index.unfilled(), &journal_path, &identity)?;
-    // A batch an earlier run left unfinished (interrupted, or its observation
+    let earlier = settle::Earlier {
+        journal: &journal_path,
+        identity: &identity,
+        state: &state,
+        snapshot: &snapshot_path,
+    };
+    earlier.only_unfinished(saved.index.unfilled())?;
+    // Work an earlier run left unfinished (interrupted, or its observation
     // failed) is settled first, as resume would; the selection then starts
     // from fresh state. A dry run changes nothing, so it names what settles it.
     if o.dry_run {
-        refuse_unsettled(
-            &journal_path,
-            &identity,
-            &snapshot_path,
-            &engine.command_options(),
-        )?;
+        earlier.refuse(&engine.command_options())?;
     } else {
-        if let Some(removed) =
-            settle_unfinished(&journal_path, &identity, &o.host_name, engine, o.seconds).await?
+        if let Some(removed) = earlier
+            .settle(&run.join("settle"), &o.host_name, engine, o.seconds)
+            .await?
         {
             ids.retain(|id| !removed.contains(id));
             if fresh {
@@ -394,8 +391,8 @@ async fn remove(
             }
         }
     }
-    // Rows without audio this run did not settle (a dry run, or an insert
-    // batch only resume settles) stop it, naming what settles them.
+    // Rows without audio this run did not settle (a saved snapshot, or a
+    // coordination's own insert) stop it, naming what settles them.
     if !saved.index.unfilled().is_empty() {
         crate::engine::execution::replace::ensure_no_unfinished_attempt(
             &journal_path,
@@ -970,145 +967,6 @@ pub(crate) fn missing_origins(
         .collect()
 }
 
-/// Refuse a dry run while the journal's removal batch is unfinished, naming
-/// the two ways to settle it: the same command without `--dry-run`
-/// (`settle_unfinished`), or `resume` with `snapshot`, this run's. Each ends
-/// with `connection` (`Engine::command_options`).
-fn refuse_unsettled(
-    journal_path: &Path,
-    identity: &Identity,
-    snapshot: &Path,
-    connection: &str,
-) -> Result<()> {
-    if !journal_path.try_exists()? {
-        return Ok(());
-    }
-    let Some(batch) =
-        Journal::open_read_only(journal_path, identity)?.outstanding_removal_batch()?
-    else {
-        return Ok(());
-    };
-    use crate::engine::execution::replace::{quoted, session_or_removal};
-    bail!(
-        "{} from an earlier run is unfinished; the same command without --dry-run settles it first, or rustunes resume --snapshot {} --journal {} --trace-dir NEW_DIRECTORY{connection} settles it alone; either observes the phone and never resends",
-        session_or_removal(&batch),
-        quoted(&snapshot.to_string_lossy()),
-        quoted(&journal_path.to_string_lossy()),
-    )
-}
-
-/// Settle the journal's unfinished removal batch, if any, as resume would: a
-/// Prepared batch was never sent and is cancelled; a Started one is observed
-/// and settled, never resent. A session's removal half settles with its
-/// insert half (`insert_batch::resume`). Returns the tracks it removed when
-/// there was one.
-async fn settle_unfinished(
-    journal_path: &Path,
-    identity: &Identity,
-    host_name: &str,
-    engine: &crate::engine::Engine,
-    seconds: u64,
-) -> Result<Option<BTreeSet<u64>>> {
-    if !journal_path.try_exists()? {
-        return Ok(None);
-    }
-    let Some(batch) =
-        Journal::open_read_only(journal_path, identity)?.outstanding_removal_batch()?
-    else {
-        return Ok(None);
-    };
-    let id = batch.id.as_i64();
-    if let Some(insert) = batch.with_insert_batch {
-        let record = Journal::open_read_only(journal_path, identity)?.insert_batch(insert)?;
-        insert_batch::resume(
-            journal_path,
-            identity,
-            &record,
-            host_name,
-            &engine.control(seconds),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "the session of removal batch {id} and insert batch {} from an earlier run is not settled; nothing was sent",
-                insert.as_i64()
-            )
-        })?;
-        let state = Journal::open_read_only(journal_path, identity)?
-            .removal_batch(batch.id)?
-            .state;
-        engine.emit(crate::engine::Event::Deletion(Event::Settled {
-            batch: id,
-            state: state.as_str(),
-        }))?;
-        return Ok(Some(match state {
-            BatchState::Verified => batch.targets.iter().map(|t| t.track).collect(),
-            _ => BTreeSet::new(),
-        }));
-    }
-    let mut journal = Journal::open(journal_path, identity)?;
-    let state = match batch.state {
-        BatchState::Prepared => {
-            journal.cancel_removal_batch(batch.id)?;
-            BatchState::Cancelled
-        }
-        // A batch of an earlier run: the phone may have been played since.
-        _ => {
-            removal_batch::settle(
-                &mut journal,
-                identity,
-                &batch,
-                crate::engine::recovery::retained::playback::Window::LaterRun,
-                &engine.control(seconds),
-            )
-            .await
-            .with_context(|| {
-                format!("removal batch {id} from an earlier run is not settled; nothing was sent")
-            })?
-            .state
-        }
-    };
-    engine.emit(crate::engine::Event::Deletion(Event::Settled {
-        batch: id,
-        state: state.as_str(),
-    }))?;
-    let removed = match state {
-        BatchState::Verified => batch.targets.iter().map(|t| t.track).collect(),
-        _ => BTreeSet::new(),
-    };
-    Ok(Some(removed))
-}
-
-/// Every row without audio is a target of the journal's unfinished insert
-/// batch: an interrupted insertion left it.
-fn only_unfinished(
-    unfilled: &BTreeSet<u64>,
-    journal_path: &Path,
-    identity: &Identity,
-) -> Result<()> {
-    if unfilled.is_empty() {
-        return Ok(());
-    }
-    let targets: BTreeSet<u64> = match journal_path.try_exists()? {
-        true => Journal::open_read_only(journal_path, identity)?
-            .outstanding_insert_batch()?
-            .map(|b| {
-                b.targets
-                    .iter()
-                    .map(|t| t.target.content.track_pid)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        false => BTreeSet::new(),
-    };
-    if let Some(track) = unfilled.iter().find(|t| !targets.contains(t)) {
-        bail!(
-            "track {track:016x} has no audio on the phone, and no unfinished insertion of it was cut short; nothing was sent"
-        );
-    }
-    Ok(())
-}
-
 fn no_tracks_left(snapshot: &snapshot::Snapshot, id: CoordinationId) -> Result<()> {
     let left = snapshot.catalog.tracks().len();
     ensure!(
@@ -1156,90 +1014,6 @@ fn write_selection_output(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A Prepared batch an earlier run never sent is cancelled before the
-    /// next selection, without connecting; an idle or missing journal has
-    /// nothing to settle. A run tries a batch again only when nothing is
-    /// left outstanding and it was not cancelled.
-    #[tokio::test]
-    async fn an_earlier_prepared_batch_is_cancelled_before_selecting() {
-        use crate::engine::state::journal::test_support::{Temp, identity};
-        use crate::engine::state::journal::{PlaylistTarget, RemovalIntent};
-        let engine = crate::engine::Engine::quiet(crate::engine::Config {
-            device: crate::engine::DeviceConfig::default(),
-            deadline: None,
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
-        let t = Temp::new();
-        assert_eq!(
-            settle_unfinished(&t.path(), &identity(), "test", &engine, 1)
-                .await
-                .unwrap(),
-            None
-        );
-        let mut journal = Journal::create(&t.path(), &identity()).unwrap();
-        let id = journal
-            .prepare_removal_batch(&RemovalIntent {
-                coordination: None,
-                compensates: None,
-                compensates_insert_batch: None,
-                operation: vec![5; 40],
-                base_anchor: 14,
-                before_current: [1; 32],
-                before_index: [2; 32],
-                input_receipt: [3; 32],
-                evidence: "/run/unsent".into(),
-                targets: Vec::new(),
-                playlists: vec![PlaylistTarget {
-                    container: 3,
-                    name: "CLI Removal Test 3".into(),
-                }],
-            })
-            .unwrap();
-        drop(journal);
-        // A dry run settles nothing: it names both ways to settle the batch.
-        let error = refuse_unsettled(&t.path(), &identity(), Path::new("/run/snap"), " --wifi")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.starts_with(&format!(
-                "removal batch {} from an earlier run is unfinished; the same command without --dry-run settles it first, or rustunes resume --snapshot /run/snap --journal ",
-                id.as_i64()
-            )) && error.contains(" --trace-dir NEW_DIRECTORY --wifi settles it alone"),
-            "{error}"
-        );
-        // The deadline must outlast the test, or the control reads as stopped.
-        let control = engine.control(600);
-        assert!(!removal_batch::may_try_again(&t.path(), &identity(), &control).unwrap());
-        assert_eq!(
-            settle_unfinished(&t.path(), &identity(), "test", &engine, 1)
-                .await
-                .unwrap(),
-            Some(BTreeSet::new())
-        );
-        assert!(removal_batch::may_try_again(&t.path(), &identity(), &control).unwrap());
-        let stopped = crate::engine::Engine::quiet(crate::engine::Config {
-            device: crate::engine::DeviceConfig::default(),
-            deadline: None,
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        });
-        assert!(
-            !removal_batch::may_try_again(&t.path(), &identity(), &stopped.control(600)).unwrap()
-        );
-        let journal = Journal::open_read_only(&t.path(), &identity()).unwrap();
-        assert_eq!(
-            journal.removal_batch(id).unwrap().state,
-            BatchState::Cancelled
-        );
-        assert!(journal.outstanding_removal_batch().unwrap().is_none());
-        drop(journal);
-        refuse_unsettled(&t.path(), &identity(), Path::new("/run/snap"), "").unwrap();
-        assert_eq!(
-            settle_unfinished(&t.path(), &identity(), "test", &engine, 1)
-                .await
-                .unwrap(),
-            None
-        );
-    }
     #[test]
     fn a_sync_is_left_the_removals_that_do_not_fill_a_batch() {
         let none = |_: &[u64]| Ok(false);
@@ -1257,123 +1031,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-    /// A Prepared session an earlier run never sent is cancelled, both
-    /// halves, through its insert half, without connecting.
-    #[tokio::test]
-    async fn an_earlier_prepared_session_is_cancelled_with_both_halves() {
-        use crate::engine::state::journal::test_support::{Temp, alac_content, identity};
-        use crate::engine::state::journal::{
-            InsertBatchState, InsertIntent, InsertTarget, RemovalIntent, RemovalTarget,
-        };
-        let engine = crate::engine::Engine::quiet(crate::engine::Config {
-            device: crate::engine::DeviceConfig::default(),
-            deadline: None,
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
-        let t = Temp::new();
-        let evidence = t.0.join("session");
-        std::fs::create_dir(&evidence).unwrap();
-        let input = serde_json::to_vec(&json!({"members":[{
-            "source_path":"/library/gone.m4a","album":"0000000000000011","artist":"0000000000000012",
-        }]}))
-        .unwrap();
-        std::fs::write(evidence.join("input.json"), &input).unwrap();
-        let mut journal = Journal::create(&t.path(), &identity()).unwrap();
-        let ids = journal
-            .prepare_session(
-                &InsertIntent {
-                    coordination: None,
-                    operation: vec![5; 40],
-                    base_anchor: 14,
-                    before_current: [1; 32],
-                    before_index: [2; 32],
-                    input_receipt: removal_batch::sha(&input),
-                    evidence: evidence.clone(),
-                    targets: vec![InsertTarget {
-                        content: alac_content(1),
-                        new_album_pid: None,
-                        new_artist_pid: None,
-                        conversion: None,
-                        source: None,
-                    }],
-                },
-                &RemovalIntent {
-                    coordination: None,
-                    compensates: None,
-                    compensates_insert_batch: None,
-                    operation: vec![5; 40],
-                    base_anchor: 14,
-                    before_current: [1; 32],
-                    before_index: [2; 32],
-                    input_receipt: removal_batch::sha(&input),
-                    evidence,
-                    targets: vec![RemovalTarget {
-                        track: 7,
-                        item_pid: 7,
-                        path: None,
-                        file_bytes: None,
-                        file_sha256: None,
-                        binding: None,
-                    }],
-                    playlists: Vec::new(),
-                },
-            )
-            .unwrap();
-        drop(journal);
-        assert_eq!(
-            settle_unfinished(&t.path(), &identity(), "test", &engine, 1)
-                .await
-                .unwrap(),
-            Some(BTreeSet::new())
-        );
-        let journal = Journal::open_read_only(&t.path(), &identity()).unwrap();
-        assert_eq!(
-            journal.removal_batch(ids.removal).unwrap().state,
-            BatchState::Cancelled
-        );
-        assert_eq!(
-            journal.insert_batch(ids.insert).unwrap().state,
-            InsertBatchState::Cancelled
-        );
-        assert!(journal.outstanding_insert_batch().unwrap().is_none());
-    }
-    /// A row may lack audio only as a target of the unfinished insert batch.
-    #[test]
-    fn rows_without_audio_belong_to_the_unfinished_insert_batch() {
-        use crate::engine::state::journal::test_support::{Temp, alac_content, identity};
-        use crate::engine::state::journal::{InsertIntent, InsertTarget};
-        let t = Temp::new();
-        let target = alac_content(1).track_pid;
-        let rows = |tracks: &[u64]| tracks.iter().copied().collect::<BTreeSet<_>>();
-        only_unfinished(&rows(&[]), &t.path(), &identity()).unwrap();
-        assert!(only_unfinished(&rows(&[target]), &t.path(), &identity()).is_err());
-        let mut journal = Journal::create(&t.path(), &identity()).unwrap();
-        let batch = journal
-            .prepare_insert_batch(&InsertIntent {
-                coordination: None,
-                operation: vec![5; 40],
-                base_anchor: 14,
-                before_current: [1; 32],
-                before_index: [2; 32],
-                input_receipt: [3; 32],
-                evidence: "/run/batch".into(),
-                targets: vec![InsertTarget {
-                    content: alac_content(1),
-                    new_album_pid: None,
-                    new_artist_pid: None,
-                    conversion: None,
-                    source: None,
-                }],
-            })
-            .unwrap();
-        journal.start_insert_batch(batch, [8; 32], [1; 21]).unwrap();
-        drop(journal);
-        only_unfinished(&rows(&[target]), &t.path(), &identity()).unwrap();
-        let error = only_unfinished(&rows(&[target, 99]), &t.path(), &identity())
-            .err()
-            .expect("a row no batch explains was accepted");
-        assert!(error.to_string().contains("0000000000000063"), "{error:#}");
     }
     /// A file may be missing only for a track an unapplied or outstanding
     /// removal batch named: its session may have deleted the file before

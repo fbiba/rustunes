@@ -885,8 +885,8 @@ removals and 100 additions. The phone applies such a session as one (chapter
   through its insert half: a Prepared one is cancelled, a Started one is
   observed and never sent again. The rows a killed session left without audio
   must be its insert half's own targets; the next `sync` settles the session
-  first and captures the phone again, while its dry run names the `resume`
-  that settles it.
+  first and captures the phone again, while its dry run names both that
+  command and the `resume` that settles it.
 - **On the phone.** Mirroring syncs of a scratch library sent 5 removals and 2
   additions, then 249 and 250 (500 operations, about 75 s), each as one
   verified session moving the anchor by one. A session of 50 and 50 killed
@@ -1026,8 +1026,9 @@ The table lists what was observed on the phone and what the tool does.
 | Failed observation after a removal | Applied or not | Retried up to three times before the run stops |
 | Process dies between batches | Library partway through | Run the same command again: it settles the unfinished batch, then selects from fresh state |
 
-In every one of these kill runs `resume` sent nothing again, and a `sync` met
-by the unfinished run refused and named the `resume` that settles it.
+In every one of these kill runs `resume` sent nothing again. A `sync` met by
+the unfinished run then refused and named the `resume` that settles it; it
+now settles the run itself, the same way (section 7.1).
 
 The kills mid-upload also left partial files in the phone's `Airlock/Media`
 staging folder: two audio files whose sizes end on a 1 MiB request boundary,
@@ -1185,16 +1186,38 @@ separately (section 12).
 - `resume` reads fresh phone state and settles unfinished work. It never
   resends an uncertain operation and never resumes an old batch implicitly.
   After it settles something, a fresh plan follows.
-- `delete`, `prune`, `clear` and the mirror's removal settle a dead run
-  themselves: running the same command again settles the unfinished removal
-  batch first, then selects from fresh state, so no separate `resume` is
-  needed. A dry run changes nothing.
-- A `sync` met by any other unfinished work refuses before planning and names
-  the command that settles it: `resume --cancel-prepared` for a Prepared single
-  attempt, which sent nothing, or the `resume` with the run that holds the
-  attempt's or batch's input for a Started one. For a batch, whose journal
-  record names its evidence, the snapshot only identifies the phone; the
-  refusing run's own capture serves, even with the rows the batch left
+- `sync`, `push`, `delete`, `prune`, `clear` and the mirror's removal settle
+  a dead run themselves, so no separate `resume` is needed. Running the same
+  command again settles what the run left unfinished first, as `resume`
+  would, then captures the phone again and selects or plans from fresh state.
+  - Every kind of batch is settled: a removal batch, a session through its
+    insert half, an insert batch on its own and a metadata batch. A Partial
+    insert batch has the rows it left without audio removed by one
+    compensating removal batch; the tracks it bound stay.
+  - A single insert or cover is settled too. A Prepared one sent nothing and
+    is cancelled. A Started one is observed with the snapshot and input of the
+    run that started it, found among the state directory's runs by the
+    SHA-256 of its input, as `resume --run-dir` would be given it.
+  - Rows without audio in the capture must be targets of that unfinished
+    insertion; any other refuses.
+  - A dry run changes nothing. It names both the same command without
+    `--dry-run` and the `resume` that settles the work alone.
+  - CONFIRMED over Wi-Fi on iOS 27.2.1, with ten noise tracks: a `push`
+    interrupted after its insert batch was prepared, run again, cancelled
+    the batch and sent all ten. A `push` interrupted mid-upload was settled
+    once by `sync` and once by `push` itself: each found the batch Partial,
+    removed the rows it left without audio in one compensating removal
+    batch, captured the phone again and went on. The `push` sent the rest;
+    the `sync`, whose library did not hold the tracks, sent nothing.
+- Any other command met by unfinished work refuses before planning and names
+  the command that settles it. That covers `metadata`, `plan` and `apply`, a
+  coordination's own single attempt, and a Started single attempt whose run
+  is not under the state directory, such as a cover `artwork --trace-dir`
+  traced elsewhere. The command is `resume --cancel-prepared` for a Prepared
+  single attempt, which sent nothing, or the `resume` with the run that holds
+  the attempt's or batch's input for a Started one. For a batch, whose
+  journal record names its evidence, the snapshot only identifies the phone;
+  the refusing run's own capture serves, even with the rows the batch left
   without audio. A single attempt still needs a snapshot in which every row
   holds its audio.
 
@@ -1975,7 +1998,8 @@ its details.
 | `artwork_started` | info | `track_id` |
 | `insertion_verified` | info | |
 | `refreshing_before_session` | info | |
-| `earlier_batch_settled` | info | `batch`, `state` |
+| `earlier_batch_settled` | info | `batch`, `kind` (`removal`, `insert` or `metadata`), `state`: an earlier run's unfinished batch, settled before this run went on |
+| `earlier_attempt_settled` | info | `attempt`, `state`: an earlier run's unfinished single insert or cover, settled before this run went on |
 | `dry_run_complete`, `cancelled` | info | |
 | `atc_connected` | info | `ping_sent` (`probe`) |
 | `pong` | info | `session` (`probe --ping`) |

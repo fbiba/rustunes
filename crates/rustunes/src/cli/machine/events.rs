@@ -161,6 +161,20 @@ pub(crate) fn event(event: &Event<'_>) -> Result<()> {
             tally().insert = None;
             notice("sync_resuming", Warning, line()?, json!({"reason": reason}))
         }
+        Event::EarlierSettled { kind, id, state } => match *kind {
+            "attempt" => notice(
+                "earlier_attempt_settled",
+                Info,
+                line()?,
+                json!({"attempt": id, "state": state}),
+            ),
+            kind => notice(
+                "earlier_batch_settled",
+                Info,
+                line()?,
+                json!({"batch": id, "kind": kind, "state": state}),
+            ),
+        },
         Event::CoverLeftOut(source) => {
             notice("cover_left_out", Warning, line()?, json!({"path": source}))
         }
@@ -647,12 +661,6 @@ pub(crate) fn deletion(event: &Deletion<'_>) -> Result<()> {
             update = update.current(json!({"batch": number, "batches": total}));
             progress(update.message(line.unwrap_or_default()))
         }
-        Deletion::Settled { batch, state } => notice(
-            "earlier_batch_settled",
-            Info,
-            line.unwrap_or_default(),
-            json!({"batch": batch, "state": state}),
-        ),
         Deletion::Completed {
             removed,
             deleted_playlists,
