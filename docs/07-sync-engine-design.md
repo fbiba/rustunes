@@ -751,6 +751,15 @@ DESIGN, CONFIRMED on the phone.
   representative hand-over, and packs what each session can carry. Renaming
   an artist shared by two tracks takes two sessions. If the sequence could
   not finish, nothing is sent and the plan says how many sessions it needs.
+- **A coverless representative may move.** In an edit session, as in a
+  delete session, the phone may move the representative of an album artist,
+  artist or genre that has no cover of its own to the group's lowest member
+  with one ([chapter 5](05-receiver-operations.md), section 2). The verifier
+  accepts that or an unchanged representative, group by group, as the after
+  state shows, and refuses any other move. The simulation assumes nothing
+  moves; each session is planned from its own fresh capture, so a move only
+  changes what that capture holds. The playlist deletion that ends a Clear
+  accepts the same move, though it has not been seen there.
 - **Cleared fields.** A year, track number, track count, disc count or
   copyright the source no longer has is cleared (0 for numbers, empty text for
   copyright). A genre or composer cannot be cleared by an edit. The plan gives

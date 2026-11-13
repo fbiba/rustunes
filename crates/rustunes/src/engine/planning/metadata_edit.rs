@@ -1550,6 +1550,11 @@ impl Catalogue {
     /// or created, representatives move as `relocate` says, and a row created
     /// in the session ends with its lowest member. Rows created here get pids
     /// below every stored one; names new to the library have no grouping key.
+    /// No other representative moves here. The verifier also accepts the
+    /// phone moving a representative without a cover to its group's lowest
+    /// member with one (`moves_to_covered`); `update_all` plans each session
+    /// from its own fresh capture, so only this schedule's estimate assumes
+    /// it does not.
     pub(crate) fn simulate(&mut self, edits: &[Edit]) -> Result<()> {
         let mut created = Vec::new();
         for e in edits {

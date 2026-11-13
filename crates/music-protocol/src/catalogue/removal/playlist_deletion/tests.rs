@@ -261,3 +261,46 @@ fn a_deletion_session_may_fill_in_the_state_of_an_entry_the_phone_added() {
     let receipt = verify_deletion(&before, &after, &[88, 89], 10).unwrap();
     assert_eq!(receipt.filled_phone_entries, [5]);
 }
+
+#[test]
+fn a_deletion_session_may_move_a_coverless_representative_to_its_lowest_covered_member() {
+    use crate::catalogue::removal::tests::{COVERED_FOUR, GENRE_OF_ALL};
+    // Item 3, without a cover, represents artist 13 (items 3 and 4) and the
+    // genre of every item; item 4 is the only one with a cover.
+    let both = format!("{PLAYLISTS} {GENRE_OF_ALL} {COVERED_FOUR}");
+    let moved = format!(
+        "{DELETION} UPDATE item_artist SET representative_item_pid=4 WHERE item_artist_pid=13;
+        UPDATE genre SET representative_item_pid=4 WHERE genre_id=30;"
+    );
+    let pair = Pair::new(&both, &moved);
+    let (before, after) = pair.tables();
+    let receipt = verify_deletion(&before, &after, &[88, 89], 10).unwrap();
+    assert_eq!(
+        receipt.covered_representatives,
+        [
+            Representative {
+                table: "item_artist",
+                group_pid: 13,
+                before: 3,
+                after: 4,
+            },
+            Representative {
+                table: "genre",
+                group_pid: 30,
+                before: 3,
+                after: 4,
+            },
+        ]
+    );
+    // Not to a member without a cover, and never an album's.
+    let pair = Pair::new(&format!("{PLAYLISTS} {GENRE_OF_ALL}"), &moved);
+    let (before, after) = pair.tables();
+    assert!(verify_deletion(&before, &after, &[88, 89], 10).is_err());
+    let pair = Pair::new(
+        &both,
+        &format!("{DELETION} UPDATE album SET representative_item_pid=4 WHERE album_pid=11;"),
+    );
+    let (before, after) = pair.tables();
+    let error = verify_deletion(&before, &after, &[88, 89], 10).unwrap_err();
+    assert!(error.to_string().contains("album"), "{error:#}");
+}

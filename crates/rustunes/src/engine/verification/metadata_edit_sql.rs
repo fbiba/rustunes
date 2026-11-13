@@ -19,7 +19,10 @@
 //! * Representatives: a leaving representative hands over to the lowest
 //!   remaining member (or zero), a joiner becomes the representative of an
 //!   empty row, and a group created in this session ends with its lowest
-//!   member.
+//!   member. Any album artist, artist or genre whose representative has no
+//!   cover of its own may move to its lowest member that has one, as in a
+//!   removal (`moves_to_covered`; seen for the groups of a track pushed
+//!   without a cover, which an edit of that track handed over).
 //! * Revisions are allocated for the whole session: first every touched
 //!   group once, by class (album artist, album, artist, composer, genre),
 //!   then each update's item in operation order, where a later update of the
@@ -60,7 +63,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use music_protocol::catalogue::{
     metadata_edit::decode,
-    removal::{fill_phone_entries, phone_entry_file_note},
+    removal::{covered_items, fill_phone_entries, moves_to_covered, phone_entry_file_note},
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -125,6 +128,10 @@ pub(crate) struct MetadataEditReceipt {
     /// Entries the phone added itself whose state the session filled in.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     filled_phone_entries: Vec<i64>,
+    /// Representatives without a cover of their own that the phone moved to
+    /// their group's lowest member with one (`moves_to_covered`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    covered_representatives: Vec<RepresentativeMove>,
     /// What a later run's capture showed of the phone's use since the
     /// session (`verify_later`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1238,6 +1245,47 @@ fn model_session(
         }
     }
 
+    // A representative without a cover of its own may move to its group's
+    // lowest member with one, in any album artist, artist or genre the
+    // session did not create, whether or not an update touched it.
+    let covered = covered_items(before)?;
+    let mut covered_representatives = Vec::new();
+    for class in [Class::AlbumArtist, Class::ItemArtist, Class::Genre] {
+        let groups = model.t(class.table())?;
+        let key = groups.column(class.key())?;
+        let pids = groups
+            .rows
+            .keys()
+            .map(|r| r[key].integer())
+            .collect::<Result<Vec<_>>>()?;
+        let after_groups = table(after, class.table())?;
+        for group in pids {
+            if model.created.contains(&(class, group)) {
+                continue;
+            }
+            let Ok(observed) = typed::unique(after_groups, class.key(), int(group)) else {
+                continue;
+            };
+            let now = typed::int(after_groups, observed, "representative_item_pid")?;
+            let mut row = model.group(class, group)?;
+            let prior = row.int("representative_item_pid")?;
+            if now == prior {
+                continue;
+            }
+            let members = model.members(class, group, None)?;
+            if moves_to_covered(class.table(), prior, now, Some(&members), &covered) {
+                row.set("representative_item_pid", int(now))?;
+                row.store(&mut model.expected)?;
+                covered_representatives.push(RepresentativeMove {
+                    class: class.table(),
+                    group_pid: group,
+                    before: prior,
+                    after: now,
+                });
+            }
+        }
+    }
+
     // Sync properties.
     let highest = model.counter;
     ensure!(
@@ -1350,6 +1398,7 @@ fn model_session(
         recent_counter_resets: resets,
         keep_local_evaluations,
         filled_phone_entries,
+        covered_representatives,
         between_runs_playback,
         run_housekeeping,
     })

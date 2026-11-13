@@ -528,18 +528,9 @@ fn verify_with(
     // member, or to zero when none survives; album representatives may move to
     // any surviving same-album member. An artist or genre whose
     // representative has no cover of its own may move to its lowest member
-    // that has one: one removal moved an artist's representative off the
-    // library's one track without a cover, although no target belonged to
-    // that artist, and another moved a genre's off a coverless test tone
-    // with its album and artists. No other group cell may change.
+    // that has one (`moves_to_covered`). No other group cell may change.
     let items = table(before, "item")?;
-    let tokens = table(before, "artwork_token")?;
-    let mut covered = BTreeSet::new();
-    for row in tokens.rows.keys() {
-        if typed::int(tokens, row, "entity_type")? == 0 {
-            covered.insert(typed::int(tokens, row, "entity_pid")?);
-        }
-    }
+    let covered = covered_items(before)?;
     let mut representatives = Vec::new();
     let mut emptied = BTreeSet::new();
     for (name, key, _) in GROUPS {
@@ -582,9 +573,7 @@ fn verify_with(
             } else if name == "album" {
                 surviving.is_some_and(|s| s.contains(&now))
             } else {
-                matches!(name, "album_artist" | "item_artist" | "genre")
-                    && !covered.contains(&prior)
-                    && surviving.and_then(|s| s.iter().find(|m| covered.contains(*m))) == Some(&now)
+                moves_to_covered(name, prior, now, surviving, &covered)
             };
             ensure!(
                 allowed,
@@ -816,6 +805,95 @@ const FILLED_STATE: [(&str, Cell); 3] = [
     ("lyrics_adam_id", Cell::Null),
     ("is_valid_content_type", Cell::Integer(1)),
 ];
+
+/// Items with a cover of their own: an `artwork_token` row of entity type 0.
+pub fn covered_items(tables: &Tables) -> Result<BTreeSet<i64>> {
+    let tokens = table(tables, "artwork_token")?;
+    let mut covered = BTreeSet::new();
+    for row in tokens.rows.keys() {
+        if typed::int(tokens, row, "entity_type")? == 0 {
+            covered.insert(typed::int(tokens, row, "entity_pid")?);
+        }
+    }
+    Ok(covered)
+}
+
+/// Whether a `name` group's representative moving from `prior` to `now` is
+/// the phone's preference for a member with a cover (`covered`): an album
+/// artist, artist or genre whose representative has no cover of its own may
+/// move to its lowest member (`members`) that has one. Seen in a removal,
+/// for an artist no target belonged to (it moved off the library's one track
+/// without a cover) and for a genre with its album and artists; and in
+/// metadata edits on iOS 26.7.3 and iOS 27.2.1, for the groups of a track
+/// pushed without a cover. Any session may do it, so the removal, metadata
+/// edit and playlist deletion models take it (`take_covered_moves`).
+pub fn moves_to_covered(
+    name: &str,
+    prior: i64,
+    now: i64,
+    members: Option<&BTreeSet<i64>>,
+    covered: &BTreeSet<i64>,
+) -> bool {
+    matches!(name, "album_artist" | "item_artist" | "genre")
+        && !covered.contains(&prior)
+        && members.and_then(|s| s.iter().find(|m| covered.contains(*m))) == Some(&now)
+}
+
+/// Take into `expected` each album artist, artist or genre representative
+/// that `after` shows moved to its group's lowest member with a cover
+/// (`moves_to_covered`), in a session that moves no item between groups or
+/// out of the library, so `before`'s items are the members. Any other
+/// representative change is left for the caller's comparison to refuse.
+/// Returns the moves taken.
+pub(crate) fn take_covered_moves(
+    before: &Tables,
+    after: &Tables,
+    expected: &mut Tables,
+) -> Result<Vec<Representative>> {
+    let items = table(before, "item")?;
+    let covered = covered_items(before)?;
+    let mut moves = Vec::new();
+    for (name, key, _) in GROUPS {
+        if !matches!(name, "album_artist" | "item_artist" | "genre") {
+            continue;
+        }
+        let mut members: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+        for row in items.rows.keys() {
+            members
+                .entry(typed::int(items, row, key)?)
+                .or_default()
+                .insert(typed::int(items, row, "item_pid")?);
+        }
+        let groups = table(before, name)?;
+        let after_groups = table(after, name)?;
+        for row in groups.rows.keys() {
+            let id = typed::int(groups, row, key)?;
+            let Ok(now_row) = after_groups.one(key, id) else {
+                continue;
+            };
+            let prior = typed::int(groups, row, "representative_item_pid")?;
+            let now = typed::int(after_groups, now_row, "representative_item_pid")?;
+            if prior == now || !moves_to_covered(name, prior, now, members.get(&id), &covered) {
+                continue;
+            }
+            let mut desired = row.clone();
+            typed::set(
+                groups,
+                &mut desired,
+                "representative_item_pid",
+                Cell::Integer(now),
+            )?;
+            typed::replace(expected, name, row, desired)?;
+            moves.push(Representative {
+                table: name,
+                group_pid: id,
+                before: prior,
+                after: now,
+            });
+        }
+    }
+    Ok(moves)
+}
 
 /// The `item_state` rows of entries the phone added itself (`item_store`
 /// sync ID 0) that the session filled in: every column of [`FILLED_STATE`]

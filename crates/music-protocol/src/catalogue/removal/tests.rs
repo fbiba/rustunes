@@ -87,7 +87,7 @@ fn one_session_removes_two_targets_with_retained_memberships() {
 }
 
 /// Item 4 has a cover and item 3, artist 13's representative, has none.
-const COVERED_FOUR: &str = "INSERT INTO artwork_token(entity_pid,artwork_token,artwork_source_type,artwork_type,entity_type)VALUES(4,'44',300,1,0);";
+pub(super) const COVERED_FOUR: &str = "INSERT INTO artwork_token(entity_pid,artwork_token,artwork_source_type,artwork_type,entity_type)VALUES(4,'44',300,1,0);";
 
 #[test]
 fn an_artist_represented_by_a_track_without_a_cover_moves_to_one_with_a_cover() {
@@ -125,7 +125,7 @@ fn an_artist_represented_by_a_track_without_a_cover_moves_to_one_with_a_cover() 
 }
 
 /// Genre 30 holds every item; item 3, without a cover, represents it.
-const GENRE_OF_ALL: &str =
+pub(super) const GENRE_OF_ALL: &str =
     "INSERT INTO genre(genre_id,genre,representative_item_pid)VALUES(30,'Genre',3);
     UPDATE item SET genre_id=30;";
 

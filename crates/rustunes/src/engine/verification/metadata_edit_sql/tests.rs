@@ -1273,6 +1273,10 @@ fn unmodelled_phone_behaviour_is_refused() {
             "UPDATE album SET representative_item_pid=1 WHERE album_pid=10;",
         ),
         (
+            "another group's representative moved",
+            "UPDATE item_artist SET representative_item_pid=4 WHERE item_artist_pid=13;",
+        ),
+        (
             "album year moved",
             "UPDATE album SET album_year=1999 WHERE album_pid=10;",
         ),
@@ -1298,6 +1302,76 @@ fn unmodelled_phone_behaviour_is_refused() {
             verify(&before, &after, &operation(&updates), ANCHOR_BEFORE).is_err(),
             "{name}"
         );
+    }
+}
+
+/// Seen on iOS 26.7.3 (a comment) and iOS 27.2.1 (a title and a year): an
+/// edit of a track pushed without a cover moved the representative of its
+/// album artist, artist and genre to each group's lowest member with a cover,
+/// as removals do (`moves_to_covered`); an edit of a covered representative
+/// moved nothing. Any group may move so, the edited track's or not; either
+/// outcome verifies, group by group, and no other move does.
+#[test]
+fn a_representative_without_a_cover_may_move_to_the_lowest_covered_member() {
+    let updates = vec![update(1001, &[("comment", text("test"))])];
+    let session = |moves: &str| {
+        let world = World::new();
+        // Tracks 2, 4 and 5 have a cover of their own; 1 and 3 have none.
+        for path in [&world.fixture.before, &world.fixture.after] {
+            Connection::open(path)
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO artwork_token(entity_pid,artwork_token,artwork_source_type,artwork_type,entity_type)
+                        VALUES(2,'c2',300,1,0),(4,'c4',300,1,0),(5,'c5',300,1,0);",
+                )
+                .unwrap();
+        }
+        let before = world.before();
+        let mut phone = Phone::new();
+        phone.sql("UPDATE item_extra SET comment='test' WHERE item_pid=1;");
+        phone.sql(moves);
+        phone.revise(0, 1);
+        let after = world.after(&phone.finish());
+        verify(&before, &after, &operation(&updates), ANCHOR_BEFORE)
+    };
+    // Track 1 represents album artist 20 and genre Rock (both with tracks 2
+    // and 5) and artist 11 (alone); track 3 represents artist 13 (with 4),
+    // which the edit does not touch.
+    let receipt = session(
+        "UPDATE album_artist SET representative_item_pid=2 WHERE album_artist_pid=20;
+         UPDATE genre SET representative_item_pid=2 WHERE genre_id=31;
+         UPDATE item_artist SET representative_item_pid=4 WHERE item_artist_pid=13;",
+    )
+    .unwrap();
+    let moves: Vec<_> = receipt
+        .covered_representatives
+        .iter()
+        .map(|m| (m.class, m.group_pid, m.before, m.after))
+        .collect();
+    assert_eq!(
+        moves,
+        [
+            ("album_artist", 20, 1, 2),
+            ("item_artist", 13, 3, 4),
+            ("genre", 31, 1, 2)
+        ]
+    );
+    // Group by group: the genre moved, the others kept.
+    let receipt = session("UPDATE genre SET representative_item_pid=2 WHERE genre_id=31;").unwrap();
+    assert_eq!(receipt.covered_representatives.len(), 1);
+    // Nothing moved, as in the other tests.
+    assert!(session("").unwrap().covered_representatives.is_empty());
+    for tamper in [
+        // A covered member, but not the lowest.
+        "UPDATE album_artist SET representative_item_pid=5 WHERE album_artist_pid=20;",
+        // Off a representative with a cover (track 2, of artist 12).
+        "UPDATE item_artist SET representative_item_pid=5 WHERE item_artist_pid=12;",
+        // An album: only album artists, artists and genres move so.
+        "UPDATE album SET representative_item_pid=1 WHERE album_pid=10;",
+        // A group with no covered member.
+        "UPDATE item_artist SET representative_item_pid=0 WHERE item_artist_pid=11;",
+    ] {
+        assert!(session(tamper).is_err(), "{tamper}");
     }
 }
 

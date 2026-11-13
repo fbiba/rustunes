@@ -7,16 +7,19 @@
 //! rise in operation order. Sync properties advance by one anchor with the
 //! highest tombstone as last synced; hero progress follows it or stays. As in
 //! any session, recent play/skip counters may reset, the maintenance clock
-//! may advance and an entry the phone added itself may have its state filled
-//! in. Every other typed row in all tables must be exact.
+//! may advance, an entry the phone added itself may have its state filled in,
+//! and an album artist, artist or genre whose representative has no cover of
+//! its own may move it to its lowest member with one. Every other typed row
+//! in all tables must be exact.
 //!
 //! Only empty playlists qualify: deleting one with members leaves its media
 //! count row behind, so a Clear deletes its playlists after every
 //! track is gone. A playlist anything else refers to (members, a count row,
 //! child playlists, artwork, any other table's `container_pid`) refuses.
 use super::{
-    ANCHOR, BetweenRuns, GENERATION, HERO, LAST_SYNCED, Tables, decimal, fill_phone_entries,
-    phone_entry_file_note, playlists, property, property_changes, recent_counter_resets, table,
+    ANCHOR, BetweenRuns, GENERATION, HERO, LAST_SYNCED, Representative, Tables, decimal,
+    fill_phone_entries, phone_entry_file_note, playlists, property, property_changes,
+    recent_counter_resets, table, take_covered_moves,
 };
 use crate::catalogue::sqlite::tables::{Cell, Row, values as typed};
 use anyhow::{Context, Result, bail, ensure};
@@ -44,6 +47,10 @@ pub struct PlaylistDeletionReceipt {
     /// Entries the phone added itself whose state the session filled in.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     filled_phone_entries: Vec<i64>,
+    /// Groups whose representative, without a cover of its own, moved to
+    /// their lowest member with one (`take_covered_moves`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    covered_representatives: Vec<Representative>,
     /// What a later run's capture showed of the phone's use since the
     /// session (`verify_deletion_later`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +264,7 @@ fn verify_deletion_with(
     let recent_counter_resets =
         recent_counter_resets(before, after, &mut expected, &BTreeSet::new())?;
     let filled_phone_entries = fill_phone_entries(before, after, &mut expected)?;
+    let covered_representatives = take_covered_moves(before, after, &mut expected)?;
     let anchor = base_anchor
         .checked_add(1)
         .context("playlist deletion anchor exhausted")?;
@@ -292,6 +300,7 @@ fn verify_deletion_with(
         property_changes,
         recent_counter_resets,
         filled_phone_entries,
+        covered_representatives,
         between_runs_playback,
     })
 }
