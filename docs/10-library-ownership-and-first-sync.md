@@ -67,11 +67,11 @@ Conventions:
 
 ## 4. A phone no computer has synced
 
-No such phone was read. The table is what the code of iOS 27.2 says about it.
+The table is what the code of iOS 27.2 says about such a phone. One was read, though not fresh from Setup Assistant: a phone that no computer had synced, on iOS 26.6.2 and then 26.7.3 (section 13.4). What it showed follows the table.
 
 | Item | State | Label |
 | --- | --- | --- |
-| `iTunes_Control/iTunes/MediaLibrary.sqlitedb` | Present once anything has opened the library. A new database: all tables, no `db_info` row, no sync property, no playlist (chapter 04, section 2.5). | CONFIRMED contents; OBSERVED created at the first unlock after a restart, not at boot (chapter 04, section 2.1); INFERRED that it exists before a host connects, since lockdown serves no host before that unlock |
+| `iTunes_Control/iTunes/MediaLibrary.sqlitedb` | Present once anything has opened the library. A new database: all tables, no `db_info` row, no sync property, no playlist (chapter 04, section 2.5). | CONFIRMED contents; OBSERVED created at the first unlock after a restart, not at boot (chapter 04, section 2.1); INFERRED that it exists before a host connects, since lockdown serves no host before that unlock; OBSERVED before any host on a phone not fresh from setup, migrated rather than new (chapter 04, section 2.5) |
 | Media anchor the phone reports | `"0"` (chapter 02, section 7.3) | CONFIRMED |
 | `iTunes_Control`, `iTunes_Control/iTunes` | Created by `medialibraryd` with the database, or first by a host over AFC (section 5.5). `afcd` runs as `mobile`, so folders made over AFC pass the database's owner checks (chapter 04, section 2.1). | CONFIRMED; INFERRED for folders made over AFC |
 | `iTunes_Control/Music` and `Music/Fnn` | Absent until the first track arrives. The phone creates them when it moves that track (chapter 02, section 12.3). | CONFIRMED code; INFERRED absence |
@@ -92,7 +92,16 @@ Two other states are easy to mistake for this one:
 - **A phone restored from a backup by Apple's host.** The restore routine saves the default prefs image with `configured` set and both library IDs zero (`0x1404eb2fc-0x1404eb321`). On some outcomes it later deletes `iTunesPrefs` again, but not the plist (`0x1404eb8c7`). INFERRED. Such a phone has a prefs pair, or the plist alone, that names no library.
 - **A phone whose library the phone rebuilt** (chapter 09, section 4.4). Its database is new, but the host's four files are still there and describe the old library.
 
-OBSERVED on the phone of section 13.4, whose library the phone had rebuilt: `iTunes_Control` held only `iTunes`, and there was no `Airlock`. The new database matched the first row (chapter 04, section 2.5) until the phone added rows of its own: at once one hidden container of kind 10000, and within a minute the purchase-history items of the signed-in Apple Account, with `sync_id` 0. It held no built-in smart playlist. OPEN: what a phone fresh from Setup Assistant lists under `iTunes_Control`.
+OBSERVED on the phone of section 13.4, whose library the phone had rebuilt: `iTunes_Control` held only `iTunes`, and there was no `Airlock`. The new database matched the first row (chapter 04, section 2.5) until the phone added rows of its own: at once one hidden container of kind 10000, and within a minute the purchase-history items of the signed-in Apple Account, with `sync_id` 0. It held no built-in smart playlist.
+
+OBSERVED on the second phone of section 13.4, which no computer had synced:
+
+- Before and after its Music app was first opened, `iTunes_Control` held only `iTunes`, and that held `IC-Info.sidf`, `IC-Info.sidv` and the database with its WAL and shared-memory files. There was no `Music`, `Sync`, `Airlock` or `Artwork` folder and no host file. `Music/Downloads` on the AFC root was there.
+- Its database was migrated, not new, with one hidden container of kind 10000, one entry of the phone's own with `sync_id` 0 and no built-in smart playlist (chapter 04, section 2.5). Opening the Music app changed only that item's revision.
+- The domain `com.apple.mobile.iTunes` held no `iTunesSetupComplete`. `DisabledAssetTypes` did not name `Music`. `rustunes device check` reported a phone no computer has synced.
+- During the session of `rustunes init` the phone created `Airlock` and its subfolders. It created each music folder from `F00` to `F49`, and registered it in `base_location`, as the tracks of the first full sync moved in, and created `iTunes_Control/iTunes/Artwork` with `Originals` and the rendition folders when the first covers came.
+
+OPEN: whether a phone fresh from Setup Assistant differs.
 
 ## 5. The host's files on the phone
 
@@ -561,7 +570,7 @@ Read in the code of iOS 27.2. The last item says which of these points `rustunes
 - **An iCloud music library changes the picture.** When it is on, the phone lists `Music` among the asset types it takes from no computer and ignores a host's playlist operations (chapter 02, section 4.4; chapter 05, section 5).
 - **Built-in smart playlists.** At the end of the first session that transfers an asset, the phone deletes, once, the built-in smart playlists (kinds 200 to 203 and 206) that it lists as auto-created. MusicLibrary never creates them, and a library the phone built new had none (chapter 04, section 2.5; chapter 05, section 5).
 - **No host file is needed.** The phone reads none of the four files of section 5.
-- **Observed with `rustunes init`** (section 11.1), on the phone of section 13.4. The phone reported the anchor `"0"`, accepted init's Delta, created its `db_info` row from `update_db_info` and took the anchor 1 from `FinishedSyncingMetadata`; the next session took 2. `init` had created `Sync/Media`. The move of the first track created its music folder, which the phone registered in `base_location` (chapter 04, section 4.4). Neither `iTunesCDB` nor `ArtworkDB` was on the phone.
+- **Observed with `rustunes init`** (section 11.1), on the phone of section 13.4. The phone reported the anchor `"0"`, accepted init's Delta, created its `db_info` row from `update_db_info` and took the anchor 1 from `FinishedSyncingMetadata`; the next session took 2. `init` had created `Sync/Media`. The move of the first track created its music folder, which the phone registered in `base_location` (chapter 04, section 4.4). Neither `iTunesCDB` nor `ArtworkDB` was on the phone. The same held on iOS 26.7.3 on the second phone of section 13.4, which no computer had synced: the anchor `"0"`, 1 after `init` and 2 after the first track.
 
 ## 11. Guidance for a sync client
 
@@ -592,7 +601,7 @@ The phone's code allows it (section 10). What follows is what a client has to de
 
 | # | Question | What would settle it |
 | --- | --- | --- |
-| 1 | What does a phone no computer has synced really hold: which folders, which playlists, and is the database there before a host connects? | Answered for a library the phone rebuilt (section 4). A listing and a database copy from a phone fresh from Setup Assistant |
+| 1 | What does a phone no computer has synced really hold: which folders, which playlists, and is the database there before a host connects? | Answered for a library the phone rebuilt, and for a phone that no computer had synced, though not fresh from setup (section 4). A listing and a database copy from a phone fresh from Setup Assistant |
 | 2 | Does the phone behave as section 10 says in a first session? | Answered for a Delta by `rustunes init` (section 10). A Reset as the first session was not tried |
 | 3 | Does Apple's host really empty a phone of another library when the owner presses Sync (section 9, second row)? | Answered: yes, observed once on a phone `rustunes init` had prepared (section 13.4) |
 | 4 | Does the Apple Devices window check anything before it asks the agent to sync? | Partly answered: nothing that asks or stops (section 13.4). Reading the interface layer |
@@ -603,9 +612,9 @@ The phone's code allows it (section 10). What follows is what a client has to de
 | 9 | Which process on the phone asks `atc` to send `RequestingSync`, and what posts `syncResumeRequest`? | Reading the callers outside the files that were read |
 | 10 | Does a track that a host synced and that also has another source survive a Reset? | Reading the removal routine (`0x1d1b121c4`) |
 | 11 | Does Apple's host send a `Capabilities` message with its `LibraryID` at any point? None was seen before the guard ended the capture. | A capture that runs further |
-| 12 | Which component creates the built-in smart playlists (kinds 200 to 203 and 206) that the phone deletes after its first asset transfer, and does a phone fresh from Setup Assistant have any? | Partly answered: MusicLibrary never creates them, and a library the phone rebuilt had none (chapter 04, section 2.5). A search of the shared cache for callers of `_insertNewSmartPlaylist:…`; a database copy from such a phone |
-| 13 | Does the Grappa exchange need anything a phone fresh from Setup Assistant lacks? It worked with `rustunes init` on the phone of section 13.4, which had been synced before, and no code path ties it to sync history (INFERRED). | A first session on a phone fresh from setup |
-| 14 | Does the phone create `iTunes_Control/iTunes/Artwork/Originals` when the folder is missing? The phone of section 13.4 kept the empty folder through each rebuild. | A first session with a cover on a phone without the folder |
+| 12 | Which component creates the built-in smart playlists (kinds 200 to 203 and 206) that the phone deletes after its first asset transfer, and does a phone fresh from Setup Assistant have any? | Partly answered: MusicLibrary never creates them, and neither a library the phone rebuilt nor a phone that no computer had synced had any. On the second, both properties were 1 after its first track (chapter 04, section 2.5). A search of the shared cache for callers of `_insertNewSmartPlaylist:…`; a database copy from such a phone |
+| 13 | Does the Grappa exchange need anything a phone fresh from Setup Assistant lacks? It worked with `rustunes init` on the phone of section 13.4 that had been synced before, and on the one no computer had synced; no code path ties it to sync history (INFERRED). | A first session on a phone fresh from setup |
+| 14 | Does the phone create `iTunes_Control/iTunes/Artwork/Originals` when the folder is missing? The phone of section 13.4 whose library it rebuilt kept the empty folder through each rebuild. | Answered: yes. On the phone no computer had synced the folder was missing until the first session with covers, which created it and the rendition folders (section 4) |
 | 15 | What does the phone do when Apple's host sends an artwork cache ID that tracks another host sent, or their leftover cover originals, already hold (section 5.4)? | An Apple sync with covers to a phone `rustunes` filled with covers |
 
 ## 13. Evidence
@@ -645,10 +654,11 @@ One capture of Apple Devices 1.1540.24088.0 in a Windows virtual machine without
 - One insert and one delete of a generated test track with `rustunes`, with the Apple TV app installed, each ended in `SyncFinished`. The saved frames gave the session numbers of chapter 02, section 5.2.
 - A phone whose library the phone rebuilt (iOS 27.2, 24B119). Over AFC the host files, the music and staging folders, the artwork and the three database files were removed, and the phone was restarted. It built a new database, in the state a rebuild leaves (chapter 09, section 4.4), and `rustunes device check` reported a phone no computer has synced. What still differed from a phone fresh from setup: the phone's `com.apple.atc` host records and lockdown values, files under `iTunes_Control/iTunes` that no sync uses, the purchase-history items of the signed-in Apple Account, and a database built new by 24B119 rather than migrated. `rustunes init`, a one-track `push` and a full `sync` then ran on it (sections 4 and 10; chapter 04, sections 2.5 and 4.4).
 - That phone, so prepared and holding several hundred tracks, connected to Apple Devices 1.1540.24088.0 in the virtual machine of section 13.3, booted without network, whose library held a few test tracks and nothing else. Observed: the attach (no sync; the prefs pair rewritten with the same IDs; `iTunesCDB` and `ArtworkDB` written); Sync with music sync off (no question; a Reset; the phone removed all those tracks and their files and kept its purchase-history items); then music sync on (the switch question; Sync and Replace sent the test tracks in a Delta and made the host the phone's home library). The phone was read from Linux over Wi-Fi between the steps: `rustunes device check`, the phone's log and copies of the host's files (sections 5 and 9). That host was not meeting the phone for the first time: its device list (section 6.1) held the phone from an earlier sync with it.
+- A second iPhone17,2 that no computer had synced, not fresh from setup, on iOS 26.6.2 and, after it updated itself during the run, 26.7.3, with the same database schema on both (chapter 09, section 8.4). Listings and database copies were taken before and after its Music app was first opened. Then, over USB, with its `rustunes` state kept apart: `rustunes init`, a one-track `push`, a full `sync` of several hundred tracks with covers, edits, deletes, a sync interrupted mid-upload, a restart of the phone and `rustunes verify` with every file read back (sections 4 and 10; chapter 04, section 2.5).
 
 ### 13.5 Strength of the evidence
 
 - What Apple's host writes, reads and compares is read in code and, for the first session, observed up to the staged file.
 - What Apple's host does to a phone of another library (section 9, second row) is read in code twice and observed once, on one phone (section 13.4), with a host that had synced that phone before.
-- What the phone does with a session of Apple's host was observed for the two sessions of section 13.4, a Reset and a Delta, and is otherwise read in code. The phone's side of a first session was observed only with `rustunes init` (section 10).
+- What the phone does with a session of Apple's host was observed for the two sessions of section 13.4, a Reset and a Delta, and is otherwise read in code. The phone's side of a first session was observed only with `rustunes init` (section 10), on two phones, one of which no computer had synced.
 - Nothing here was checked against Finder or iTunes.

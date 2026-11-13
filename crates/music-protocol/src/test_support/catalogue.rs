@@ -339,6 +339,60 @@ fn built_new(schema: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         })
         .collect()
 }
+/// The first of the eight columns at the end of iOS 27's `album` that iOS
+/// 26's (user_version 2350000) lacks; the other seven follow it.
+const IOS_27_ALBUM_COLUMNS: &str = ", date_released INTEGER";
+/// The indexes iOS 27 has on three of those columns.
+const IOS_27_ALBUM_INDEXES: [&str; 3] = [
+    "AlbumIsFollowed",
+    "AlbumIsPreRelease",
+    "AlbumReleaseEventAuxInfo",
+];
+/// The last column of iOS 27's `item_store`, which iOS 26's lacks.
+const IOS_27_ITEM_STORE_COLUMN: &str = ", expected_release_date INTEGER NOT NULL DEFAULT 0)";
+/// How the two `item_store` triggers of iOS 27 set `item.in_my_library`, and
+/// how iOS 26's do. They differ only for an item with a store saga ID and
+/// another reason to be in the library; a synced track has no saga ID.
+const IOS_27_IN_MY_LIBRARY: &str = "( CASE WHEN new.home_sharing_id != 0 THEN 1 ELSE ( CASE WHEN new.store_saga_id != 0 THEN new.cloud_in_my_library ELSE ( CASE WHEN new.purchase_history_id != 0 THEN 1 ELSE ( CASE WHEN new.sync_id != 0 THEN new.sync_in_my_library ELSE ( CASE WHEN new.is_ota_purchased THEN 1 ELSE 0 END) END) END) END) END)";
+const IOS_26_IN_MY_LIBRARY: &str = "( CASE WHEN new.home_sharing_id OR (new.store_saga_id AND new.cloud_in_my_library) OR new.purchase_history_id OR (new.sync_id AND new.sync_in_my_library) OR new.is_ota_purchased THEN 1 ELSE 0 END)";
+/// `schema` (iOS 27.0.1's, migrated) as iOS 26.6.2 and 26.7.3 hold it in a
+/// migrated database at user_version 2350000 (docs/09, section 8.4): `album`,
+/// unquoted, without the eight columns iOS 27 adds at its end and the
+/// indexes on them, `item_store` without `expected_release_date`, and the two
+/// triggers that set `in_my_library` written as one OR. `item_state` is the
+/// same.
+fn ios_26(schema: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    schema
+        .into_iter()
+        .filter(|r| !(r[0] == "index" && IOS_27_ALBUM_INDEXES.contains(&r[1].as_str().unwrap())))
+        .map(|mut r| {
+            let Some(sql) = r[3].as_str() else {
+                return r;
+            };
+            let mut sql = sql.to_owned();
+            if r[0] == "table" && r[1] == "album" {
+                sql = sql.replacen("\"album\"", "album", 1);
+                sql.truncate(sql.find(IOS_27_ALBUM_COLUMNS).unwrap());
+                sql.push(')');
+            }
+            if r[0] == "table" && r[1] == "item_store" {
+                assert_eq!(sql.matches(IOS_27_ITEM_STORE_COLUMN).count(), 1);
+                sql = sql.replace(IOS_27_ITEM_STORE_COLUMN, ")");
+            }
+            if r[0] == "trigger" && sql.contains(IOS_27_IN_MY_LIBRARY) {
+                sql = sql.replace(IOS_27_IN_MY_LIBRARY, IOS_26_IN_MY_LIBRARY);
+            }
+            r[3] = sql.into();
+            r
+        })
+        .collect()
+}
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Migrated,
+    BuiltNew,
+    Ios26,
+}
 /// A before/after database pair in the phone's exact native schema
 /// (`schema_fixture.json`; building it fails unless the database reproduces
 /// that schema exactly) with four synthetic tracks, the after state having
@@ -352,19 +406,25 @@ pub struct NativeFixture {
 #[allow(dead_code, reason = "each test crate uses part of this file")]
 impl NativeFixture {
     pub fn new() -> Self {
-        Self::build(2_400_060, None, false)
+        Self::build(2_400_060, None, Shape::Migrated)
     }
     /// As `new`, in the schema after iOS 27.2's index-only update.
     pub fn index_only_update() -> Self {
-        Self::build(2_410_000, Some(INDEX_ONLY_UPDATE), false)
+        Self::build(2_410_000, Some(INDEX_ONLY_UPDATE), Shape::Migrated)
     }
     /// As `index_only_update`, in the schema of a database iOS 27.2 builds
     /// new (`built_new`): its item_state rows hold NULL in every column the
     /// fixture does not name.
     pub fn built_new() -> Self {
-        Self::build(2_410_000, Some(INDEX_ONLY_UPDATE), true)
+        Self::build(2_410_000, Some(INDEX_ONLY_UPDATE), Shape::BuiltNew)
     }
-    fn build(version: i64, index: Option<[&str; 4]>, new: bool) -> Self {
+    /// As `new`, in the schema of a database migrated to iOS 26's
+    /// user_version 2350000 (`ios_26`).
+    pub fn ios_26() -> Self {
+        Self::build(2_350_000, None, Shape::Ios26)
+    }
+    fn build(version: i64, index: Option<[&str; 4]>, shape: Shape) -> Self {
+        let new = shape == Shape::BuiltNew;
         let dir = std::env::temp_dir().join(format!(
             "delete-sql-test-{}-{}",
             std::process::id(),
@@ -374,9 +434,11 @@ impl NativeFixture {
         let before = dir.join("before.sqlite");
         let c = Connection::open(&before).unwrap();
         let mut schema: Vec<Vec<Value>> = serde_json::from_str(NATIVE_SCHEMA).unwrap();
-        if new {
-            schema = built_new(schema);
-        }
+        schema = match shape {
+            Shape::Migrated => schema,
+            Shape::BuiltNew => built_new(schema),
+            Shape::Ios26 => ios_26(schema),
+        };
         if let Some(row) = index {
             schema.push(row.map(Value::from).to_vec());
             schema.sort_by(|a, b| {

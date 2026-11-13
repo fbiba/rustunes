@@ -549,7 +549,7 @@ The CLI that results is a Rust reimplementation of observed behaviour.
 | SMPB | The `iTunSMPB` tag: gapless information written by iTunes. |
 | `sync_id` | An identifier the host sets on a track to relate it to its own library. |
 | `usbmuxd` | The USB multiplexer daemon that carries TCP-like streams to the phone. |
-| `user_version` | SQLite's `PRAGMA user_version`. In `MediaLibrary.sqlitedb` it is the database version: 2400060 in iOS 27.0.1, 2410000 in iOS 27.2 (chapter 09). |
+| `user_version` | SQLite's `PRAGMA user_version`. In `MediaLibrary.sqlitedb` it is the database version: 2350000 in iOS 26.6.2 and 26.7.3, 2400060 in iOS 27.0.1, 2410000 in iOS 27.2 (chapter 09). |
 | WAL | SQLite's write-ahead log, `MediaLibrary.sqlitedb-wal`. The live state is the database plus the WAL. |
 
 ## 9. Map of the document set

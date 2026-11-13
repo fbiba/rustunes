@@ -42,6 +42,12 @@ pub const LAYOUT_SHA256: &str = "282f0a1114d01c831e691f47b5071743f530936c81efb3d
 /// `item_state`).
 pub const BUILT_NEW_LAYOUT_SHA256: &str =
     "c2b315ede376aa40cbad756979092addbd49299f327f28f3ae84bb7b475bb0b8";
+/// `Snapshot::layout_hash` of the same 45 tables on iOS 26.6.2 and 26.7.3
+/// (user_version 2350000), in a database migrated from an older iOS: `album`
+/// without the eight columns iOS 27 has at its end and `item_store` without
+/// `expected_release_date`; `item_state` as in `LAYOUT_SHA256` (docs/09, section 8.4).
+pub const IOS_26_LAYOUT_SHA256: &str =
+    "d12dbc6c6e57b3daed4b6fd34774f99acb3d6a12bf35eebd136df56be5970dba";
 
 pub mod values;
 
@@ -176,19 +182,23 @@ impl Snapshot {
             .collect();
         Ok(hex(&Sha256::digest(serde_json::to_vec(&layout)?)))
     }
-    /// At or above the user_version floor, with the table layout that the
-    /// full-table models were written against.
+    /// At or above the modelled user_version floor, with the table layout
+    /// that the full-table models were written against.
     pub fn layout_qualified(&self) -> Result<bool> {
-        Ok(self.version >= super::USER_VERSION_FLOOR && self.layout_hash()? == LAYOUT_SHA256)
+        Ok(self.version >= super::MODELLED_USER_VERSION_FLOOR
+            && self.layout_hash()? == LAYOUT_SHA256)
     }
-    /// `layout_qualified`, or at or above the floor with the layout of a
-    /// database built new (`BUILT_NEW_LAYOUT_SHA256`). Enough for a check
-    /// that compares two captures of one database and builds no
-    /// `item_state` row.
+    /// `layout_qualified`; or at or above that floor with the layout of a
+    /// database built new (`BUILT_NEW_LAYOUT_SHA256`); or at or above the
+    /// reader's floor with iOS 26's layout (`IOS_26_LAYOUT_SHA256`).
+    /// Enough for a check that compares two captures of one database, builds
+    /// no `item_state` row and names no column iOS 26 lacks.
     pub fn layout_observed(&self) -> Result<bool> {
+        let layout = self.layout_hash()?;
         Ok(self.layout_qualified()?
-            || self.version >= super::USER_VERSION_FLOOR
-                && self.layout_hash()? == BUILT_NEW_LAYOUT_SHA256)
+            || self.version >= super::MODELLED_USER_VERSION_FLOOR
+                && layout == BUILT_NEW_LAYOUT_SHA256
+            || self.version >= super::USER_VERSION_FLOOR && layout == IOS_26_LAYOUT_SHA256)
     }
 }
 #[derive(Clone)]
@@ -1000,6 +1010,45 @@ mod layout_tests {
             "DROP TABLE lyrics",
         ] {
             let fixture = NativeFixture::built_new();
+            Connection::open(&fixture.before)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+            let changed = snapshot(&fixture.before);
+            fs::remove_dir_all(&fixture.dir).unwrap();
+            assert!(!changed.layout_observed().unwrap(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_ios_26_database_has_its_own_observed_layout() {
+        let fixture = NativeFixture::ios_26();
+        let ios_26 = snapshot(&fixture.before);
+        assert_eq!(ios_26.version, 2_350_000);
+        assert_eq!(ios_26.tables.len(), 45);
+        assert_eq!(ios_26.table("item_state").unwrap().columns.len(), 64);
+        assert_eq!(ios_26.table("album").unwrap().columns.len(), 27);
+        assert_eq!(ios_26.layout_hash().unwrap(), IOS_26_LAYOUT_SHA256);
+        assert!(!ios_26.layout_qualified().unwrap());
+        assert!(ios_26.layout_observed().unwrap());
+        let mut older = ios_26.clone();
+        older.version = 2_349_990;
+        assert!(!older.layout_observed().unwrap());
+        // Another layout at iOS 26's version is not observed.
+        let migrated = NativeFixture::new();
+        let mut relabelled = snapshot(&migrated.before);
+        relabelled.version = 2_350_000;
+        assert!(!relabelled.layout_qualified().unwrap() && !relabelled.layout_observed().unwrap());
+        for fixture in [fixture, migrated] {
+            fs::remove_dir_all(&fixture.dir).unwrap();
+        }
+
+        for sql in [
+            "ALTER TABLE album ADD COLUMN date_released INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE item_store ADD COLUMN unmodelled TEXT",
+            "DROP TABLE lyrics",
+        ] {
+            let fixture = NativeFixture::ios_26();
             Connection::open(&fixture.before)
                 .unwrap()
                 .execute_batch(sql)

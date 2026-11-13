@@ -812,17 +812,20 @@ fn a_library_without_music_folders_plans_into_apples_folders() {
 }
 
 /// After a first track went into one folder, a library built new (the shape
-/// `rustunes init` prepares) still takes new tracks in any of Apple's F00 to
-/// F49, as Apple's sync spreads them; a migrated library keeps to the
-/// folders it uses, and neither takes a folder outside them.
+/// `rustunes init` prepares on iOS 27.2) and an iOS 26 library still take
+/// new tracks in any of Apple's F00 to F49, as Apple's sync spreads them; a
+/// migrated iOS 27 library keeps to the folders it uses, and none takes a
+/// folder outside them.
 #[test]
-fn a_library_built_new_plans_into_all_of_apples_folders() {
+fn a_library_built_new_or_on_ios_26_plans_into_all_of_apples_folders() {
     let source = sources();
     let other = different(fingerprint::read(&fixture()).unwrap());
     let built_new = "ALTER TABLE item_state DROP COLUMN is_supported_type;";
+    let ios_26 = "PRAGMA user_version=2350000;";
     let plan = |sql: &str, folder: &str| {
         let catalog = music_protocol::test_support::catalogue::modified_collection_catalog(1, sql);
-        assert_eq!(catalog.item_state_built_new(), !sql.is_empty());
+        assert_eq!(catalog.item_state_built_new(), sql == built_new);
+        assert_eq!(catalog.full_model_shape(), sql.is_empty());
         assert_eq!(
             catalog.music_folders().iter().collect::<Vec<_>>(),
             ["iTunes_Control/Music/F39"]
@@ -844,6 +847,8 @@ fn a_library_built_new_plans_into_all_of_apples_folders() {
     ));
     assert!(matches!(plan(built_new, "F39"), Decision::Add { .. }));
     assert!(refused(&plan(built_new, "F50")));
+    assert!(matches!(plan(ios_26, "F07"), Decision::Add { .. }));
+    assert!(refused(&plan(ios_26, "F50")));
     assert!(refused(&plan("", "F07")));
     assert!(matches!(plan("", "F39"), Decision::Add { .. }));
 }

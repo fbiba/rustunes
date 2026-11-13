@@ -447,15 +447,16 @@ fn build_inner_with_control(
     let paths = catalog.music_paths()?;
     // Folders tracks use, and the phone's own registry: an emptied library
     // keeps its folders but no track names them. A phone with neither (one
-    // `rustunes init` prepared), and a library built new, also take Apple's
-    // set, as the allocator does.
+    // `rustunes init` prepared), and a library the full SQL model of recovery
+    // does not cover (built new, or iOS 26's), also take Apple's set, as
+    // the allocator does.
     let known: BTreeSet<_> = paths
         .iter()
         .filter_map(|p| p.rsplit_once('/').map(|(parent, _)| parent.to_owned()))
         .chain(catalog.music_folders().iter().cloned())
         .collect();
     let folders: BTreeSet<_> =
-        destination_folders(known.into_iter().collect(), catalog.item_state_built_new())
+        destination_folders(known.into_iter().collect(), catalog.full_model_shape())
             .into_iter()
             .collect();
     let journal_evidence = journal.as_ref().map(|e| (e.journal, e.identity));

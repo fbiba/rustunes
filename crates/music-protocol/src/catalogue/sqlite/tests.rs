@@ -419,7 +419,7 @@ fn absent_and_empty_wal_are_distinguished() {
 fn schema_missing_columns_and_wrong_versions_fail() {
     for sql in [
         "PRAGMA user_version=1",
-        "PRAGMA user_version=2400059",
+        "PRAGMA user_version=2349990",
         "PRAGMA user_version=2410000; ALTER TABLE item_extra RENAME COLUMN title TO absent",
         "DROP TABLE item_stats",
         "ALTER TABLE item_extra RENAME COLUMN content_rating TO absent",
@@ -947,6 +947,32 @@ fn native_schemas_of_both_item_state_shapes_read_through_the_catalogue() {
     let error = format!("{:#}", read(&migrated).err().unwrap());
     assert!(error.contains(WRONG_STORAGE), "{error}");
     for fixture in [built_new, migrated] {
+        fs::remove_dir_all(&fixture.dir).unwrap();
+    }
+}
+
+/// iOS 26's native schema (user_version 2350000): the migrated
+/// `item_state`, with `album` and `item_store` lacking columns iOS 27 has
+/// (docs/09, section 8.4). The catalogue reads it as it reads iOS 27's; the full-table
+/// models of new rows do not cover it, nor a database built new.
+#[test]
+fn ios_26_native_schema_reads_through_the_catalogue() {
+    use crate::test_support::catalogue::NativeFixture;
+    let read = |fixture: &NativeFixture| read_snapshot(&fixture.before, None, &fixture.dir);
+    let ios_26 = NativeFixture::ios_26();
+    let catalog = read(&ios_26).unwrap();
+    assert_eq!(catalog.user_version(), 2_350_000);
+    assert!(catalog.user_version_tested());
+    assert!(!catalog.item_state_built_new() && !catalog.full_model_shape());
+    let migrated = NativeFixture::new();
+    let wide = read(&migrated).unwrap();
+    assert!(wide.full_model_shape());
+    assert_eq!(catalog.tracks().len(), 4);
+    assert_eq!(catalog.tracks(), wide.tracks());
+    assert!(catalog.albums() == wide.albums() && catalog.artists() == wide.artists());
+    let built_new = NativeFixture::built_new();
+    assert!(!read(&built_new).unwrap().full_model_shape());
+    for fixture in [ios_26, migrated, built_new] {
         fs::remove_dir_all(&fixture.dir).unwrap();
     }
 }

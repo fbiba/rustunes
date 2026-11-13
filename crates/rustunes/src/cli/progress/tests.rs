@@ -105,7 +105,7 @@ fn a_blocked_sync_says_what_holds_it_and_how_to_send_the_rest() {
 fn an_untested_catalogue_version_names_it_and_the_tested_ones() {
     assert_eq!(
         observation_line(&Observation::UntestedCatalogueVersion(2_420_000)),
-        "The phone's Music database is version 2420000, which rustunes has not been tested with (tested: 2400060, 2410000); every table and column it reads is present"
+        "The phone's Music database is version 2420000, which rustunes has not been tested with (tested: 2350000, 2400060, 2410000); every table and column it reads is present"
     );
 }
 

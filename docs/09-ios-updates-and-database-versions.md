@@ -1,6 +1,6 @@
 # How an iOS update changes the Music library database
 
-This chapter describes how the phone versions its `MediaLibrary.sqlitedb`, what it does to the database when iOS is updated, and what a host has to know about it. It covers the phone's version number and migrations, the other version stamps that can rewrite library contents, the version rules of the phone's sync service and of Apple's Windows host, the difference between iOS 27.0.1 and iOS 27.2, and what that update did to a real library. Section 11 compares the findings with `rustunes`. The database layout is in chapter 04, the protocol in chapter 02, the receiver's effects in chapter 05, how Apple's host batches a sync in chapter 08, and the tool's design in chapter 07.
+This chapter describes how the phone versions its `MediaLibrary.sqlitedb`, what it does to the database when iOS is updated, and what a host has to know about it. It covers the phone's version number and migrations, the other version stamps that can rewrite library contents, the version rules of the phone's sync service and of Apple's Windows host, the difference between iOS 27.0.1 and iOS 27.2, the database of iOS 26, and what that update did to a real library. Section 11 compares the findings with `rustunes`. The database layout is in chapter 04, the protocol in chapter 02, the receiver's effects in chapter 05, how Apple's host batches a sync in chapter 08, and the tool's design in chapter 07.
 
 ## Contents
 
@@ -28,7 +28,7 @@ The phone of the earlier chapters was updated:
 | Before the update | iOS 27.0.1, build 24A446, database version 2400060 |
 | After the update | iOS 27.2, build 24B119, database version 2410000 |
 
-The findings come from static analysis of Apple's iPhone17,2 firmware for both builds and of Apple Devices for Windows, and from two read-only captures of the phone's database: the last one on iOS 27.0.1 and the first one on iOS 27.2. No Apple code was run and no phone experiment was made for this chapter.
+The findings come from static analysis of Apple's iPhone17,2 firmware for both builds and of Apple Devices for Windows, and from two read-only captures of the phone's database: the last one on iOS 27.0.1 and the first one on iOS 27.2. Section 8.4 rests on read-only captures of a second iPhone17,2 on iOS 26.6.2 and 26.7.3. No Apple code was run and no phone experiment was made for this chapter.
 
 Firmware files read. The SHA-256 values are of each file as extracted from the firmware, decompressed. The binaries are not redistributed. Only addresses, constants and conclusions are published.
 
@@ -76,7 +76,7 @@ Address conventions:
 
 | Question | Answer | Label |
 | --- | --- | --- |
-| What is the database version? | `PRAGMA user_version` of `MediaLibrary.sqlitedb`, a constant compiled into MusicLibrary: 2400060 in iOS 27.0.1, 2410000 in iOS 27.2. | CONFIRMED |
+| What is the database version? | `PRAGMA user_version` of `MediaLibrary.sqlitedb`, a constant compiled into MusicLibrary: 2400060 in iOS 27.0.1, 2410000 in iOS 27.2. A database on iOS 26.6.2 and 26.7.3 is at 2350000, with a narrower `album` and `item_store` (section 8.4). | CONFIRMED; iOS 26 from captures only |
 | When does it change? | With an iOS update whose MusicLibrary changes the database. It does not follow the framework's version. | CONFIRMED for the two builds; the rule INFERRED |
 | An older database? | Migrated in place, one exact step at a time, all steps in one transaction. | CONFIRMED |
 | A newer database? | Refused with error 3. Nothing is changed or deleted. | CONFIRMED |
@@ -369,6 +369,23 @@ In the WAL the migration is one 44-page commit: the header page with the new ver
 
 No message, key, required field or default that a host sends or receives changed.
 
+### 8.4 An iOS 26 database
+
+CONFIRMED from read-only captures of a second iPhone17,2, one no computer had synced, on iOS 26.6.2 (build 23G90) and again after it updated itself to iOS 26.7.3 (build 23H131). The firmware of these builds was not read.
+
+| | iOS 26.6.2 and 26.7.3 | iOS 27.0.1 (section 8.1) |
+| --- | --- | --- |
+| `user_version` | 2350000 | 2400060 |
+| Tables, indexes, triggers | 45, 133, 16 | 45, 136, 16 |
+
+The update from 26.6.2 to 26.7.3 left the version and the whole `sqlite_schema` unchanged. The 45 tables are those of iOS 27, and `item_state` has the 64 columns of a migrated database (chapter 04, section 4.1). Against the 27.0.1 schema:
+
+- `album` lacks the eight columns at the end of 27.0.1's table: `date_released`, `is_prerelease`, `release_event_aux_info`, `album_type` (default 1 in 27.0.1), `content_timestamp`, `expected_release_date`, `cloud_channel_name` and `is_followed`. It lacks the indexes `AlbumIsFollowed`, `AlbumIsPreRelease` and `AlbumReleaseEventAuxInfo` on three of them, and its `CREATE TABLE` names the table without quotes.
+- `item_store` lacks `expected_release_date`, the last column of 27.0.1's table.
+- The triggers `on_insert_item_setInMyLibraryColumn` and `on_update_item_setInMyLibraryColumn` set `item.in_my_library` with one OR: `home_sharing_id OR (store_saga_id AND cloud_in_my_library) OR purchase_history_id OR (sync_id AND sync_in_my_library) OR is_ota_purchased`. 27.0.1 nests `CASE` expressions in the same order, so a store saga ID decides alone: an item with one that is not in the cloud library gets 0 there, and 1 on iOS 26 when a later term holds. A synced track, with no saga ID, gets `sync_in_my_library` in both.
+
+INFERRED: the migration steps from 2350000 to 2400060 add the columns and indexes and rewrite the triggers. Section 8.1 places `cloud_channel_name` and `is_followed` in the step from 2400050. OPEN: which steps add the others.
+
 ## 9. What the update did to a library
 
 CONFIRMED from the 27.2 capture. The WAL holds ten commits after the last checkpoint before the update:
@@ -406,11 +423,13 @@ These follow from the findings above. They are not Apple's rules.
 
 DESIGN. The tool follows the guidance of section 10 where it reads the phone's database:
 
-- **Catalogue read.** The reader in `music-protocol` accepts any `user_version` at or above 2400060, the lowest version it was tested with, when every table and column it reads is present with its type. It refuses an older version or a missing column. The exception is `item_state.is_supported_type`. An `item_state` with none of the 12 columns that only the old migration step adds, the shape of a database built new (chapter 04, section 4.1), may lack it, and then every track reads as supported: 1, the default a migrated table declares and the value the one migrated library examined held in every row. A table with any of the 12, in any letter case, must have the column as spelled. NULL in `is_placeholder`, `is_library_added` or `has_non_purgeable_asset` reads as 0 only in an `item_state` of the built-new shape that declares that column without a default. A migrated table declares them DEFAULT 0, and NULL there is refused. Reading NULL as 0 is a choice of the reader, not an observed meaning: for the purchase-history entries of the rebuilt library the phone's own trigger would write `is_library_added` 1, and the phone did write 1 there later, when the import of `rustunes init`'s session repopulated `item_state`; a track a sync inserts gets integers there (OBSERVED once; chapter 04, section 4.1). It reports whether the version is one the tool was tested with on a phone (2400060 and 2410000). An untested version is read, not refused, and the tool says so once per command with the warning `untested_catalogue_version` (chapter 07, section 10.5).
-- **Layout fingerprint.** For the models that compare every table, the library offers a SHA-256 of each table's name and columns, without indexes, triggers or the version. The 27.0.1 and 27.2 captures have the same fingerprint, while their hashes of the whole `sqlite_schema` differ. A database built new at 2410000 has a fingerprint of its own (`BUILT_NEW_LAYOUT_SHA256`, chapter 04, section 4.1). The checks that use a fingerprint require a version at or above 2400060 and the same version and whole schema in the two snapshots they compare, so an index-only update like 27.2's passes and a column change fails. Those that build no `item_state` row, the revision housekeeping check after an insert batch and the playback bridges of recovery, accept either fingerprint (`layout_observed`). The full-table model of an interrupted ordinary insert's recovery requires the migrated one (`layout_qualified`), because its expected rows model the 64-column `item_state`. Recovery proves an insertion into a database whose `item_state` has the built-new shape with the catalogue verifier instead, the check that verified the insertion when it was written.
+- **Catalogue read.** The reader in `music-protocol` accepts any `user_version` at or above 2350000, the lowest version it was tested with (iOS 26.6.2 and 26.7.3, section 8.4), when every table and column it reads is present with its type. It reads no column that iOS 26 lacks. It refuses an older version or a missing column. The exception is `item_state.is_supported_type`. An `item_state` with none of the 12 columns that only the old migration step adds, the shape of a database built new (chapter 04, section 4.1), may lack it, and then every track reads as supported: 1, the default a migrated table declares and the value the one migrated library examined held in every row. A table with any of the 12, in any letter case, must have the column as spelled. NULL in `is_placeholder`, `is_library_added` or `has_non_purgeable_asset` reads as 0 only in an `item_state` of the built-new shape that declares that column without a default. A migrated table declares them DEFAULT 0, and NULL there is refused. Reading NULL as 0 is a choice of the reader, not an observed meaning: for the purchase-history entries of the rebuilt library the phone's own trigger would write `is_library_added` 1, and the phone did write 1 there later, when the import of `rustunes init`'s session repopulated `item_state`; a track a sync inserts gets integers there (OBSERVED once; chapter 04, section 4.1). It reports whether the version is one the tool was tested with on a phone (2350000, 2400060 and 2410000). An untested version is read, not refused, and the tool says so once per command with the warning `untested_catalogue_version` (chapter 07, section 10.5).
+- **Layout fingerprint.** For the models that compare every table, the library offers a SHA-256 of each table's name and columns, without indexes, triggers or the version. The 27.0.1 and 27.2 captures have the same fingerprint, while their hashes of the whole `sqlite_schema` differ. A database built new at 2410000 has a fingerprint of its own (`BUILT_NEW_LAYOUT_SHA256`, chapter 04, section 4.1), and so does iOS 26's at 2350000 (`IOS_26_LAYOUT_SHA256`, section 8.4). The checks that use a fingerprint require the same version and whole schema in the two snapshots they compare, so an index-only update like 27.2's passes and a column change fails, and a version at or above the one their fingerprint was seen at: 2400060 for the two iOS 27 fingerprints, 2350000 for iOS 26's. Those that build no `item_state` row and name no column iOS 26 lacks, the revision housekeeping check after an insert batch and the playback bridges of recovery, accept any of the three (`layout_observed`). The full-table model of an interrupted ordinary insert's recovery requires the migrated iOS 27 one (`layout_qualified`), because its expected rows model the 64-column `item_state` and iOS 27's `album`. Recovery proves an insertion into a database built new, or into iOS 26's, with the catalogue verifier instead, the check that verified the insertion when it was written. On those databases new tracks also spread over Apple's 50 music folders besides the ones in use, as on a phone with no music folder (chapter 04, section 4.4), since no model expects a track's folder to be registered already.
 - **Database and WAL together.** The tool copies both (chapter 04, section 2.2).
 - **Host version.** It sends `HostInfo.Version` `13.2.4.123`.
 - **Anchor.** It requires the anchor in `ReadyForSync` to equal the one it saved ("Ready anchor differs from saved state"), so a zeroed anchor stops a session before any write.
+
+OBSERVED on the iOS 26.7.3 phone of section 8.4: `rustunes device check` read it as never synced, `rustunes init` prepared it, and a single `push` and then a full `sync` of a library were verified, with tracks spread over Apple's 50 folders.
 
 OPEN for the tool: detecting a rebuilt phone library from `_UUID`, the `db_info` row and a zeroed anchor (section 4.4), and keying sort-dependent cached state on `OrderingLanguage` and `MLSortMapUnicodeVersion` (section 5.1).
 
@@ -427,6 +446,7 @@ OPEN for the tool: detecting a rebuilt phone library from `_UUID`, the `db_info`
 9. What `itunescloudd` changed beyond the cloud steps (it was not compared function by function), and what the changed Photos sync bundle (`MobileSlideShow.syncBundle`) does differently.
 10. On the host: whether the phone's `MinITunesVersion`, `MinBuildID` and `DBVersion` capability keys have a refusing consumer, and what the flags set at iOS 15.4 and 26.0 mean.
 11. Which iOS release first shipped database version 2340000, the version whose migration step adds the 12 extra `item_state` columns (section 4.2).
+12. Which migration steps between 2350000 and 2400060 add the `album` and `item_store` columns iOS 26 lacks (section 8.4), and what a database iOS 26 builds new looks like. The tool's checks that compare every table would refuse a layout they have no fingerprint for.
 
 ## 13. Evidence
 
@@ -452,6 +472,8 @@ The binaries and hashes of chapter 02, section 1. String extraction (ASCII and U
 ### 13.3 Phone database captures
 
 Two read-only captures of `MediaLibrary.sqlitedb` and its WAL, taken as in chapter 04, section 2.2: the last on iOS 27.0.1 and the first on iOS 27.2, which the tool's failed `sync` retained. Copies were compared by schema dump, `_MLDatabaseProperties`, `sort_map` and revisions. The 27.2 WAL was replayed commit by commit to give the order of section 9.
+
+For section 8.4, `rustunes device check` captures of the second phone's database and WAL, taken the same way on iOS 26.6.2 and on 26.7.3. Their `sqlite_schema` dumps were compared with each other and, entry by entry, with the 27.0.1 schema, and the tool's layout fingerprint of the 26.6.2 capture with that of a test database built from the 27.0.1 schema with the differences of section 8.4 applied.
 
 ### 13.4 Strength of the evidence
 

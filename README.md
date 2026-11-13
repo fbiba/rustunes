@@ -108,15 +108,15 @@ OpenSSL dependency.
 
 | | |
 | --- | --- |
-| Tested phone | iPhone 16 Pro Max (`iPhone17,2`), iOS 27.0.1 and 27.2 |
+| Tested phone | iPhone 16 Pro Max (`iPhone17,2`), iOS 27.0.1, 27.2 and 27.2.1; a second one on iOS 26.7.3 that no computer had synced, prepared by `rustunes init` |
 | Tested computer | Linux x86_64 (Fedora 44) |
 | Tested library | 419 tracks, 8.6 GB, 418 covers, over USB and Wi-Fi |
 
 Other models and iOS versions have not been tested, and Apple can change the
 protocol in any iOS update. As a safeguard, rustunes reads the phone's music
 database before sending anything. It refuses a database older than schema
-version 2400060, or one missing a table or column it relies on. A newer version
-that has everything is used, with a warning that it is untested.
+version 2350000 (iOS 26), or one missing a table or column it relies on. A
+newer version that has everything is used, with a warning that it is untested.
 
 ## Installation
 
@@ -891,7 +891,7 @@ covers).
 - **Apple's sync software can undo it.** Syncing the phone's music with
   Finder, Apple Devices or iTunes afterwards can remove the tracks rustunes
   sent (see the warning under [Getting started](#getting-started)).
-- **Tested on one phone and two iOS versions** (see [Supported phones](#supported-phones)).
+- **Tested on two phones of one model and four iOS versions** (see [Supported phones](#supported-phones)).
 - **No playlist editing.** rustunes does not create or edit playlists. It
   removes members of ordinary playlists when it removes a track, and refuses to
   remove members of smart playlists, folders or playlists made on the phone.

@@ -1245,6 +1245,13 @@ fn ordinary_full_sql_covers_only_an_insertion_creating_its_groups() {
     );
     assert!(built_new.item_state_built_new());
     assert!(!ordinary_sql::covers(&prepared, &source, &built_new).unwrap());
+    // And into iOS 26's, whose album lacks columns the model builds.
+    let ios_26 = music_protocol::test_support::catalogue::modified_collection_catalog(
+        13,
+        "PRAGMA user_version=2350000",
+    );
+    assert!(!ios_26.item_state_built_new() && !ios_26.full_model_shape());
+    assert!(!ordinary_sql::covers(&prepared, &source, &ios_26).unwrap());
 }
 
 #[test]

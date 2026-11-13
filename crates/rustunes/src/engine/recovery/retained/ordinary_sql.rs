@@ -104,13 +104,14 @@ struct Observed {
 }
 /// Whether the full SQL model covers this insertion: an artless one that
 /// creates its album and artist, with no composer, compilation or rating,
-/// into a database whose `item_state` has the migrated shape (`rows` models
-/// its 64 columns; no insert into the built-new shape has been observed).
-/// Recovery proves any other by the catalogue verifier, as the insertion
-/// itself was checked.
+/// into a database of the shape `rows` models (`full_model_shape`: the
+/// migrated 64-column `item_state` and iOS 27's `album`; no insert into the
+/// built-new shape has been modelled, and iOS 26's `album` lacks columns
+/// `rows` builds). Recovery proves any other by the catalogue verifier, as
+/// the insertion itself was checked.
 pub(super) fn covers(p: &PreparedAttempt, source: &Metadata, before: &Catalog) -> Result<bool> {
     let scalar = source.projected()?;
-    Ok(!before.item_state_built_new()
+    Ok(before.full_model_shape()
         && p.kind == AttemptKind::Insert
         && p.content.artwork.is_none()
         && p.new_album_pid.is_some()

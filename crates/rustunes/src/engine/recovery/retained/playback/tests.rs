@@ -794,10 +794,10 @@ fn state_scope_rejects_new_revision_device_prefs_cdb_and_raw_artwork_changes() {
 
 /// The housekeeping and playback checks compare two captures of one database
 /// and build no item_state row, so they read a database iOS 27.2 built new,
-/// whose layout differs from a migrated one's (docs/04), as well; any other
-/// layout is still refused.
+/// whose layout differs from a migrated one's (docs/04), and iOS 26's
+/// (docs/09, section 8.4) as well; any other layout is still refused.
 #[test]
-fn full_table_comparisons_read_a_database_built_new() {
+fn full_table_comparisons_read_a_database_built_new_or_on_ios_26() {
     use music_protocol::test_support::catalogue::NativeFixture;
     use sha2::{Digest, Sha256};
     let snapshot = |fixture: &NativeFixture, database: &std::path::Path, name: &str| {
@@ -812,6 +812,7 @@ fn full_table_comparisons_read_a_database_built_new() {
     for fixture in [
         NativeFixture::built_new(),
         NativeFixture::index_only_update(),
+        NativeFixture::ios_26(),
     ] {
         let before = fixture.before.as_path();
         let (a, b) = (

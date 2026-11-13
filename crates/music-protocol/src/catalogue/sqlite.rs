@@ -1,6 +1,6 @@
 //! Read-only catalog from a bounded local MediaLibrary database/WAL capture.
 //!
-//! Read from user_version 2400060 on, when the tables and columns in `TABLES`
+//! Read from user_version 2350000 on, when the tables and columns in `TABLES`
 //! are present, and `item_state.is_supported_type` too unless `item_state`
 //! has the shape of a database built new (`validate_schema`). Wire identities
 //! come from sync_id, not SQLite item_pid or item_state.sync_id.
@@ -33,11 +33,16 @@ const MAX_ROWS: usize = 50_000;
 const MAX_TOTAL_ROWS: usize = 200_000;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_TEXT_BYTES: usize = 64 * 1024 * 1024;
-/// Lowest MediaLibrary user_version read. Older databases are refused.
-pub const USER_VERSION_FLOOR: i64 = 2_400_060;
+/// Lowest MediaLibrary user_version read: iOS 26's (26.6.2 and 26.7.3).
+/// Older databases are refused.
+pub const USER_VERSION_FLOOR: i64 = 2_350_000;
+/// Lowest user_version of the tables the full-table models were written
+/// against: iOS 27.0.1's. iOS 26's `album` and `item_store` lack
+/// columns those models build (docs/09, section 8.4).
+pub const MODELLED_USER_VERSION_FLOOR: i64 = 2_400_060;
 /// The user_versions this reader was qualified against on a phone. Any other
 /// version at or above the floor is read, and `Catalog` reports it untested.
-pub const TESTED_USER_VERSIONS: &[i64] = &[2_400_060, 2_410_000];
+pub const TESTED_USER_VERSIONS: &[i64] = &[2_350_000, 2_400_060, 2_410_000];
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 mod library_state;
 mod scratch;
@@ -94,6 +99,13 @@ impl Catalog {
     /// (docs/04, section 4.1).
     pub fn item_state_built_new(&self) -> bool {
         self.item_state_built_new
+    }
+    /// Whether the database has the shape the full-table models of new rows
+    /// were written against: a migrated `item_state` at or above
+    /// `MODELLED_USER_VERSION_FLOOR`. Not a library built new, nor iOS
+    /// 26's narrower `album`; the catalogue verifier checks those.
+    pub fn full_model_shape(&self) -> bool {
+        !self.item_state_built_new && self.user_version >= MODELLED_USER_VERSION_FLOOR
     }
     /// The phone's own registry of audio folders (`iTunes_Control/Music/Fnn`
     /// rows of `base_location`). It keeps them when no track uses them.
