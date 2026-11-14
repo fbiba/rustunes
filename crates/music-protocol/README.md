@@ -27,7 +27,7 @@ chapters of the repository this crate comes from.
 
 ## Status
 
-Version 0.1. The interfaces follow what the phone was observed to do and may
+Version 0.2. The interfaces follow what the phone was observed to do and may
 change between releases. Tested against the iOS versions named in the
 repository's docs.
 
