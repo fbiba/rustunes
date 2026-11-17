@@ -1,10 +1,8 @@
 //! The removal receiver model is `music_protocol::catalogue::removal`, re-exported
 //! here. The Clear command's choice of playlists stays with the command.
-use crate::{
-    engine::verification::sql_tables::reader::Cell, engine::verification::sql_values as typed,
-};
-use anyhow::{Context, Result};
-use music_protocol::catalogue::removal::playlists;
+use crate::engine::verification::sql_values as typed;
+use anyhow::Result;
+use music_protocol::catalogue::removal::{playlists, track_with_sync_id};
 use std::collections::BTreeSet;
 
 pub(crate) use music_protocol::catalogue::removal::{
@@ -26,11 +24,9 @@ pub(crate) struct ClearPlaylists {
 /// Whether an ordinary playlist holds any of `tracks` (sync IDs): a session
 /// that also inserts removes none of them (`qualify_session`).
 pub(crate) fn in_playlists(tables: &Tables, tracks: &[u64]) -> Result<bool> {
-    let store = tables.get("item_store").context("item_store absent")?;
     let mut items = BTreeSet::new();
     for track in tracks {
-        let row = typed::unique(store, "sync_id", Cell::Integer(*track as i64))?;
-        items.insert(typed::int(store, row, "item_pid")?);
+        items.insert(track_with_sync_id(tables, *track as i64)?);
     }
     Ok(!playlists::holding(tables, &items)?.is_empty())
 }

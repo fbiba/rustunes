@@ -44,9 +44,13 @@ pub const MODELLED_USER_VERSION_FLOOR: i64 = 2_400_060;
 /// version at or above the floor is read, and `Catalog` reports it untested.
 pub const TESTED_USER_VERSIONS: &[i64] = &[2_350_000, 2_400_060, 2_410_000];
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+mod companion_rows;
 mod library_state;
 mod scratch;
 pub mod tables;
+pub use companion_rows::{
+    COMPANION_TABLES, CompanionRows, ItemRowCounts, SONGS_UNTIL_CLEARED_LIMIT,
+};
 pub use library_state::{ContainerRow, LibraryState, SYNCED_TABLES, read_library_state};
 mod without;
 
@@ -81,8 +85,12 @@ pub struct Catalog {
     stats_except_playback: BTreeMap<u64, [u8; 32]>,
     playback_dates: BTreeMap<u64, PlaybackDates>,
     represented_sync_ids: BTreeSet<u64>,
+    /// The part of `represented_sync_ids` only `item_store` rows whose track
+    /// is gone hold.
+    stray_sync_ids: BTreeSet<u64>,
     music_folders: BTreeSet<String>,
     artwork: ArtworkInventory,
+    item_rows: ItemRowCounts,
 }
 
 impl Catalog {
@@ -111,6 +119,13 @@ impl Catalog {
     /// rows of `base_location`). It keeps them when no track uses them.
     pub fn music_folders(&self) -> &BTreeSet<String> {
         &self.music_folders
+    }
+    /// `item`'s rows and its companion tables', as the database held them
+    /// (a catalogue derived from this one keeps them). Rows whose track is
+    /// gone are left out of the catalogue; a track without a companion row
+    /// is refused.
+    pub fn item_rows(&self) -> &ItemRowCounts {
+        &self.item_rows
     }
     pub fn source_hashes(&self) -> &SourceHashes {
         &self.source_hashes
@@ -234,8 +249,20 @@ impl Catalog {
     }
     /// Nonzero sync IDs in the mapped item/collection/container tables, plus
     /// db_info identities. No claim covers opaque properties or historical IDs.
+    /// Includes those of `item_store` rows whose track is gone: no new
+    /// identity may take one while the row exists.
     pub fn represented_sync_ids(&self) -> &BTreeSet<u64> {
         &self.represented_sync_ids
+    }
+    /// `represented_sync_ids` without those only `item_store` rows whose
+    /// track is gone hold. The phone deletes such rows when it pleases (at
+    /// the end of a session that transfers files, and in its sanitize), so a
+    /// before/after comparison of identities compares these.
+    pub fn live_sync_ids(&self) -> BTreeSet<u64> {
+        self.represented_sync_ids
+            .difference(&self.stray_sync_ids)
+            .copied()
+            .collect()
     }
     /// Observed local-art source300 evidence, not a cache allocator or proof
     /// that any corresponding artwork file exists on the phone.
@@ -1643,16 +1670,10 @@ fn parse_catalog(
         counts["db_info"] == 1,
         "catalog db_info cardinality differs"
     );
-    for table in ["item_extra", "item_store", "item_state", "item_stats"] {
-        check_control(control)?;
-        ensure!(
-            counts[table] == counts["item"],
-            "catalog item companion cardinality differs"
-        );
-        let orphans: i64 = connection.query_row(&format!("SELECT count(*) FROM {table} t LEFT JOIN item i USING(item_pid) WHERE i.item_pid IS NULL"), [], |r| r.get(0))?;
-        check_control(control)?;
-        ensure!(orphans == 0, "catalog item companion has orphan rows");
-    }
+    // Rows whose track is gone are passed over: every query below starts
+    // from `item` or joins it.
+    let item_rows = ItemRowCounts::read(connection, control)?;
+    item_rows.ensure_complete()?;
     let mut text = TextBudget(0);
     check_control(control)?;
     let mut statement = connection.prepare("SELECT db_pid,primary_container_pid FROM db_info")?;
@@ -1813,28 +1834,49 @@ fn parse_catalog(
             "duplicate item artist row"
         );
     }
+    // An `item_store` row whose track is gone keeps its sync_id taken while
+    // the row exists, but the phone may delete the row at any time.
     let mut represented_sync_ids = BTreeSet::from([database_pid, primary_container_pid]);
-    for table in [
-        "item_store",
-        "album",
-        "album_artist",
-        "item_artist",
-        "composer",
-        "genre",
-        "container",
+    let mut stray_sync_ids = BTreeSet::new();
+    for (sql, stray) in [
+        (
+            "SELECT sync_id FROM item_store JOIN item USING(item_pid)",
+            false,
+        ),
+        (
+            "SELECT s.sync_id FROM item_store s LEFT JOIN item i USING(item_pid) \
+             WHERE i.item_pid IS NULL",
+            true,
+        ),
+        ("SELECT sync_id FROM album", false),
+        ("SELECT sync_id FROM album_artist", false),
+        ("SELECT sync_id FROM item_artist", false),
+        ("SELECT sync_id FROM composer", false),
+        ("SELECT sync_id FROM genre", false),
+        ("SELECT sync_id FROM container", false),
     ] {
         check_control(control)?;
-        let mut statement = connection.prepare(&format!("SELECT sync_id FROM {table}"))?;
+        let mut statement = connection.prepare(sql)?;
         check_control(control)?;
         let mut rows = statement.query([])?;
         check_control(control)?;
         while let Some(row) = next_row(&mut rows, control)? {
             let id = integer(row, "sync_id")? as u64;
             if id != 0 {
-                represented_sync_ids.insert(id);
+                if stray {
+                    &mut stray_sync_ids
+                } else {
+                    &mut represented_sync_ids
+                }
+                .insert(id);
             }
         }
     }
+    let stray_sync_ids: BTreeSet<u64> = stray_sync_ids
+        .difference(&represented_sync_ids)
+        .copied()
+        .collect();
+    represented_sync_ids.extend(&stray_sync_ids);
     let mut tracks = Vec::with_capacity(counts["item"]);
     let mut seen = BTreeSet::new();
     let mut paths = BTreeSet::new();
@@ -2045,8 +2087,10 @@ fn parse_catalog(
         stats_except_playback,
         playback_dates,
         represented_sync_ids,
+        stray_sync_ids,
         music_folders,
         artwork,
+        item_rows,
     })
 }
 
@@ -2103,7 +2147,7 @@ fn stats_fingerprints(
 ) -> Result<(BTreeMap<u64, [u8; 32]>, BTreeMap<u64, PlaybackDates>)> {
     check_control(control)?;
     let mut query = connection.prepare(
-        "SELECT s.sync_id AS __wire_id,ps.* FROM item_stats ps JOIN item_store s USING(item_pid) WHERE s.sync_id<>0 ORDER BY s.sync_id",
+        "SELECT s.sync_id AS __wire_id,ps.* FROM item_stats ps JOIN item_store s USING(item_pid) JOIN item i USING(item_pid) WHERE s.sync_id<>0 ORDER BY s.sync_id",
     )?;
     let names: Vec<String> = query
         .column_names()

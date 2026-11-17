@@ -10,16 +10,17 @@
 //! may advance, an entry the phone added itself may have its state filled in,
 //! and an album artist, artist or genre whose representative has no cover of
 //! its own may move it to its lowest member with one. Every other typed row
-//! in all tables must be exact.
+//! in all tables must be exact, rows whose track is gone too; a later run's
+//! capture may show the phone's changes to those since (`stray_rows`).
 //!
 //! Only empty playlists qualify: deleting one with members leaves its media
 //! count row behind, so a Clear deletes its playlists after every
 //! track is gone. A playlist anything else refers to (members, a count row,
 //! child playlists, artwork, any other table's `container_pid`) refuses.
 use super::{
-    ANCHOR, BetweenRuns, GENERATION, HERO, LAST_SYNCED, Representative, Tables, decimal,
-    fill_phone_entries, phone_entry_file_note, playlists, property, property_changes,
-    recent_counter_resets, table, take_covered_moves,
+    ANCHOR, BetweenRuns, GENERATION, HERO, LAST_SYNCED, Representative, StrayRows, Tables,
+    absorb_stray_rows, decimal, fill_phone_entries, phone_entry_file_note, playlists, property,
+    property_changes, recent_counter_resets, stray_window, table, take_covered_moves,
 };
 use crate::catalogue::sqlite::tables::{Cell, Row, values as typed};
 use anyhow::{Context, Result, bail, ensure};
@@ -51,6 +52,11 @@ pub struct PlaylistDeletionReceipt {
     /// their lowest member with one (`take_covered_moves`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     covered_representatives: Vec<Representative>,
+    /// Rows whose track is gone that the phone deleted, added or changed
+    /// since the session, as a later run's capture showed them
+    /// (`absorb_stray_rows`).
+    #[serde(skip_serializing_if = "StrayRows::is_empty")]
+    stray_rows: StrayRows,
     /// What a later run's capture showed of the phone's use since the
     /// session (`verify_deletion_later`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,6 +66,9 @@ pub struct PlaylistDeletionReceipt {
 impl PlaylistDeletionReceipt {
     pub fn deleted(&self) -> usize {
         self.playlists.len()
+    }
+    pub fn stray_rows(&self) -> &StrayRows {
+        &self.stray_rows
     }
 }
 
@@ -279,6 +288,8 @@ fn verify_deletion_with(
         "playlist deletion hero revision progress differs"
     );
     let property_changes = property_changes(before, after, &mut expected)?;
+    // Before the caller's rule, whose statistics check counts rows by item.
+    let stray_rows = absorb_stray_rows(&mut expected, after, stray_window(between_runs))?;
     let between_runs_playback = match between_runs {
         Some(absorb) => absorb(&mut expected, after, highest)?,
         None => None,
@@ -301,6 +312,7 @@ fn verify_deletion_with(
         recent_counter_resets,
         filled_phone_entries,
         covered_representatives,
+        stray_rows,
         between_runs_playback,
     })
 }

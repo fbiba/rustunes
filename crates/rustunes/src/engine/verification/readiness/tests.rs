@@ -1,5 +1,7 @@
 use super::*;
-use music_protocol::catalogue::sqlite::ContainerRow;
+use music_protocol::catalogue::sqlite::{
+    COMPANION_TABLES, CompanionRows, ContainerRow, ItemRowCounts,
+};
 
 fn directory() -> Attributes {
     [("st_ifmt".into(), "S_IFDIR".into())].into_iter().collect()
@@ -20,7 +22,7 @@ pub(crate) fn fresh_library() -> LibraryState {
         db_info: None,
         media_anchor: None,
         synced_rows: SYNCED.map(|table| (table, 0)),
-        items: 0,
+        item_rows: item_rows(0, &[]),
         containers: vec![ContainerRow {
             container_pid: 5,
             sync_id: 0,
@@ -32,6 +34,32 @@ pub(crate) fn fresh_library() -> LibraryState {
     }
 }
 const SYNCED: [&str; 4] = music_protocol::catalogue::sqlite::SYNCED_TABLES;
+
+/// `items` tracks with their companion rows, changed by each `(table,
+/// missing, stray)`: that many tracks without a row in `table`, and that many
+/// rows in it whose track is gone. The tracks are numbered 1 to `items`, and
+/// the gone tracks follow them, one per stray row of the table with the most.
+fn item_rows(items: u64, changes: &[(&'static str, u64, u64)]) -> ItemRowCounts {
+    let gone = changes.iter().map(|(.., stray)| *stray).max().unwrap_or(0);
+    ItemRowCounts {
+        items,
+        companions: COMPANION_TABLES.map(|table| {
+            let (missing, stray) = changes
+                .iter()
+                .find(|(name, ..)| *name == table)
+                .map_or((0, 0), |(_, missing, stray)| (*missing, *stray));
+            CompanionRows {
+                table,
+                rows: items - missing + stray,
+                missing,
+                stray,
+            }
+        }),
+        stray_tracks: gone,
+        stray_pids: (gone != 0).then(|| (items as i64 + 1, (items + gone) as i64)),
+        highest_item_pid: (items != 0).then_some(items as i64),
+    }
+}
 
 fn synced_library() -> LibraryState {
     LibraryState {
@@ -414,4 +442,87 @@ fn the_report_lists_the_prefs_temporaries() {
         .unwrap();
     assert_eq!(listed["present"], true);
     assert_eq!(report["readiness"]["state"], "init_unfinished");
+}
+
+/// Rows the phone left for deleted tracks do not stop a sync; the report
+/// counts them per table.
+#[test]
+fn leftover_rows_from_deleted_tracks_leave_a_synced_phone_ready() {
+    let record = InitRecord::mint().unwrap();
+    let mut inspection = with_prefs(fresh(), &record);
+    inspection.library = Some(LibraryState {
+        item_rows: item_rows(12, &[("item_extra", 0, 1), ("item_state", 0, 2)]),
+        ..synced_library()
+    });
+    let readiness = inspection.readiness(Some(&record)).unwrap();
+    assert_eq!(readiness, Readiness::Synced { initialised: true });
+    let report = inspection.report(&readiness);
+    let rows = &report["database"]["companion_rows"];
+    assert_eq!(report["database"]["items"], 12);
+    assert_eq!(
+        rows["item_extra"],
+        json!({"rows": 13, "missing": 0, "stray": 1})
+    );
+    assert_eq!(
+        rows["item_state"],
+        json!({"rows": 14, "missing": 0, "stray": 2})
+    );
+    assert_eq!(
+        rows["item_store"],
+        json!({"rows": 12, "missing": 0, "stray": 0})
+    );
+    assert_eq!(
+        rows["item_stats"],
+        json!({"rows": 12, "missing": 0, "stray": 0})
+    );
+    assert_eq!(report["database"]["leftover_songs"], 2);
+    assert_eq!(report["database"]["songs_until_cleared"], 2);
+}
+
+/// A track without a companion row makes the catalogue refuse the library,
+/// so a synced phone holding one is not ready, and the reason gives the
+/// counts.
+#[test]
+fn a_track_without_a_companion_row_is_not_ready() {
+    let record = InitRecord::mint().unwrap();
+    let mut inspection = with_prefs(fresh(), &record);
+    inspection.library = Some(LibraryState {
+        item_rows: item_rows(12, &[("item_state", 3, 0), ("item_extra", 0, 1)]),
+        ..synced_library()
+    });
+    let reason = "3 of 12 tracks have no item_state row (item 12, item_extra 13, \
+                  item_store 12, item_stats 12, item_state 9; stray rows: item_extra 1)";
+    for (own, initialised) in [(Some(&record), true), (None, false)] {
+        assert_eq!(
+            inspection.readiness(own).unwrap(),
+            Readiness::Inconsistent {
+                initialised,
+                reason: reason.to_owned()
+            }
+        );
+    }
+    let readiness = inspection.readiness(Some(&record)).unwrap();
+    let report = inspection.report(&readiness);
+    assert_eq!(report["readiness"]["state"], "inconsistent");
+    assert_eq!(report["readiness"]["initialised_by_rustunes"], true);
+    assert_eq!(report["readiness"]["reason"], reason);
+    assert_eq!(
+        report["database"]["companion_rows"]["item_state"],
+        json!({"rows": 9, "missing": 3, "stray": 0})
+    );
+
+    // Not synced, it is one more reason the phone is unclear.
+    let mut unsynced = fresh();
+    unsynced.library = Some(LibraryState {
+        item_rows: item_rows(1, &[("item_store", 1, 0)]),
+        ..fresh_library()
+    });
+    let reasons = unclear(unsynced.readiness(None).unwrap());
+    assert_eq!(
+        reasons,
+        [
+            "the music library is inconsistent: 1 of 1 track has no item_store row (item 1, \
+          item_extra 1, item_store 0, item_stats 1, item_state 1; stray rows: none)"
+        ]
+    );
 }

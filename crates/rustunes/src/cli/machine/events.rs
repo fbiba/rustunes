@@ -463,6 +463,16 @@ fn observation(event: &Observation<'_>) -> Result<()> {
             line,
             json!({"user_version": version, "tested": music_protocol::catalogue::sqlite::TESTED_USER_VERSIONS}),
         ),
+        Observation::LeftoverItemRows(rows) => notice(
+            "leftover_item_rows",
+            Warning,
+            line,
+            json!({
+                "stray": rows.stray().map(|c| (c.table.to_owned(), json!(c.stray))).collect::<serde_json::Map<_, _>>(),
+                "songs": rows.stray_tracks,
+                "songs_until_cleared": rows.songs_until_cleared(),
+            }),
+        ),
         Observation::StateCaptureRetained(directory) => notice(
             "state_capture_retained",
             Info,

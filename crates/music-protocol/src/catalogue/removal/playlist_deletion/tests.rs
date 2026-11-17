@@ -251,6 +251,73 @@ fn a_later_run_hands_the_rest_to_the_callers_rule_above_the_tombstones() {
 }
 
 #[test]
+fn rows_whose_track_is_gone_stay_exact_in_the_deletions_run_and_may_change_between_runs() {
+    use crate::catalogue::removal::tests::stray_pids;
+    use crate::test_support::catalogue::{SANITIZED, STRAY_ROWS as STRAY};
+    let rule = |_: &mut Tables, _: &Tables, _: i64| Ok(None);
+    let both = format!("{PLAYLISTS} {STRAY}");
+    let pids =
+        |receipt: &PlaylistDeletionReceipt, name: &str| stray_pids(receipt.stray_rows(), name);
+    // Left alone, they are compared exactly in either window.
+    let pair = Pair::new(&both, DELETION);
+    let (before, after) = pair.tables();
+    assert!(
+        verify_deletion(&before, &after, &[88, 89], 10)
+            .unwrap()
+            .stray_rows()
+            .is_empty()
+    );
+    let receipt = verify_deletion_later(&before, &after, &[88, 89], 10, &rule).unwrap();
+    assert!(receipt.stray_rows().is_empty());
+
+    // The sanitize deletes them, but not in a session that transfers no file.
+    let pair = Pair::new(&both, &format!("{DELETION} {SANITIZED}"));
+    let (before, after) = pair.tables();
+    assert!(verify_deletion(&before, &after, &[88, 89], 10).is_err());
+    let receipt = verify_deletion_later(&before, &after, &[88, 89], 10, &rule).unwrap();
+    let gone = Some((BTreeSet::from([9]), BTreeSet::new(), BTreeSet::new()));
+    for name in ["item_extra", "item_store", "item_stats"] {
+        assert_eq!(pids(&receipt, name), gone, "{name}");
+    }
+
+    // Nothing deletes a stray item_state row.
+    let pair = Pair::new(
+        &both,
+        &format!("{DELETION} {SANITIZED} DELETE FROM item_state WHERE item_pid=9;"),
+    );
+    let (before, after) = pair.tables();
+    assert!(verify_deletion(&before, &after, &[88, 89], 10).is_err());
+    assert!(verify_deletion_later(&before, &after, &[88, 89], 10, &rule).is_err());
+
+    // A late write for a deleted track adds rows or changes them.
+    let pair = Pair::new(
+        &both,
+        &format!(
+            "{DELETION} INSERT OR REPLACE INTO item_extra(item_pid,location,file_size)VALUES(7,'X.m4a',5);
+            UPDATE item_stats SET date_accessed=2 WHERE item_pid=9;"
+        ),
+    );
+    let (before, after) = pair.tables();
+    assert!(verify_deletion(&before, &after, &[88, 89], 10).is_err());
+    let receipt = verify_deletion_later(&before, &after, &[88, 89], 10, &rule).unwrap();
+    let appeared = Some((BTreeSet::new(), BTreeSet::from([7]), BTreeSet::new()));
+    for name in ["item_extra", "item_state"] {
+        assert_eq!(pids(&receipt, name), appeared, "{name}");
+    }
+    assert_eq!(
+        pids(&receipt, "item_stats"),
+        Some((BTreeSet::new(), BTreeSet::new(), BTreeSet::from([9])))
+    );
+    // A track's own rows stay exact.
+    let pair = Pair::new(
+        &both,
+        &format!("{DELETION} {SANITIZED} DELETE FROM item_extra WHERE item_pid=2;"),
+    );
+    let (before, after) = pair.tables();
+    assert!(verify_deletion_later(&before, &after, &[88, 89], 10, &rule).is_err());
+}
+
+#[test]
 fn a_deletion_session_may_fill_in_the_state_of_an_entry_the_phone_added() {
     use crate::catalogue::removal::tests::{FILLED, PHONE_ENTRY};
     let pair = Pair::new(

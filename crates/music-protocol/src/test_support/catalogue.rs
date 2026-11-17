@@ -393,6 +393,20 @@ enum Shape {
     BuiltNew,
     Ios26,
 }
+/// For a `NativeFixture` state: rows of item 9, which has no track, as a
+/// property write for a deleted track leaves them (`INSERT OR REPLACE`
+/// naming a few columns); the fixture's triggers add item 9's item_state row.
+pub const STRAY_ROWS: &str = "INSERT OR REPLACE INTO item_extra(item_pid,location,file_size)VALUES(9,'T9.m4a',100);
+    INSERT OR REPLACE INTO item_store(item_pid,is_protected)VALUES(9,0);
+    INSERT OR REPLACE INTO item_stats(item_pid,needs_restore,download_identifier,date_accessed)VALUES(9,1,'d',1);";
+/// The phone's sanitize of `STRAY_ROWS`: every row of item 9 goes but its
+/// item_state row.
+pub const SANITIZED: &str = "DELETE FROM item_extra WHERE item_pid=9;
+    DELETE FROM item_store WHERE item_pid=9; DELETE FROM item_stats WHERE item_pid=9;";
+/// A write for track 1 after the `NativeFixture` after state lost it (issue
+/// #4's late write); the fixture's triggers add an item_state row too.
+pub const LATE_WRITE: &str =
+    "INSERT OR REPLACE INTO item_extra(item_pid,location,file_size)VALUES(1,'X.m4a',5);";
 /// A before/after database pair in the phone's exact native schema
 /// (`schema_fixture.json`; building it fails unless the database reproduces
 /// that schema exactly) with four synthetic tracks, the after state having

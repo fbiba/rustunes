@@ -1730,7 +1730,16 @@ const LATER_LISTENING: &str = "
 
 /// The title edit of track 2 with `extra` after it, read by a later run.
 fn later_title_edit(extra: &str) -> (World, Tables, Tables, Vec<TrackUpdate>) {
+    title_edit("", extra)
+}
+
+/// The title edit of track 2 in a library where `both` ran, with `extra`
+/// after it.
+fn title_edit(both: &str, extra: &str) -> (World, Tables, Tables, Vec<TrackUpdate>) {
     let world = World::new();
+    for path in [&world.fixture.before, &world.fixture.after] {
+        Connection::open(path).unwrap().execute_batch(both).unwrap();
+    }
     let before = world.before();
     let updates = vec![update(
         1002,
@@ -1878,6 +1887,54 @@ fn a_later_run_refuses_what_listening_does_not_explain_after_the_edit() {
             verify_later(&before, &after, &operation(&updates), ANCHOR_BEFORE).is_err(),
             "{sql}"
         );
+    }
+}
+
+#[test]
+fn rows_whose_track_is_gone_stay_exact_in_the_edits_run_and_may_change_between_runs() {
+    use music_protocol::test_support::catalogue::{SANITIZED, STRAY_ROWS};
+    let check = |extra: &str| {
+        let (_world, before, after, updates) = title_edit(STRAY_ROWS, extra);
+        let op = operation(&updates);
+        (
+            verify(&before, &after, &op, ANCHOR_BEFORE),
+            verify_later(&before, &after, &op, ANCHOR_BEFORE),
+        )
+    };
+    // Left alone, they are compared exactly in either window.
+    let (same, later) = check(LATER_LISTENING);
+    assert!(same.is_err());
+    assert!(later.unwrap().stray_rows().is_empty());
+    // The sanitize deletes them, but not in a session that transfers no file.
+    let (same, later) = check(SANITIZED);
+    let error = same.unwrap_err();
+    assert!(error.to_string().contains("item_store:"), "{error:#}");
+    let later = later.unwrap();
+    for table in ["item_extra", "item_store", "item_stats"] {
+        assert_eq!(
+            later.stray_rows().table(table).unwrap().vanished,
+            BTreeSet::from([9]),
+            "{table}"
+        );
+    }
+    // With listening: the later run's listening rule counts the tracks only.
+    let (_, later) = check(&format!("{SANITIZED}{LATER_LISTENING}"));
+    let receipt = serde_json::to_value(later.unwrap()).unwrap();
+    assert!(!receipt["stray_rows"].is_null());
+    assert_eq!(
+        receipt["between_runs_playback"]["completed_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // Nothing deletes a stray item_state row; a track's own rows stay exact.
+    for sql in [
+        "DELETE FROM item_state WHERE item_pid=9",
+        "DELETE FROM item_search WHERE item_pid=4",
+    ] {
+        let (_, later) = check(&format!("{SANITIZED}{LATER_LISTENING}{sql};"));
+        assert!(later.is_err(), "{sql}");
     }
 }
 

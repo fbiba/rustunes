@@ -319,7 +319,11 @@ impl Catalogue {
             ensure!(stored.insert(pid), "duplicate item_store identity");
             let sync = typed::int(store_table, row, "sync_id")?;
             if sync != 0 {
-                by_sync.entry(sync).or_default().push(pid);
+                // A row whose track is gone keeps its sync id taken but names
+                // no track.
+                if items.contains_key(&pid) {
+                    by_sync.entry(sync).or_default().push(pid);
+                }
                 used.insert(sync);
             }
         }

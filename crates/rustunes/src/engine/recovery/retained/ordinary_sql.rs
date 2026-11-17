@@ -10,6 +10,9 @@ use crate::{
     engine::verification::sql_tables::{Capture, reader},
 };
 use anyhow::{Context, Result, ensure};
+use music_protocol::catalogue::removal::{
+    STRAY_TABLES, StrayRows, absorb_stray_rows, replace_stray_rows,
+};
 use music_protocol::catalogue::sqlite::Catalog;
 use music_protocol::media::metadata::Metadata;
 use reader::{Budget, Cell, Row, Snapshot, Table, hex};
@@ -26,6 +29,8 @@ mod model;
 
 mod rows;
 use model::compare;
+#[cfg(test)]
+mod tests;
 
 /// A well-formed effect that needs an independent immediate-to-current proof.
 /// This error is never completion authority. Input, schema, I/O and control
@@ -101,6 +106,7 @@ struct Observed {
     integrity: Vec<u8>,
     recent_resets: Vec<serde_json::Value>,
     playback: Option<serde_json::Value>,
+    stray_rows: StrayRows,
 }
 /// Whether the full SQL model covers this insertion: an artless one that
 /// creates its album and artist, with no composer, compilation or rating,
@@ -235,6 +241,9 @@ pub(super) fn verify(
         if let Some(playback) = observed.playback {
             receipt["between_runs_playback"] = playback;
         }
+        if !observed.stray_rows.is_empty() {
+            receipt["stray_rows"] = serde_json::to_value(&observed.stray_rows)?;
+        }
         Ok(receipt)
     })();
     reader::recheck(&a, &budget)?;
@@ -355,9 +364,15 @@ fn allocation_facts(
         let n = decimal(props, k)?;
         ensure!(n > 0 && n <= maximum, "before revision property invalid");
     }
+    // The slot has no item row, so a row at it in a table beside item is
+    // one whose track is gone, which the new track's import replaces
+    // (`replace_stray_rows`). Every other reference refuses.
     for (name, t) in &a.tables {
         budget.check()?;
         for (j, key) in t.columns.iter().enumerate() {
+            if key == "item_pid" && STRAY_TABLES.contains(&name.as_str()) {
+                continue;
+            }
             if key.ends_with("_pid") || key == "genre_id" {
                 for r in t.rows.keys() {
                     if name == "entity_revision" && tombstone.as_ref() == Some(r) {
@@ -394,7 +409,6 @@ fn before_facts(
         maximum,
         generation,
     } = allocation_facts(a, w.database, w.primary, p.current_media_anchor, budget)?;
-    let live = a.table("item")?;
     let new_wire = [Some(p.content.track_pid), p.new_album_pid, p.new_artist_pid]
         .into_iter()
         .flatten()
@@ -421,32 +435,7 @@ fn before_facts(
             }
         }
     }
-    let (folder, file) = p
-        .content
-        .path
-        .rsplit_once('/')
-        .context("ordinary ALAC path absent")?;
-    let loc = a.table("base_location")?;
-    let base = int(
-        loc,
-        unique(loc, "path", Cell::Text(folder.into()))?,
-        "base_location_id",
-    )?;
-    let extra = a.table("item_extra")?;
-    for r in extra.rows.keys() {
-        if let Cell::Text(old) = extra.at(r, "location")?
-            && old.eq_ignore_ascii_case(file)
-        {
-            ensure!(
-                int(
-                    live,
-                    live.one("item_pid", int(extra, r, "item_pid")?)?,
-                    "base_location_id"
-                )? != base,
-                "ordinary ALAC destination occupied"
-            );
-        }
-    }
+    let base = destination(a, &p.content.path)?;
     let mut groups = Vec::new();
     for (table, key, label, wire, class, new) in [
         (
@@ -532,6 +521,33 @@ fn before_facts(
         base,
         groups,
     })
+}
+/// The `base_location_id` of `path`'s folder, which must hold no track's
+/// file of the same name (ASCII case aside). A row whose track is gone names
+/// no file of the library.
+fn destination(a: &Snapshot, path: &str) -> Result<i64> {
+    let (folder, file) = path.rsplit_once('/').context("ordinary ALAC path absent")?;
+    let loc = a.table("base_location")?;
+    let base = int(
+        loc,
+        unique(loc, "path", Cell::Text(folder.into()))?,
+        "base_location_id",
+    )?;
+    let live = a.table("item")?;
+    let extra = a.table("item_extra")?;
+    for r in extra.rows.keys() {
+        let id = int(extra, r, "item_pid")?;
+        if let Cell::Text(old) = extra.at(r, "location")?
+            && old.eq_ignore_ascii_case(file)
+            && !absent(live, "item_pid", Cell::Integer(id))?
+        {
+            ensure!(
+                int(live, live.one("item_pid", id)?, "base_location_id")? != base,
+                "ordinary ALAC destination occupied"
+            );
+        }
+    }
+    Ok(base)
 }
 fn same_label(a: &str, b: &str) -> bool {
     a == b || (a.is_ascii() && b.is_ascii() && a.eq_ignore_ascii_case(b))

@@ -16,8 +16,8 @@ impl Catalog {
     /// collected album's registration as an orphan or drops it. A removed
     /// track's cache ID leaves the namespace only when nothing else holds it
     /// (no cached object, no remaining registration) and `after` lacks it.
-    /// Identity, anchor, source hashes and the groups no sync made stay this
-    /// catalogue's own.
+    /// Identity, anchor, source hashes, the item row counts and the groups no
+    /// sync made stay this catalogue's own.
     pub fn without_tracks(&self, removed: &BTreeSet<u64>, after: &Catalog) -> Result<Catalog> {
         let tracks: Vec<_> = self
             .tracks
@@ -217,9 +217,11 @@ impl Catalog {
                 .filter(|id| kept(id))
                 .copied()
                 .collect(),
+            stray_sync_ids: self.stray_sync_ids.clone(),
             music_folders: self.music_folders.clone(),
             tracks,
             artwork,
+            item_rows: self.item_rows.clone(),
         })
     }
 }

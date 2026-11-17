@@ -355,6 +355,34 @@ pub(super) fn covered(result: &CoverResult) -> String {
     }
 }
 
+/// What `device check` and a command reading the catalogue say about rows
+/// the phone left for `songs` deleted tracks, in plain words; with
+/// `until_cleared`, about how many new songs take them over (the tables and
+/// counts go to the log and the JSON). It promises nothing about syncing:
+/// iOS's own repair of such rows can reset the sync anchor (docs/04 §4.6).
+pub(super) fn leftover_rows_line(songs: u64, until_cleared: Option<u64>) -> String {
+    let start = format!(
+        "Warning: your iPhone's music library has leftover entries from {}. They don't affect your music",
+        count(songs, "deleted song")
+    );
+    match until_cleared {
+        Some(n) => format!(
+            "{start}, and they clear up on their own after you add about {} more {}.",
+            n,
+            if n == 1 { "song" } else { "songs" }
+        ),
+        None => format!("{start}."),
+    }
+}
+
+/// "1 deleted song", "2 deleted songs".
+fn count(n: u64, noun: &str) -> String {
+    match n {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
+}
+
 pub(super) fn observation_line(event: &Observation<'_>) -> String {
     match event {
         Observation::CapturingCatalogue => "Copying the phone's Music catalogue".into(),
@@ -372,6 +400,9 @@ pub(super) fn observation_line(event: &Observation<'_>) -> String {
                 "The phone's Music database is version {version}, which rustunes has not been tested with (tested: {}); every table and column it reads is present",
                 tested.join(", ")
             )
+        }
+        Observation::LeftoverItemRows(rows) => {
+            leftover_rows_line(rows.stray_tracks, rows.songs_until_cleared())
         }
         Observation::RecapturingBeforeAudioIndex => "Catalogue changed before audio indexing; retaining failed attempt and recapturing once within the original deadline".into(),
         Observation::RecapturingAfterAudioIndex => "Catalogue changed during audio indexing; retaining failed attempt and recapturing once within the original deadline".into(),

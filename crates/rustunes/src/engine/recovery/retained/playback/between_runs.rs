@@ -8,7 +8,9 @@
 //! later listening counts up from zero. `absorb` proves that the observed
 //! playback tables differ from `expected` only by those effects, using the
 //! bridge's phone-observed rules, and then copies them into `expected`. Every
-//! other table is left for the caller's exact comparison. It grants no
+//! other table is left for the caller's exact comparison. Rows whose track is
+//! gone are left to the stray rule (`absorb_stray_rows`, as
+//! `Window::stray_rows` allows), which the caller applies first. It grants no
 //! transport, replay or journal transition.
 use super::*;
 
@@ -44,6 +46,17 @@ pub(crate) enum Window {
 impl Window {
     pub(crate) fn is_same_run(&self) -> bool {
         *self == Self::SameRun
+    }
+    /// What the phone may have done to rows whose track is gone, for a
+    /// write whose session transferred files (`transfers`: an insert) or
+    /// not. A later run's window takes it before `absorb`, whose statistics
+    /// check counts the rows of tracks in the library only.
+    pub(crate) fn stray_rows(self, transfers: bool) -> StrayWindow {
+        match (self, transfers) {
+            (Self::LaterRun, _) => StrayWindow::BetweenRuns,
+            (Self::SameRun, true) => StrayWindow::WithTransfers,
+            (Self::SameRun, false) => StrayWindow::WithoutTransfers,
+        }
     }
     /// Absorbs listening and housekeeping into `expected` for a later-run
     /// capture only. Returns `None` when nothing was absorbed.
@@ -311,18 +324,25 @@ pub(crate) fn catalogue_listening(
 }
 
 /// The ordinary play/skip rule, except that a positive recent counter may have
-/// been cleared by the write before the later events were counted.
+/// been cleared by the write before the later events were counted. Only the
+/// rows of tracks in the library (`items`) are counted; rows whose track is
+/// gone are the stray rule's (`absorb_stray_rows`), which the caller applies
+/// first, and must be equal here.
 fn statistics(
     a: &Table,
     b: &Table,
     items: &BTreeMap<i64, Row>,
     budget: &Budget,
 ) -> Result<(BTreeMap<i64, Played>, Vec<Value>)> {
-    let old = keyed(a, "item_pid")?;
-    let new = keyed(b, "item_pid")?;
+    let (old, old_gone) = by_track(a, items)?;
+    let (new, new_gone) = by_track(b, items)?;
     ensure!(
         old.keys().eq(new.keys()),
         "playback statistics membership changed"
+    );
+    ensure!(
+        old_gone == new_gone,
+        "playback statistics of tracks that are gone changed outside the stray rule"
     );
     let mut events = BTreeMap::new();
     let mut resets = Vec::new();
@@ -332,10 +352,6 @@ fn statistics(
         if before == after {
             continue;
         }
-        ensure!(
-            items.contains_key(pid),
-            "playback statistics reference a foreign item"
-        );
         exact_except(a, before, after, &FIELDS)?;
         let count = |t: &Table, r: &Row, field: &str| -> Result<i64> {
             let n = num(t, r, field)?;
@@ -410,6 +426,28 @@ fn statistics(
         }
     }
     Ok((events, resets))
+}
+
+/// `t`'s rows of tracks in `items`, by item, and its other rows.
+fn by_track(
+    t: &Table,
+    items: &BTreeMap<i64, Row>,
+) -> Result<(BTreeMap<i64, Row>, BTreeMap<Row, u32>)> {
+    let (mut own, mut gone) = (BTreeMap::new(), BTreeMap::new());
+    for (row, n) in &t.rows {
+        let side = if items.contains_key(&num(t, row, "item_pid")?) {
+            &mut own
+        } else {
+            &mut gone
+        };
+        side.insert(row.clone(), *n);
+    }
+    let own = Table {
+        columns: t.columns.clone(),
+        definitions: t.definitions.clone(),
+        rows: own,
+    };
+    Ok((keyed(&own, "item_pid")?, gone))
 }
 
 #[cfg(test)]

@@ -12,6 +12,9 @@ pub enum Observation<'a> {
     /// The phone's catalogue has a user_version rustunes was not tested
     /// with; every table and column it reads is present.
     UntestedCatalogueVersion(i64),
+    /// The phone's catalogue holds rows beside `item` whose track is gone;
+    /// the reader passes over them.
+    LeftoverItemRows(&'a music_protocol::catalogue::sqlite::ItemRowCounts),
     RecapturingBeforeAudioIndex,
     RecapturingAfterAudioIndex,
     FreshCatalogue {

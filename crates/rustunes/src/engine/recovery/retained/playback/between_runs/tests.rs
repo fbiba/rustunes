@@ -167,6 +167,38 @@ fn recent_counters_cleared_by_the_write_then_counted_again_are_absorbed() {
 }
 
 #[test]
+fn statistics_rows_whose_track_is_gone_are_left_to_the_stray_rule() {
+    // Items 7 and 8 have no track: since the write the phone's sanitize
+    // deleted item 7's statistics row and a late write added item 8's.
+    let (mut a, mut b) = cleared_then_played();
+    let stray = |pid| vec![i(pid), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0)];
+    a.get_mut("item_stats").unwrap().rows.insert(stray(7), 1);
+    b.get_mut("item_stats").unwrap().rows.insert(stray(8), 1);
+    // The listening rule counts the tracks in the library only.
+    let error = absorbed(&a, &b).unwrap_err();
+    assert!(error.to_string().contains("stray rule"), "{error:#}");
+    let mut expected = a.clone();
+    let taken = absorb_stray_rows(&mut expected, &b, Window::LaterRun.stray_rows(false)).unwrap();
+    let stats = taken.table("item_stats").unwrap();
+    assert_eq!(
+        (&stats.vanished, &stats.appeared),
+        (&BTreeSet::from([7]), &BTreeSet::from([8]))
+    );
+    let (expected, report) = absorbed(&expected, &b).unwrap();
+    assert_eq!(report.unwrap()["completed_events"][0]["item_pid"], 2);
+    assert_eq!(expected["item_stats"], b["item_stats"]);
+    // The run's own window takes none of them, or only the sweep's.
+    for (transfers, vanished) in [(false, None), (true, Some(BTreeSet::from([7])))] {
+        let mut expected = a.clone();
+        let window = Window::SameRun.stray_rows(transfers);
+        let taken = absorb_stray_rows(&mut expected, &b, window).unwrap();
+        let stats = taken.table("item_stats");
+        assert_eq!(stats.map(|s| s.vanished.clone()), vanished, "{window:?}");
+        assert!(stats.is_none_or(|s| s.appeared.is_empty()), "{window:?}");
+    }
+}
+
+#[test]
 fn a_cleared_recent_counter_alone_is_absorbed_without_an_event() {
     let (a, _) = native(fixture().0, fixture().0);
     let mut b = a.clone();

@@ -278,7 +278,9 @@ struct View<'a> {
     playback_dates: &'a BTreeMap<u64, PlaybackDates>,
     albums: &'a BTreeMap<i64, Album>,
     artists: &'a BTreeMap<i64, Artist>,
-    represented: &'a BTreeSet<u64>,
+    /// `Catalog::live_sync_ids`: the phone may sweep `item_store` rows whose
+    /// track is gone at the end of the session.
+    represented: BTreeSet<u64>,
     occupied: &'a BTreeSet<u32>,
     cached: &'a BTreeSet<u32>,
     cached_objects: &'a BTreeMap<(u32, i64), CachedArtwork>,
@@ -299,7 +301,7 @@ impl<'a> From<&'a Catalog> for View<'a> {
             playback_dates: catalog.playback_dates(),
             albums: catalog.albums(),
             artists: catalog.artists(),
-            represented: catalog.represented_sync_ids(),
+            represented: catalog.live_sync_ids(),
             occupied: catalog.artwork().occupied_cache_ids(),
             cached: catalog.artwork().cached_ids(),
             cached_objects: catalog.artwork().cached_objects(),
@@ -1131,6 +1133,22 @@ mod tests {
             let (before, after) =
                 real_transition(old, &format!("{reset}UPDATE item_stats SET {change};"));
             assert!(verify(&before, &after, u64::MAX, 100).is_err(), "{change}");
+        }
+    }
+    /// The sweep that ends a session with file transfers may delete an
+    /// `item_store` row whose track is gone, sync id and all: no mapped
+    /// identity changed.
+    #[test]
+    fn a_swept_store_row_whose_track_is_gone_is_no_changed_identity() {
+        for id in [77, 0] {
+            let stray = format!(
+                "INSERT INTO item_store VALUES(9,{id}); INSERT INTO item_stats(item_pid) VALUES(9);"
+            );
+            for after_stats in [stray.as_str(), ""] {
+                let (before, after) = real_transition(&stray, after_stats);
+                assert_eq!(before.represented_sync_ids().contains(&77), id == 77);
+                verify(&before, &after, u64::MAX, 100).unwrap();
+            }
         }
     }
     #[test]

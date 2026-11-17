@@ -37,7 +37,10 @@ pub struct LibraryState {
     pub media_anchor: Option<String>,
     /// Rows with `sync_id != 0`, per `SYNCED_TABLES` entry.
     pub synced_rows: [(&'static str, u64); 4],
-    pub items: u64,
+    /// `item`'s rows and its companion tables', as the catalogue counts
+    /// them: a track without a companion row makes the catalogue refuse
+    /// the library.
+    pub item_rows: ItemRowCounts,
     pub containers: Vec<ContainerRow>,
 }
 
@@ -132,7 +135,7 @@ fn query(connection: &Connection) -> Result<LibraryState> {
     for (table, rows) in &mut synced_rows {
         *rows = count(&format!("SELECT count(*) FROM {table} WHERE sync_id != 0"))?;
     }
-    let items = count("SELECT count(*) FROM item")?;
+    let item_rows = ItemRowCounts::read(connection, None)?;
     let mut statement = connection.prepare(
         "SELECT container_pid,sync_id,name,is_hidden,distinguished_kind,smart_criteria IS NOT NULL \
          FROM container ORDER BY container_pid LIMIT ?1",
@@ -161,7 +164,7 @@ fn query(connection: &Connection) -> Result<LibraryState> {
         db_info,
         media_anchor,
         synced_rows,
-        items,
+        item_rows,
         containers,
     })
 }
@@ -212,7 +215,7 @@ mod tests {
         assert_eq!(state.db_info_rows, 0);
         assert_eq!(state.db_info, None);
         assert_eq!(state.media_anchor, None);
-        assert_eq!(state.items, 0);
+        assert_eq!(state.item_rows.items, 0);
         assert_eq!(state.synced_row_total(), 0);
         assert_eq!(
             state.containers,

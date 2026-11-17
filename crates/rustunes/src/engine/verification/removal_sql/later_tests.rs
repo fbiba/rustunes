@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use music_protocol::catalogue::removal::RemovalReceipt;
+use music_protocol::test_support::catalogue::{LATE_WRITE, SANITIZED, STRAY_ROWS};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
@@ -131,6 +132,74 @@ fn a_later_run_refuses_what_listening_does_not_explain() {
     }
 }
 
+/// Item pids of the rows whose track is gone that `receipt` took from
+/// `table`, under `kind` (vanished, appeared, changed).
+fn stray(receipt: &serde_json::Value, table: &str, kind: &str) -> Vec<i64> {
+    receipt["stray_rows"][table][kind]
+        .as_array()
+        .map(|pids| pids.iter().map(|p| p.as_i64().unwrap()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_later_run_takes_the_phones_changes_to_rows_whose_track_is_gone() {
+    // Item 9's rows were there before the removal and the phone's sanitize
+    // deleted all but its item_state row since, while it was played: the
+    // statistics rule sees only the tracks in the library.
+    let both = format!("{CLOCK}{STRAY_ROWS}");
+    let (_f, before, after) = pair(&both, &format!("{SANITIZED}{LISTENING}"), false);
+    assert!(verify(&before, &after, &[1], 10).is_err());
+    let receipt = serde_json::to_value(later(&before, &after).unwrap()).unwrap();
+    for table in ["item_extra", "item_store", "item_stats"] {
+        assert_eq!(stray(&receipt, table, "vanished"), [9], "{table}");
+    }
+    assert!(receipt["stray_rows"]["item_state"].is_null());
+    assert_eq!(
+        receipt["between_runs_playback"]["completed_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // Without the sanitize the rows are compared exactly, and none is taken.
+    let (_f, before, after) = pair(&both, LISTENING, false);
+    let receipt = serde_json::to_value(later(&before, &after).unwrap()).unwrap();
+    assert!(receipt["stray_rows"].is_null());
+
+    // A write for the removed target after the session (issue #4).
+    let (_f, before, after) = pair(CLOCK, &format!("{LATE_WRITE}{LISTENING}"), false);
+    assert!(verify(&before, &after, &[1], 10).is_err());
+    let receipt = serde_json::to_value(later(&before, &after).unwrap()).unwrap();
+    for table in ["item_extra", "item_state"] {
+        assert_eq!(stray(&receipt, table, "appeared"), [1], "{table}");
+    }
+    // A later write over item 9's statistics row, which is no listening.
+    let (_f, before, after) = pair(
+        &both,
+        &format!(
+            "{LISTENING}UPDATE item_stats SET date_accessed=2,play_count_user=7 WHERE item_pid=9;"
+        ),
+        false,
+    );
+    let receipt = serde_json::to_value(later(&before, &after).unwrap()).unwrap();
+    assert_eq!(stray(&receipt, "item_stats", "changed"), [9]);
+}
+
+#[test]
+fn a_later_run_refuses_a_stray_item_state_row_gone_or_a_tracks_row_hidden() {
+    let both = format!("{CLOCK}{STRAY_ROWS}");
+    for sql in [
+        // Nothing deletes a stray item_state row.
+        "DELETE FROM item_state WHERE item_pid=9",
+        // A survivor's own statistics row is not a stray row.
+        "DELETE FROM item_stats WHERE item_pid=4",
+        "UPDATE item_extra SET location='X.m4a' WHERE item_pid=3",
+    ] {
+        let (_f, before, after) = pair(&both, &format!("{SANITIZED}{LISTENING}{sql};"), false);
+        assert!(later(&before, &after).is_err(), "{sql}");
+    }
+}
+
 /// Library container -3 and the empty ordinary playlists 88 and 89; last
 /// synced is 8.
 const PLAYLISTS: &str = "INSERT INTO container(container_pid,name,is_hidden)VALUES(-3,'Library',1);
@@ -164,5 +233,14 @@ fn a_later_run_absorbs_listening_after_a_playlist_deletion() {
     let wrong =
         format!("{DELETION_THEN_PLAY}UPDATE item_stats SET user_rating=80 WHERE item_pid=2;");
     let (_f, before, after) = pair(PLAYLISTS, &wrong, true);
+    assert!(verify_deletion_later(&before, &after, &[88, 89], 10, &rule).is_err());
+    // The phone's sanitize since the deletion, with the play.
+    let both = format!("{PLAYLISTS}{STRAY_ROWS}");
+    let (_f, before, after) = pair(&both, &format!("{DELETION_THEN_PLAY}{SANITIZED}"), true);
+    let receipt = verify_deletion_later(&before, &after, &[88, 89], 10, &rule).unwrap();
+    let receipt = serde_json::to_value(receipt).unwrap();
+    assert_eq!(stray(&receipt, "item_stats", "vanished"), [9]);
+    let gone = format!("{DELETION_THEN_PLAY}{SANITIZED}DELETE FROM item_state WHERE item_pid=9;");
+    let (_f, before, after) = pair(&both, &gone, true);
     assert!(verify_deletion_later(&before, &after, &[88, 89], 10, &rule).is_err());
 }

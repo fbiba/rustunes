@@ -11,6 +11,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, ensure};
+use music_protocol::catalogue::removal::{StrayRows, StrayWindow, absorb_stray_rows};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -85,7 +86,8 @@ pub(super) fn verify(
         "media_anchor":fresh.catalog.persisted_media_anchor(),
         "database_pid":fresh.catalog.database_pid(),"primary_container_pid":fresh.catalog.primary_container_pid(),
         "schema_sha256":old.schema_hash()?,"table_count":45,"changes":changes,
-        "full_delta_sha256":reader::hex(&delta_sha),"nonplayback_sql_exact":true,
+        "full_delta_sha256":reader::hex(&delta_sha),
+        "nonplayback_sql_exact":changes["stray_rows"].is_null(),
         "prefs_cdb_raw_artwork_exact":true,"new_media_revision":false,
         "fresh_playback_equal_to_pre_import_claimed":false,
         "history_and_completed_play_counters_validated_independently":true,
@@ -212,7 +214,14 @@ pub(super) fn verify_ordinary(
         }
     };
     control.check()?;
-    let nonplayback_exact = changes["maintenance_task_operation_date"].is_null();
+    let mut nonplayback_except = Vec::new();
+    if !changes["maintenance_task_operation_date"].is_null() {
+        nonplayback_except.push("_MLDatabaseProperties.MLMaintenanceTaskOperationDate");
+    }
+    if !changes["stray_rows"].is_null() {
+        nonplayback_except.push("stray_rows");
+    }
+    let nonplayback_exact = nonplayback_except.is_empty();
     let receipt = json!({
         "schema":"rustunes.ordinary-recovery-playback-bridge",
         "device_sha256":reader::hex(&fresh.identity.device_digest()),
@@ -224,9 +233,7 @@ pub(super) fn verify_ordinary(
         "database_pid":fresh.catalog.database_pid(),"primary_container_pid":fresh.catalog.primary_container_pid(),
         "schema_sha256":old.schema_hash()?,"table_count":45,"changes":changes,
         "full_delta_sha256":reader::hex(&delta_sha),"nonplayback_sql_exact":nonplayback_exact,
-        "nonplayback_sql_exact_except":if nonplayback_exact { Vec::<&str>::new() } else {
-            vec!["_MLDatabaseProperties.MLMaintenanceTaskOperationDate"]
-        },
+        "nonplayback_sql_exact_except":nonplayback_except,
         "prefs_and_cdb_exact":true,
         "raw_artwork_comparison":ordinary_raw_artwork_comparison(immediate, fresh)?,
         "all_managed_physical_preservation_still_required":true,
@@ -285,8 +292,10 @@ fn materialize_profile(
 
 /// SQL evidence only. The caller must separately prove the original write,
 /// Current scope, physical files and original transcript before any completion.
-/// Completed plays and skips, Playback History, revision housekeeping and the
-/// maintenance clock are the only accepted differences; no authority follows.
+/// Completed plays and skips, Playback History, revision housekeeping, the
+/// maintenance clock and what the phone did to rows whose track is gone
+/// between the write's run and the later one (`StrayWindow::BetweenRuns`)
+/// are the only accepted differences; no authority follows.
 /// It builds no `item_state` row, so a database built new is read too.
 pub(super) fn verify_views(a: &Snapshot, b: &Snapshot, budget: &Budget) -> Result<Value> {
     budget.check()?;
@@ -302,13 +311,16 @@ pub(super) fn verify_views(a: &Snapshot, b: &Snapshot, budget: &Budget) -> Resul
 /// above every revision `a` holds and drop the statistics revisions that renumbering
 /// supersedes (observed on iOS 27.2, seconds after an insert batch). Those are
 /// the only accepted differences: no listening, and every other row of every
-/// table must be exact. Returns the revision changes; no authority follows.
-/// A database built new (`layout_observed`) is read as a migrated one.
+/// table must be exact, except that the sweep ending the import's session,
+/// which transferred files, may delete rows whose track is gone
+/// (`StrayWindow::WithTransfers`). Returns what was accepted; no authority
+/// follows. A database built new (`layout_observed`) is read as a migrated
+/// one.
 pub(crate) fn verify_revision_housekeeping(
     a: &Snapshot,
     b: &Snapshot,
     budget: &Budget,
-) -> Result<Vec<Value>> {
+) -> Result<Housekeeping> {
     budget.check()?;
     ensure!(
         a.layout_observed()? && b.version == a.version && a.schema == b.schema,
@@ -317,13 +329,24 @@ pub(crate) fn verify_revision_housekeeping(
     revision_housekeeping(&a.tables, &b.tables, budget)
 }
 
+/// What `verify_revision_housekeeping` accepted.
+#[derive(Debug)]
+pub(crate) struct Housekeeping {
+    /// The revision changes (`check_revisions`).
+    pub(crate) revisions: Vec<Value>,
+    /// The rows whose track is gone that the sweep deleted.
+    pub(crate) stray_rows: StrayRows,
+}
+
 fn revision_housekeeping(
     a: &BTreeMap<String, Table>,
     b: &BTreeMap<String, Table>,
     budget: &Budget,
-) -> Result<Vec<Value>> {
+) -> Result<Housekeeping> {
     ensure!(a.keys().eq(b.keys()), "the catalogue's tables differ");
-    for (name, old) in a {
+    let mut expected = a.clone();
+    let stray_rows = absorb_stray_rows(&mut expected, b, StrayWindow::WithTransfers)?;
+    for (name, old) in &expected {
         budget.check()?;
         let new = &b[name];
         ensure!(
@@ -335,7 +358,10 @@ fn revision_housekeeping(
             "the catalogue changed in {name}"
         );
     }
-    housekeeping_revisions(a, b, budget)
+    Ok(Housekeeping {
+        revisions: housekeeping_revisions(a, b, budget)?,
+        stray_rows,
+    })
 }
 
 /// Absorbs into `expected`, a model of a run's own write, the phone's
@@ -431,6 +457,11 @@ fn verify_tables(
     budget: &Budget,
 ) -> Result<Value> {
     ensure!(a.keys().eq(b.keys()), "playback bridge tables differ");
+    // The immediate capture is the write's own run's, the fresh one a later
+    // run's.
+    let mut a = a.clone();
+    let stray_rows = absorb_stray_rows(&mut a, b, StrayWindow::BetweenRuns)?;
+    let a = &a;
     let mut maintenance = None;
     for (name, old) in a {
         budget.check()?;
@@ -480,10 +511,12 @@ fn verify_tables(
         budget,
     )?;
     let events = stats.values().collect::<Vec<_>>();
-    Ok(
-        json!({"completed_events":events,"playback_history":history.report,
-        "entity_revisions":revisions,"maintenance_task_operation_date":maintenance}),
-    )
+    let mut changes = json!({"completed_events":events,"playback_history":history.report,
+        "entity_revisions":revisions,"maintenance_task_operation_date":maintenance});
+    if !stray_rows.is_empty() {
+        changes["stray_rows"] = serde_json::to_value(&stray_rows)?;
+    }
+    Ok(changes)
 }
 
 fn keyed(t: &Table, key: &str) -> Result<BTreeMap<i64, Row>> {

@@ -45,6 +45,9 @@
 //!   hold that renumbering of every live item and those superseded
 //!   statistics revisions too, but no listening (seen when the phone
 //!   renumbered its library during an edit's run).
+//! * Rows whose track is gone stay exact in the run's own capture, as the
+//!   session transfers no file; a later run's may show the phone's changes
+//!   to them since (`absorb_stray_rows`).
 //! * An album the edit leaves alone that is still at keep_local_status 0 (an
 //!   insert batch killed before its session ended leaves its new album so)
 //!   may be evaluated: status 2, every other cell equal, its live revision
@@ -63,7 +66,10 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use music_protocol::catalogue::{
     metadata_edit::decode,
-    removal::{covered_items, fill_phone_entries, moves_to_covered, phone_entry_file_note},
+    removal::{
+        StrayRows, absorb_stray_rows, covered_items, fill_phone_entries, moves_to_covered,
+        phone_entry_file_note,
+    },
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -132,6 +138,11 @@ pub(crate) struct MetadataEditReceipt {
     /// their group's lowest member with one (`moves_to_covered`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     covered_representatives: Vec<RepresentativeMove>,
+    /// Rows whose track is gone that the phone deleted, added or changed
+    /// since the session, as a later run's capture showed them
+    /// (`absorb_stray_rows`).
+    #[serde(skip_serializing_if = "StrayRows::is_empty")]
+    stray_rows: StrayRows,
     /// What a later run's capture showed of the phone's use since the
     /// session (`verify_later`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +164,10 @@ impl MetadataEditReceipt {
     #[cfg(test)]
     pub(crate) fn highest_revision(&self) -> i64 {
         self.highest_revision
+    }
+    #[cfg(test)]
+    pub(crate) fn stray_rows(&self) -> &StrayRows {
+        &self.stray_rows
     }
 }
 
@@ -1351,6 +1366,9 @@ fn model_session(
         &Budget::new(),
     )?;
     let filled_phone_entries = fill_phone_entries(before, after, &mut model.expected)?;
+    // An edit transfers no file. Before the playback rule, whose statistics
+    // check counts the rows of tracks in the library only.
+    let stray_rows = absorb_stray_rows(&mut model.expected, after, window.stray_rows(false))?;
     // The session's own block is above every earlier revision, so the
     // phone's renumbering since lies above the model's highest revision.
     let between_runs_playback = window.absorb(&mut model.expected, after, &Budget::new())?;
@@ -1399,6 +1417,7 @@ fn model_session(
         keep_local_evaluations,
         filled_phone_entries,
         covered_representatives,
+        stray_rows,
         between_runs_playback,
         run_housekeeping,
     })

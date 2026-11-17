@@ -83,7 +83,7 @@ pub(crate) fn verify_groups_and_artwork(before: &Catalog, after: &Catalog) -> Re
     ensure!(
         before.albums() == after.albums()
             && before.artists() == after.artists()
-            && before.represented_sync_ids() == after.represented_sync_ids(),
+            && before.live_sync_ids() == after.live_sync_ids(),
         "metadata update changed mapped collection identities or rows"
     );
     verify_artwork_preserved(before, after)

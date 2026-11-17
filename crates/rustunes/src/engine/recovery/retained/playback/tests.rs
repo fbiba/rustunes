@@ -564,8 +564,13 @@ fn housekeeping_fixture() -> (BTreeMap<String, Table>, BTreeMap<String, Table>) 
 #[test]
 fn revision_housekeeping_accepts_renumbered_live_items_and_superseded_stats() {
     let (a, b) = housekeeping_fixture();
-    let changes = revision_housekeeping(&a, &b, &Budget::new()).unwrap();
-    let meanings: Vec<_> = changes.iter().map(|c| c["meaning"].clone()).collect();
+    let accepted = revision_housekeeping(&a, &b, &Budget::new()).unwrap();
+    assert!(accepted.stray_rows.is_empty());
+    let meanings: Vec<_> = accepted
+        .revisions
+        .iter()
+        .map(|c| c["meaning"].clone())
+        .collect();
     assert_eq!(
         meanings,
         [
@@ -577,6 +582,7 @@ fn revision_housekeeping_accepts_renumbered_live_items_and_superseded_stats() {
     assert!(
         revision_housekeeping(&a, &a, &Budget::new())
             .unwrap()
+            .revisions
             .is_empty()
     );
 }
@@ -633,6 +639,146 @@ fn revision_housekeeping_refuses_listening_and_every_other_change() {
             "case {invalid}"
         );
     }
+}
+
+/// A statistics row of `pid` at its defaults, in the fixtures' columns.
+fn stats_row(pid: i64) -> Row {
+    vec![i(pid), i(0), i(0), i(0), i(0), i(0), i(0), i(0), i(0)]
+}
+
+/// `rows` of `table`, keyed by item, added to `tables`, columns `item_pid`
+/// and `location`.
+fn add_located(tables: &mut BTreeMap<String, Table>, name: &str, rows: &[(i64, &str)]) {
+    let t = tables
+        .entry(name.into())
+        .or_insert_with(|| table(&["item_pid", "location"], Vec::new()));
+    for (pid, location) in rows {
+        t.rows.insert(vec![i(*pid), s(location)], 1);
+    }
+}
+
+#[test]
+fn revision_housekeeping_takes_the_sweep_of_rows_whose_track_is_gone() {
+    // Item 7 has no track: the sweep ending the import's session deletes
+    // its statistics row.
+    let (mut a, mut b) = housekeeping_fixture();
+    a.get_mut("item_stats")
+        .unwrap()
+        .rows
+        .insert(stats_row(7), 1);
+    for tables in [&mut a, &mut b] {
+        add_located(
+            tables,
+            "item_extra",
+            &[(1, "one"), (2, "two"), (7, "seven")],
+        );
+    }
+    let accepted = revision_housekeeping(&a, &b, &Budget::new()).unwrap();
+    assert_eq!(accepted.revisions.len(), 3);
+    assert_eq!(
+        accepted.stray_rows.table("item_stats").unwrap().vanished,
+        BTreeSet::from([7])
+    );
+    assert!(accepted.stray_rows.table("item_extra").is_none());
+    // Nothing else of such rows changes in a run: not item_extra's (the
+    // sanitize's), and none appears or changes (a later write).
+    for case in 0..3 {
+        let (mut a, mut b) = (a.clone(), b.clone());
+        match case {
+            0 => {
+                b.get_mut("item_extra")
+                    .unwrap()
+                    .rows
+                    .remove(&vec![i(7), s("seven")]);
+            }
+            1 => {
+                b.get_mut("item_stats")
+                    .unwrap()
+                    .rows
+                    .insert(stats_row(8), 1);
+            }
+            _ => {
+                a.get_mut("item_extra")
+                    .unwrap()
+                    .rows
+                    .remove(&vec![i(7), s("seven")]);
+                add_located(&mut a, "item_extra", &[(7, "changed")]);
+            }
+        }
+        assert!(
+            revision_housekeeping(&a, &b, &Budget::new()).is_err(),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn the_bridge_takes_what_the_phone_did_to_rows_whose_track_is_gone_between_runs() {
+    // Items 7 and 8 have no track. Between the write's run and the later
+    // one, the phone's sanitize deleted item 7's rows but its item_state
+    // row, and a late write added item 8's.
+    let (mut a, mut b) = fixture();
+    a.get_mut("item_stats")
+        .unwrap()
+        .rows
+        .insert(stats_row(7), 1);
+    add_located(
+        &mut a,
+        "item_extra",
+        &[(1, "one"), (2, "two"), (7, "seven")],
+    );
+    add_located(
+        &mut b,
+        "item_extra",
+        &[(1, "one"), (2, "two"), (8, "eight")],
+    );
+    add_located(
+        &mut a,
+        "item_state",
+        &[(1, "one"), (2, "two"), (7, "seven")],
+    );
+    add_located(
+        &mut b,
+        "item_state",
+        &[(1, "one"), (2, "two"), (7, "seven"), (8, "eight")],
+    );
+    let proof = verify_tables(&a, &b, &Budget::new()).unwrap();
+    assert_eq!(proof["completed_events"][0]["item_pid"], 1);
+    let strays = &proof["stray_rows"];
+    assert_eq!(strays["item_extra"], json!({"vanished":[7],"appeared":[8]}));
+    assert_eq!(strays["item_stats"], json!({"vanished":[7]}));
+    assert_eq!(strays["item_state"], json!({"appeared":[8]}));
+    // Nothing deletes a stray item_state row, and a track's own rows stay
+    // exact.
+    for case in 0..3 {
+        let mut b = b.clone();
+        match case {
+            0 => {
+                b.get_mut("item_state")
+                    .unwrap()
+                    .rows
+                    .remove(&vec![i(7), s("seven")]);
+            }
+            1 => {
+                b.get_mut("item_extra")
+                    .unwrap()
+                    .rows
+                    .remove(&vec![i(2), s("two")]);
+            }
+            _ => {
+                let t = b.get_mut("item_stats").unwrap();
+                let row = t.one("item_pid", 2).unwrap().clone();
+                t.rows.remove(&row);
+            }
+        }
+        assert!(
+            verify_tables(&a, &b, &Budget::new()).is_err(),
+            "case {case}"
+        );
+    }
+    // Without them the bridge reports none.
+    let (a, b) = fixture();
+    assert!(verify_tables(&a, &b, &Budget::new()).unwrap()["stray_rows"].is_null());
 }
 
 #[test]
@@ -822,6 +968,7 @@ fn full_table_comparisons_read_a_database_built_new_or_on_ios_26() {
         assert!(
             verify_revision_housekeeping(&a, &b, &Budget::new())
                 .unwrap()
+                .revisions
                 .is_empty()
         );
         verify_views(&a, &b, &Budget::new()).unwrap();
@@ -846,7 +993,7 @@ fn full_table_comparisons_read_a_database_built_new_or_on_ios_26() {
             let result = verify_revision_housekeeping(&a, &later, &Budget::new());
             match renumbered {
                 Some(count) => {
-                    let changes = result.unwrap();
+                    let changes = result.unwrap().revisions;
                     assert_eq!(changes.len(), count, "{sql}");
                     assert!(
                         changes

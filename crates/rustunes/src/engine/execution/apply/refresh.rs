@@ -133,7 +133,12 @@ fn ensure_catalog(before: &Catalog, fresh: &Catalog) -> Result<()> {
             && before.composers() == fresh.composers()
             && before.track_composers() == fresh.track_composers()
             && before.stats_except_recent_play() == fresh.stats_except_recent_play()
-            && before.represented_sync_ids() == fresh.represented_sync_ids(),
+            // The phone may delete an `item_store` row whose track is gone;
+            // no identity the plan avoided may appear.
+            && before.live_sync_ids() == fresh.live_sync_ids()
+            && fresh
+                .represented_sync_ids()
+                .is_subset(before.represented_sync_ids()),
         "refresh changed the frozen catalogue planning basis"
     );
     for track in before.tracks() {

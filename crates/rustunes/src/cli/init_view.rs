@@ -154,7 +154,10 @@ pub(super) fn check(report: &Value, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
-    let mut out = std::io::stdout().lock();
+    show_check(report, &mut std::io::stdout().lock())
+}
+
+fn show_check(report: &Value, out: &mut impl Write) -> Result<()> {
     let device = &report["device"];
     writeln!(
         out,
@@ -210,6 +213,16 @@ pub(super) fn check(report: &Value, json: bool) -> Result<()> {
             database["media_anchor"].as_str().unwrap_or("absent"),
             database["playlists"],
         )?;
+        if let Some(songs) = database["leftover_songs"].as_u64().filter(|n| *n != 0) {
+            writeln!(
+                out,
+                "{}",
+                super::progress::leftover_rows_line(
+                    songs,
+                    database["songs_until_cleared"].as_u64()
+                )
+            )?;
+        }
     }
     let readiness = &report["readiness"];
     let verdict = match readiness["state"].as_str() {
@@ -217,6 +230,10 @@ pub(super) fn check(report: &Value, json: bool) -> Result<()> {
             "initialised by rustunes; ready to sync".to_owned()
         }
         Some("synced") => "synced with a music library; ready to sync".to_owned(),
+        Some("inconsistent") => format!(
+            "not ready: the music library is inconsistent, and rustunes will not read it: {}",
+            readiness["reason"].as_str().unwrap_or("?")
+        ),
         Some("never_synced") => {
             "never synced with a music library. Run rustunes init to prepare it".to_owned()
         }
@@ -237,3 +254,6 @@ pub(super) fn check(report: &Value, json: bool) -> Result<()> {
     writeln!(out, "Verdict: {verdict}")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

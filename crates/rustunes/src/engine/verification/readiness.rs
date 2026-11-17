@@ -97,6 +97,10 @@ pub(crate) enum Readiness {
     /// syncs it. `initialised` says the library is the one `rustunes init`
     /// created from this state directory.
     Synced { initialised: bool },
+    /// As `Synced`, but some track lacks a row in a table beside `item`, and
+    /// the catalogue refuses such a library. `reason` names the tables and
+    /// the counts.
+    Inconsistent { initialised: bool, reason: String },
     /// No computer has synced the phone: `rustunes init` prepares it.
     NeverSynced,
     /// `rustunes init` began writing its prefs, but its first session did not
@@ -173,10 +177,20 @@ impl Inspection {
             library.db_info_rows == 1 && library.media_anchor.as_deref().is_some_and(|a| a != "0")
         });
         let library_fresh = self.library.as_ref().is_none_or(LibraryState::never_synced);
+        let inconsistency = self
+            .library
+            .as_ref()
+            .and_then(|library| library.item_rows.inconsistency());
         let mut reasons = Vec::new();
         match &self.prefs {
             Prefs::Valid { .. } if library_synced => {
-                return Ok(Readiness::Synced { initialised: own });
+                return Ok(match inconsistency {
+                    Some(reason) => Readiness::Inconsistent {
+                        initialised: own,
+                        reason,
+                    },
+                    None => Readiness::Synced { initialised: own },
+                });
             }
             Prefs::Valid { .. } if own && library_fresh => {}
             Prefs::Valid { .. } if library_fresh => reasons.push(
@@ -200,6 +214,11 @@ impl Inspection {
                 "the database records a sync, but the phone holds no library identity".to_owned(),
             ),
             Prefs::Absent => {}
+        }
+        if let Some(inconsistency) = inconsistency {
+            reasons.push(format!(
+                "the music library is inconsistent: {inconsistency}"
+            ));
         }
         for path in [device_files::CDB, device_files::ARTWORK_DB] {
             if self.present(path) && !library_synced {
@@ -272,7 +291,10 @@ impl Inspection {
         let library = self.library.as_ref().map(|library| {
             json!({
                 "user_version": library.user_version,
-                "items": library.items,
+                "items": library.item_rows.items,
+                "companion_rows": library.item_rows.companions.iter().map(|c| (c.table.to_owned(), json!({"rows": c.rows, "missing": c.missing, "stray": c.stray}))).collect::<serde_json::Map<_, _>>(),
+                "leftover_songs": library.item_rows.stray_tracks,
+                "songs_until_cleared": library.item_rows.songs_until_cleared(),
                 "synced_rows": library.synced_rows.iter().map(|(table, rows)| (table.to_string(), json!(rows))).collect::<serde_json::Map<_, _>>(),
                 "db_info_rows": library.db_info_rows,
                 "media_anchor": library.media_anchor,
@@ -294,6 +316,7 @@ impl Inspection {
             "database": library,
             "readiness": match readiness {
                 Readiness::Synced { initialised } => json!({"state": "synced", "initialised_by_rustunes": initialised}),
+                Readiness::Inconsistent { initialised, reason } => json!({"state": "inconsistent", "initialised_by_rustunes": initialised, "reason": reason}),
                 Readiness::NeverSynced => json!({"state": "never_synced"}),
                 Readiness::InitUnfinished => json!({"state": "init_unfinished"}),
                 Readiness::Unclear(reasons) => json!({"state": "unclear", "reasons": reasons}),

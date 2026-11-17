@@ -25,7 +25,9 @@
 //! ordinary playlists go, and those playlists close up (`playlists`); any
 //! ordinary playlist not yet evaluated for keeping local may be evaluated in
 //! the session. An entry the phone added itself, which no sync made, may have
-//! its state filled in as a synced track's (`fill_phone_entries`). A mismatch
+//! its state filled in as a synced track's (`fill_phone_entries`). Rows whose
+//! track is gone stay exact in the session's own run; a later run's capture
+//! may show the phone's changes to them since (`stray_rows`). A mismatch
 //! refuses; the caller retains the full delta for review.
 use crate::catalogue::sqlite::{
     PLAYBACK_COLUMNS,
@@ -39,6 +41,10 @@ pub type Tables = BTreeMap<String, Table>;
 pub use playlist_deletion::{
     PlaylistDeletionReceipt, deletion_not_applied, qualify_clear, qualify_deletion,
     verify_deletion, verify_deletion_later,
+};
+pub use stray_rows::{
+    STRAY_TABLES, StrayChanges, StrayRows, StrayWindow, absorb_stray_rows, replace_stray_rows,
+    track_with_sync_id,
 };
 
 /// What a later run's capture may hold besides the session: the phone was
@@ -148,6 +154,11 @@ pub struct RemovalReceipt {
     collected_groups: Vec<CollectedGroup>,
     playlists: Vec<playlists::PlaylistRemoval>,
     keep_local_evaluations: Vec<playlists::KeepLocalEvaluation>,
+    /// Rows whose track is gone that the phone deleted, added or changed
+    /// since the session, as a later run's capture showed them
+    /// (`absorb_stray_rows`).
+    #[serde(skip_serializing_if = "StrayRows::is_empty")]
+    stray_rows: StrayRows,
     /// What a later run's capture showed of the phone's use since the
     /// session (`verify_later`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +166,9 @@ pub struct RemovalReceipt {
 }
 
 impl RemovalReceipt {
+    pub fn stray_rows(&self) -> &StrayRows {
+        &self.stray_rows
+    }
     pub fn removed(&self) -> usize {
         self.targets.len()
     }
@@ -701,6 +715,8 @@ fn verify_with(
         .into_values()
         .partition(|album| evaluated.contains(&album.album_pid));
 
+    // Before the caller's rule, whose statistics check counts rows by item.
+    let stray_rows = absorb_stray_rows(&mut expected, after, stray_window(between_runs))?;
     let between_runs_playback = match between_runs {
         Some(absorb) => absorb(&mut expected, after, highest)?,
         None => None,
@@ -730,8 +746,18 @@ fn verify_with(
         collected_groups: collected,
         playlists: playlist_removals,
         keep_local_evaluations: evaluations,
+        stray_rows,
         between_runs_playback,
     })
+}
+
+/// A removal or playlist deletion transfers no file: its own run's capture
+/// shows no change to stray rows, a later run's what the phone did since.
+fn stray_window(between_runs: Option<BetweenRuns<'_>>) -> StrayWindow {
+    match between_runs {
+        Some(_) => StrayWindow::BetweenRuns,
+        None => StrayWindow::WithoutTransfers,
+    }
 }
 
 /// Albums still at keep_local_status 0 that the after state shows at 2 and
@@ -1429,5 +1455,6 @@ mod playlist_deletion;
 pub mod playlists;
 #[cfg(test)]
 mod single_target_tests;
+mod stray_rows;
 #[cfg(test)]
 mod tests;

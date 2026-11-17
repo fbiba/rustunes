@@ -155,6 +155,10 @@ pub(crate) async fn run(
             "init refused: this iPhone is neither unsynced nor synced:\n- {}",
             reasons.join("\n- ")
         ),
+        Readiness::Inconsistent { reason, .. } => bail!(
+            "init refused: this iPhone is synced, but its music library is inconsistent, and \
+             rustunes will not read it: {reason}"
+        ),
     }
     let record = init_record::load_or_create(request.state, &device)?;
     let identity = record.prefs(request.host_name)?.identity()?;

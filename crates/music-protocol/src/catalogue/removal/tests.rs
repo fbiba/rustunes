@@ -1,7 +1,9 @@
 //! Full native schema fixtures for the multi-target removal model.
 use super::*;
 use crate::catalogue::sqlite::tables::{self as reader, Budget, Capture};
-use crate::test_support::catalogue::NativeFixture as Fixture;
+use crate::test_support::catalogue::{
+    LATE_WRITE, NativeFixture as Fixture, SANITIZED, STRAY_ROWS as STRAY,
+};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
@@ -857,6 +859,114 @@ fn a_later_run_still_models_what_the_session_wrote() {
     let (before, after) = pair.tables();
     let receipt = verify_later(&before, &after, &[1], 10, &rule).unwrap();
     assert_eq!(receipt.removed(), 1);
+}
+
+/// Item pids of `table`'s vanished, appeared and changed stray rows.
+pub(crate) fn stray_pids(
+    rows: &StrayRows,
+    table: &str,
+) -> Option<(BTreeSet<i64>, BTreeSet<i64>, BTreeSet<i64>)> {
+    rows.table(table)
+        .map(|t| (t.vanished.clone(), t.appeared.clone(), t.changed.clone()))
+}
+
+#[test]
+fn rows_whose_track_is_gone_stay_exact_in_the_run_and_may_change_between_runs() {
+    let floors = std::cell::RefCell::new(Vec::new());
+    let rule = taking(&floors, &[]);
+    let pids = |receipt: &RemovalReceipt, name: &str| stray_pids(receipt.stray_rows(), name);
+    // Left alone, they are compared exactly in either window.
+    let pair = Pair::new(STRAY, "");
+    let (before, after) = pair.tables();
+    assert!(before["item_state"].one("item_pid", 9).is_ok());
+    assert!(
+        verify(&before, &after, &[1], 10)
+            .unwrap()
+            .stray_rows()
+            .is_empty()
+    );
+    let receipt = verify_later(&before, &after, &[1], 10, &rule).unwrap();
+    assert!(receipt.stray_rows().is_empty());
+    assert!(serde_json::to_value(&receipt).unwrap()["stray_rows"].is_null());
+
+    // The sanitize deletes them, but not in a session that transfers no file.
+    let pair = Pair::new(STRAY, SANITIZED);
+    let (before, after) = pair.tables();
+    let error = verify(&before, &after, &[1], 10).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tables: item_extra, item_stats, item_store"),
+        "{error:#}"
+    );
+    let receipt = verify_later(&before, &after, &[1], 10, &rule).unwrap();
+    let gone = Some((BTreeSet::from([9]), BTreeSet::new(), BTreeSet::new()));
+    for name in ["item_extra", "item_store", "item_stats"] {
+        assert_eq!(pids(&receipt, name), gone, "{name}");
+    }
+    assert_eq!(pids(&receipt, "item_state"), None);
+    assert_eq!(
+        serde_json::to_value(&receipt).unwrap()["stray_rows"]["item_store"],
+        serde_json::json!({"vanished": [9]})
+    );
+
+    // Nothing deletes a stray item_state row.
+    let pair = Pair::new(
+        STRAY,
+        &format!("{SANITIZED} DELETE FROM item_state WHERE item_pid=9;"),
+    );
+    let (before, after) = pair.tables();
+    assert!(verify(&before, &after, &[1], 10).is_err());
+    let error = verify_later(&before, &after, &[1], 10, &rule).unwrap_err();
+    assert!(
+        error.to_string().contains("tables: item_state"),
+        "{error:#}"
+    );
+
+    // A write for the removed target after the session leaves rows of its
+    // own: a later run's capture may show them, the session's own may not.
+    let pair = Pair::new("", LATE_WRITE);
+    let (before, after) = pair.tables();
+    assert!(after["item_state"].one("item_pid", 1).is_ok());
+    assert!(verify(&before, &after, &[1], 10).is_err());
+    let receipt = verify_later(&before, &after, &[1], 10, &rule).unwrap();
+    let appeared = Some((BTreeSet::new(), BTreeSet::from([1]), BTreeSet::new()));
+    for name in ["item_extra", "item_state"] {
+        assert_eq!(pids(&receipt, name), appeared, "{name}");
+    }
+    // As may a later write over a stray row.
+    let pair = Pair::new(
+        STRAY,
+        "UPDATE item_stats SET date_accessed=2 WHERE item_pid=9;",
+    );
+    let (before, after) = pair.tables();
+    assert!(verify(&before, &after, &[1], 10).is_err());
+    let receipt = verify_later(&before, &after, &[1], 10, &rule).unwrap();
+    assert_eq!(
+        pids(&receipt, "item_stats"),
+        Some((BTreeSet::new(), BTreeSet::new(), BTreeSet::from([9])))
+    );
+}
+
+#[test]
+fn a_track_never_hides_behind_the_rows_whose_track_is_gone() {
+    let floors = std::cell::RefCell::new(Vec::new());
+    let rule = taking(&floors, &[]);
+    for sql in [
+        // A survivor's own rows stay exact.
+        "DELETE FROM item_extra WHERE item_pid=2",
+        "UPDATE item_state SET location='X.m4a' WHERE item_pid=3",
+        "DELETE FROM item_stats WHERE item_pid=4",
+        // The target's item row must go.
+        "INSERT INTO item(item_pid,media_type,base_location_id)VALUES(1,8,1)",
+    ] {
+        let pair = Pair::new(STRAY, &format!("{SANITIZED} {sql};"));
+        let (before, after) = pair.tables();
+        assert!(
+            verify_later(&before, &after, &[1], 10, &rule).is_err(),
+            "{sql}"
+        );
+    }
 }
 
 #[test]

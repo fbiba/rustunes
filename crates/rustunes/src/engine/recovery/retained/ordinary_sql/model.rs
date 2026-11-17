@@ -326,6 +326,9 @@ pub(super) fn compare(
             Cell::Text(text.clone()),
         )?;
     }
+    // The slot may hold rows whose track is gone; the import replaces them
+    // and the new track takes over the item_state row.
+    let mut stray_rows = replace_stray_rows(&mut expected, f.slot)?;
     for (name, r) in target_rows {
         add(&mut expected, name, r)?;
     }
@@ -395,6 +398,13 @@ pub(super) fn compare(
         }
     }
     budget.check()?;
+    // The insert's session transferred files. Before the playback rule,
+    // whose statistics check counts the rows of tracks in the library only.
+    stray_rows.extend(absorb_stray_rows(
+        &mut expected,
+        &z.tables,
+        window.stray_rows(true),
+    )?);
     // A refusal leaves `expected` unchanged, so the classification below still
     // sends a playback-tables-only difference to the immediate-After bridge.
     let playback = window
@@ -430,10 +440,11 @@ pub(super) fn compare(
         integrity: integrity.clone(),
         recent_resets,
         playback,
+        stray_rows,
     })
 }
 
-fn reset_recent(
+pub(super) fn reset_recent(
     a: &Snapshot,
     z: &Snapshot,
     expected: &mut BTreeMap<String, Table>,
@@ -441,6 +452,7 @@ fn reset_recent(
 ) -> Result<Vec<serde_json::Value>> {
     let before = a.table("item_stats")?;
     let after = z.table("item_stats")?;
+    let items = a.table("item")?;
     let mut resets = Vec::new();
     for (old, count) in &before.rows {
         budget.check()?;
@@ -449,6 +461,10 @@ fn reset_recent(
             "ordinary prior statistics multiplicity differs"
         );
         let id = int(before, old, "item_pid")?;
+        // A row whose track is gone is the stray rule's.
+        if absent(items, "item_pid", Cell::Integer(id))? {
+            continue;
+        }
         let new = after.one("item_pid", id)?;
         let mut row = old.clone();
         for key in ["play_count_recent", "skip_count_recent"] {

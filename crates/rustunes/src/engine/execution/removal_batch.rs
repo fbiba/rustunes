@@ -54,6 +54,7 @@ use crate::{
 };
 use music_protocol::catalogue::identity::{self, LibraryIdentity};
 use music_protocol::catalogue::mutation;
+use music_protocol::catalogue::removal::track_with_sync_id;
 use music_protocol::protocol::session::{self, Session, StartedOperation};
 use music_protocol::protocol::transfer::{MAX_BOUNDED_OPS, METADATA, SIGNATURE, Transfer};
 
@@ -84,10 +85,8 @@ impl Before {
         self.current.catalog.persisted_media_anchor()
     }
     pub(crate) fn item_pid(&self, track: u64) -> Result<i64> {
-        let store = self.sql.table("item_store")?;
-        let row = typed::unique(store, "sync_id", Cell::Integer(track as i64))
-            .with_context(|| format!("track {track:016x} is not in the catalogue"))?;
-        typed::int(store, row, "item_pid")
+        track_with_sync_id(&self.sql.tables, track as i64)
+            .with_context(|| format!("track {track:016x} is not in the catalogue"))
     }
 }
 
@@ -297,12 +296,10 @@ pub(crate) fn qualify_selection(
     selected: &[u64],
     batch_size: usize,
 ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
-    let store = sql.table("item_store")?;
     let steps = selected
         .iter()
         .map(|track| {
-            let blockers = match typed::unique(store, "sync_id", Cell::Integer(*track as i64))
-                .and_then(|row| typed::int(store, row, "item_pid"))
+            let blockers = match track_with_sync_id(&sql.tables, *track as i64)
                 .and_then(|item| removal_sql::qualify(&sql.tables, &[item]))
             {
                 Ok(()) => Vec::new(),

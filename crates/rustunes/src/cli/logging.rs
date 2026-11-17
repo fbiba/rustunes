@@ -294,9 +294,21 @@ pub(super) fn event(event: &Event<'_>) {
         Event::Deletion(event) => deletion::line(event),
         other => progress::line(other).ok().flatten(),
     };
-    if let Some(line) = line.filter(|line| !line.is_empty()) {
-        tracing::info!(target: SHOWN, "{line}");
+    let Some(line) = line.filter(|line| !line.is_empty()) else {
+        return;
+    };
+    if let Event::Observation(Observation::LeftoverItemRows(rows)) = event {
+        tracing::warn!(target: SHOWN, "{line}");
+        // The terminal line keeps it plain; the log keeps the rows.
+        tracing::info!(
+            "Rows whose track is gone: {}; their item_pids span {:?}, the highest item_pid is {:?}",
+            rows.stray_summary().as_deref().unwrap_or("none"),
+            rows.stray_pids,
+            rows.highest_item_pid
+        );
+        return;
     }
+    tracing::info!(target: SHOWN, "{line}");
 }
 
 /// Progress reported once per chunk, and the per-track lines of a cached

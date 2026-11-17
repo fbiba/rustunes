@@ -18,7 +18,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicI64, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
 use tokio::time::{Instant, timeout_at};
@@ -32,6 +32,9 @@ const COPY_CAP: u64 = 32 * 1024 * 1024;
 /// The untested user_version last warned about, so that a command capturing
 /// the catalogue several times warns once.
 static WARNED_VERSION: AtomicI64 = AtomicI64::new(0);
+/// Whether this command has said the catalogue holds rows whose track is
+/// gone; the first capture holding any says so, once per command.
+static TOLD_LEFTOVER_ROWS: AtomicBool = AtomicBool::new(false);
 const MAX_READS: usize = 4096;
 type Attributes = BTreeMap<String, String>;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -307,6 +310,13 @@ where
         {
             crate::engine::observe(crate::engine::Event::Observation(
                 crate::engine::Observation::UntestedCatalogueVersion(version),
+            ))?;
+        }
+        if catalog.item_rows().stray().next().is_some()
+            && !TOLD_LEFTOVER_ROWS.swap(true, Ordering::Relaxed)
+        {
+            crate::engine::observe(crate::engine::Event::Observation(
+                crate::engine::Observation::LeftoverItemRows(catalog.item_rows()),
             ))?;
         }
         let value = consume(catalog)?;

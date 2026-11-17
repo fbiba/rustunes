@@ -1948,15 +1948,20 @@ async fn settle_with(
                 "capture":covers.capture,"first_readback_refused":drift,
             });
         }
-        if let Some(revisions) = &covers.housekeeping {
-            let evidence = serde_json::to_vec_pretty(&json!({
+        if let Some(housekeeping) = &covers.housekeeping {
+            let swept = &housekeeping.stray_rows;
+            let mut evidence = json!({
                 "schema":"rustunes.cover-capture-housekeeping","capture":covers.capture,
-                "entity_revisions":revisions,"other_sql_exact":true,
-            }))?;
+                "entity_revisions":housekeeping.revisions,"other_sql_exact":swept.is_empty(),
+            });
+            if !swept.is_empty() {
+                evidence["stray_rows"] = serde_json::to_value(swept)?;
+            }
+            let evidence = serde_json::to_vec_pretty(&evidence)?;
             durable_write(&run, "housekeeping-before-covers.json", &evidence)?;
             receipt["housekeeping_before_covers"] = json!({
                 "evidence_sha256":hex(&sha(&evidence)),"capture":covers.capture,
-                "entity_revision_changes":revisions.len(),
+                "entity_revision_changes":housekeeping.revisions.len(),
             });
         }
     }
@@ -2019,8 +2024,9 @@ struct CoverReadback {
     proofs: Vec<crate::engine::verification::artwork::VerifiedTrackArtworkBytes>,
     /// The capture's directory under the run.
     capture: &'static str,
-    /// The phone's revision housekeeping the capture showed since `after`.
-    housekeeping: Option<Vec<serde_json::Value>>,
+    /// The phone's revision housekeeping the capture showed since `after`,
+    /// and the rows whose track is gone that the session's sweep deleted.
+    housekeeping: Option<playback::Housekeeping>,
     /// Why a first readback was abandoned.
     drift: Option<String>,
 }
@@ -2028,7 +2034,8 @@ struct CoverReadback {
 /// Read back each bound target's permanent cover over a capture of the same
 /// after state, as `verify` does: the exact original and a decodable
 /// derivative. Proofs come back in `checks` order. The capture's catalogue
-/// may differ from `after` only by the phone's revision housekeeping. If the
+/// may differ from `after` only by the phone's revision housekeeping and the
+/// sweep of rows whose track is gone that ends the session. If the
 /// phone's state drifts during the readback (seen when its housekeeping
 /// landed there), the state is captured once more under the same rule and
 /// the readback starts again over that capture.
@@ -2094,7 +2101,7 @@ async fn cover_capture(
     name: &str,
     identity: &Identity,
     control: &Control,
-) -> Result<(current::Current, Option<Vec<serde_json::Value>>)> {
+) -> Result<(current::Current, Option<playback::Housekeeping>)> {
     let current = current::capture_with_artwork_controlled(
         &run.join(name),
         identity,
@@ -2164,14 +2171,15 @@ async fn read_covers(
 }
 
 /// The cover capture `captured`, retained under `run/name`, differs from the
-/// observed `after` state only by the phone's revision housekeeping.
+/// observed `after` state only by the phone's revision housekeeping and the
+/// sweep of rows whose track is gone that ends the session.
 fn revision_housekeeping(
     after: &Snapshot,
     captured: &current::Current,
     run: &Path,
     name: &str,
     control: &Control,
-) -> Result<Vec<serde_json::Value>> {
+) -> Result<playback::Housekeeping> {
     let observed =
         removal_batch::materialize(after, &run.join(format!("{name}-sql-after")), control)?;
     let directory = run.join(name).join("catalog");

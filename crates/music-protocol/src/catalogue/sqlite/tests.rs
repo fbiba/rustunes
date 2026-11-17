@@ -593,6 +593,247 @@ fn a_library_no_sync_finished_names_init() {
     assert!(error.contains("cardinality"), "{error}");
 }
 
+/// A row for track 9, which `item` does not hold, in each companion table:
+/// what a write for a deleted track leaves (docs/04, section 4.1).
+const STRAY_ROWS: [(&str, &str); 4] = [
+    (
+        "item_extra",
+        "INSERT INTO item_extra VALUES(9,'','GONE.m4a',0.0,1,0,0,0,NULL,0,0,NULL,NULL)",
+    ),
+    ("item_store", "INSERT INTO item_store VALUES(9,0)"),
+    (
+        "item_stats",
+        "INSERT INTO item_stats VALUES(9,0,0,0,0,0,0,0,0)",
+    ),
+    ("item_state", "INSERT INTO item_state VALUES(9,0,0,0,1)"),
+];
+
+/// Rows whose track is gone are passed over in any of the four tables, alone
+/// or together, and counted; the catalogue is the one without them.
+#[test]
+fn rows_whose_track_is_gone_are_counted_and_left_out() {
+    let plain = Fixture::new(false).read(false).unwrap();
+    assert_eq!(plain.item_rows().stray().count(), 0);
+    assert_eq!(plain.item_rows().stray_summary(), None);
+    let mut cases: Vec<Vec<usize>> = (0..4).map(|table| vec![table]).collect();
+    cases.push(vec![0, 3]);
+    cases.push(vec![0, 1, 2, 3]);
+    for case in cases {
+        let fixture = Fixture::new(false);
+        for &table in &case {
+            fixture
+                .connection
+                .execute_batch(STRAY_ROWS[table].1)
+                .unwrap();
+        }
+        let catalog = fixture.read(false).unwrap();
+        let rows = catalog.item_rows();
+        assert_eq!(rows.items, 1);
+        for (index, companion) in rows.companions.iter().enumerate() {
+            let stray = u64::from(case.contains(&index));
+            assert_eq!(companion.table, COMPANION_TABLES[index]);
+            assert_eq!(
+                (companion.rows, companion.missing, companion.stray),
+                (1 + stray, 0, stray),
+                "{case:?}"
+            );
+        }
+        let summary: Vec<_> = case
+            .iter()
+            .map(|&table| format!("{} 1", STRAY_ROWS[table].0))
+            .collect();
+        assert_eq!(rows.stray_summary(), Some(summary.join(", ")));
+        // One gone track, however many tables hold its rows.
+        assert_eq!((rows.stray_tracks, rows.stray_pids), (1, Some((9, 9))));
+        assert_eq!(rows.highest_item_pid, plain.item_rows().highest_item_pid);
+        assert_eq!(catalog.tracks(), plain.tracks(), "{case:?}");
+        assert_eq!(
+            catalog.stats_except_playback(),
+            plain.stats_except_playback()
+        );
+    }
+}
+
+/// New tracks take stray rows over once the phone's numbering reaches their
+/// pids, one above the highest track's each: only when every stray pid is
+/// above it, and not when that would take more than the limit of new tracks.
+#[test]
+fn new_songs_clear_stray_rows_only_when_numbering_reaches_them() {
+    let plain = Fixture::new(false).read(false).unwrap();
+    assert_eq!(plain.item_rows().stray_tracks, 0);
+    assert_eq!(plain.item_rows().stray_pids, None);
+    assert_eq!(plain.item_rows().songs_until_cleared(), None);
+    let rows = |stray_pids, highest_item_pid| ItemRowCounts {
+        stray_tracks: 2,
+        stray_pids,
+        highest_item_pid,
+        ..plain.item_rows().clone()
+    };
+    assert_eq!(
+        rows(Some((471, 480)), Some(466)).songs_until_cleared(),
+        Some(14)
+    );
+    assert_eq!(
+        rows(Some((467, 467)), Some(466)).songs_until_cleared(),
+        Some(1)
+    );
+    // One a new track never reaches, or no track to number from.
+    assert_eq!(
+        rows(Some((400, 480)), Some(466)).songs_until_cleared(),
+        None
+    );
+    assert_eq!(
+        rows(Some((466, 480)), Some(466)).songs_until_cleared(),
+        None
+    );
+    assert_eq!(rows(Some((471, 480)), None).songs_until_cleared(), None);
+    // Past the limit: the phone does not number one by one.
+    let limit = SONGS_UNTIL_CLEARED_LIMIT as i64;
+    assert_eq!(
+        rows(Some((1, limit)), Some(0)).songs_until_cleared(),
+        Some(SONGS_UNTIL_CLEARED_LIMIT)
+    );
+    assert_eq!(
+        rows(Some((1, limit + 1)), Some(0)).songs_until_cleared(),
+        None
+    );
+    assert_eq!(
+        rows(Some((i64::MAX, i64::MAX)), Some(i64::MIN)).songs_until_cleared(),
+        None
+    );
+}
+
+/// A row pair in `item_store` and `item_stats` whose track is gone, with a
+/// sync id: the statistics are those of the tracks `item` holds.
+#[test]
+fn statistics_of_a_track_that_is_gone_are_not_read() {
+    let plain = Fixture::new(false).read(false).unwrap();
+    let fixture = Fixture::new(false);
+    fixture
+        .connection
+        .execute_batch(
+            "INSERT INTO item_store VALUES(9,-9);
+             INSERT INTO item_stats VALUES(9,4,4,0,0,1,0,0,0);",
+        )
+        .unwrap();
+    let catalog = fixture.read(false).unwrap();
+    assert_eq!(catalog.tracks(), plain.tracks());
+    assert_eq!(
+        catalog.stats_except_recent_play(),
+        plain.stats_except_recent_play()
+    );
+    assert_eq!(catalog.playback_dates(), plain.playback_dates());
+    // Its sync id stays taken, but is no live identity.
+    let id = (-9i64) as u64;
+    assert!(catalog.represented_sync_ids().contains(&id));
+    assert!(!catalog.live_sync_ids().contains(&id));
+    assert_eq!(catalog.live_sync_ids(), *plain.represented_sync_ids());
+}
+
+/// The three states a write for a deleted track leaves, built with the
+/// writes the phone makes and its own triggers in the native schema: right
+/// after the write, after the sweep that ends a session with file transfers,
+/// and after the phone's sanitize. Each reads as the library without them.
+#[test]
+fn the_states_a_write_for_a_deleted_track_leaves_read_as_the_library() {
+    use crate::test_support::catalogue::NativeFixture;
+    for fixture in [
+        NativeFixture::index_only_update(),
+        NativeFixture::built_new(),
+    ] {
+        let read = || read_snapshot(&fixture.before, None, &fixture.dir).unwrap();
+        let plain = read();
+        let connection = Connection::open(&fixture.before).unwrap();
+        let counts = || {
+            let rows = read().item_rows().clone();
+            assert_eq!(rows.items, 4);
+            assert!(rows.missing().next().is_none());
+            rows.companions.map(|c| c.stray)
+        };
+        // Track 9 never existed: to the database, a deleted track.
+        connection
+            .execute_batch(
+                "INSERT OR REPLACE INTO item_extra (item_pid, location, file_size) VALUES (9, 'GONE.m4a', 1234);
+                 INSERT OR REPLACE INTO item_stats (item_pid, needs_restore, download_identifier, date_accessed) VALUES (9, 0, '', 1);
+                 INSERT OR REPLACE INTO item_store (item_pid, is_protected) VALUES (9, 0);",
+            )
+            .unwrap();
+        assert_eq!(counts(), [1, 1, 1, 1]);
+        assert_eq!(read().tracks(), plain.tracks());
+        let state: (String, String) = connection
+            .query_row(
+                "SELECT title, location FROM item_state WHERE item_pid=9",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (String::new(), "GONE.m4a".to_owned()));
+        // The sweep: stray item_store and item_stats rows go.
+        connection
+            .execute_batch(
+                "DELETE FROM item_store WHERE item_pid NOT IN (SELECT item_pid FROM item);
+                 DELETE FROM item_stats WHERE item_pid NOT IN (SELECT item_pid FROM item);",
+            )
+            .unwrap();
+        assert_eq!(counts(), [1, 0, 0, 1]);
+        // Sanitize: stray item_extra rows go; item_state's stays.
+        connection
+            .execute_batch(
+                "DELETE FROM item_extra WHERE item_pid NOT IN (SELECT item_pid FROM item)",
+            )
+            .unwrap();
+        assert_eq!(counts(), [0, 0, 0, 1]);
+        let catalog = read();
+        assert_eq!(catalog.tracks(), plain.tracks());
+        assert_eq!(
+            catalog.item_rows().stray_summary().as_deref(),
+            Some("item_state 1")
+        );
+        drop(connection);
+        fs::remove_dir_all(&fixture.dir).unwrap();
+    }
+}
+
+/// A track without a row in a companion table is refused, and the error
+/// names the table and every count, also when a row whose track is gone
+/// makes the table's count match `item`'s.
+#[test]
+fn a_track_without_a_companion_row_is_refused_with_the_counts() {
+    for (table, sql) in [
+        ("item_extra", "DELETE FROM item_extra"),
+        ("item_store", "DELETE FROM item_store"),
+        ("item_stats", "DELETE FROM item_stats"),
+        ("item_state", "DELETE FROM item_state"),
+    ] {
+        let fixture = Fixture::new(false);
+        fixture.connection.execute_batch(sql).unwrap();
+        let error = format!("{:#}", fixture.read(false).err().unwrap());
+        let counts: Vec<_> = COMPANION_TABLES
+            .iter()
+            .map(|name| format!("{name} {}", u8::from(*name != table)))
+            .collect();
+        assert_eq!(
+            error,
+            format!(
+                "the iPhone's music library is inconsistent: 1 of 1 track has no {table} row \
+                 (item 1, {}; stray rows: none)",
+                counts.join(", ")
+            )
+        );
+    }
+    let fixture = Fixture::new(false);
+    fixture
+        .connection
+        .execute_batch("UPDATE item_state SET item_pid=9")
+        .unwrap();
+    let error = format!("{:#}", fixture.read(false).err().unwrap());
+    assert_eq!(
+        error,
+        "the iPhone's music library is inconsistent: 1 of 1 track has no item_state row \
+         (item 1, item_extra 1, item_store 1, item_stats 1, item_state 1; stray rows: item_state 1)"
+    );
+}
+
 /// The observed shape of an entry the phone adds outside the library: an
 /// Apple Music track it streamed, with a remote location and no file, under an
 /// album and album artist of its own, none of the three with a sync id. Its
