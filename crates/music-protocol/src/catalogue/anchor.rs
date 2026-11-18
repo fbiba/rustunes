@@ -18,6 +18,10 @@ const MAX_SECTIONS: u32 = 4096;
 const ROOT_HEADER_BYTES: usize = 0xf4;
 const ANCHOR_HEADER_BYTES: usize = 0x60;
 const ANCHOR_PAYLOAD_BYTES: usize = 0x30;
+/// Minor versions of the observed writers: 117 from Apple Devices, 115 from
+/// iTunes 12.13 for Windows. Both share the root header and dataset 11 layout
+/// below (docs/10 §5.3).
+const SUPPORTED_MINOR_VERSIONS: [u32; 2] = [115, 117];
 
 pub struct AnchorState {
     saved_media_anchor: u32,
@@ -74,9 +78,10 @@ impl ByteOrder {
     }
 }
 
-/// Accepts only the observed current root header and version: 1.117 with no
-/// compression or 2.117 with one zlib stream following the root header.
-/// Every top-level section is bounded before the saved anchor is returned.
+/// Accepts only the observed root header and versions: major 1 with no
+/// compression or major 2 with one zlib stream following the root header,
+/// each with minor version 115 or 117. Every top-level section is bounded
+/// before the saved anchor is returned.
 pub fn parse(input: &[u8]) -> Result<AnchorState> {
     ensure!(
         input.len() <= MAX_INPUT_BYTES,
@@ -100,7 +105,7 @@ pub fn parse(input: &[u8]) -> Result<AnchorState> {
         "database declared file length does not match input"
     );
     ensure!(
-        order.u32(input, 0x10)? == 117,
+        SUPPORTED_MINOR_VERSIONS.contains(&order.u32(input, 0x10)?),
         "unsupported database minor version"
     );
     let count = order.u32(input, 0x14)?;
@@ -289,23 +294,26 @@ mod tests {
     fn reads_saved_media_voice_and_database_pid_in_both_byte_orders_and_containers() {
         for order in [ByteOrder::Little, ByteOrder::Big] {
             for compressed in [false, true] {
-                let mut bytes = database(
-                    &[
-                        section(1, b"uninspected track data", order),
-                        anchor_section(0x1234abcd, order),
-                        section(12, b"uninspected other data", order),
-                    ],
-                    order,
-                    compressed,
-                );
-                bytes[0x48..0x50].copy_from_slice(&match order {
-                    ByteOrder::Little => 0x8172_6354_4536_2718u64.to_le_bytes(),
-                    ByteOrder::Big => 0x8172_6354_4536_2718u64.to_be_bytes(),
-                });
-                let parsed = parse(&bytes).unwrap();
-                assert_eq!(parsed.saved_media_anchor(), 0x1234abcd);
-                assert_eq!(parsed.saved_voice_memo_anchor(), 31);
-                assert_eq!(parsed.database_pid(), 0x8172_6354_4536_2718);
+                for minor in SUPPORTED_MINOR_VERSIONS {
+                    let mut bytes = database(
+                        &[
+                            section(1, b"uninspected track data", order),
+                            anchor_section(0x1234abcd, order),
+                            section(12, b"uninspected other data", order),
+                        ],
+                        order,
+                        compressed,
+                    );
+                    put_u32(&mut bytes, 16, minor, order);
+                    bytes[0x48..0x50].copy_from_slice(&match order {
+                        ByteOrder::Little => 0x8172_6354_4536_2718u64.to_le_bytes(),
+                        ByteOrder::Big => 0x8172_6354_4536_2718u64.to_be_bytes(),
+                    });
+                    let parsed = parse(&bytes).unwrap();
+                    assert_eq!(parsed.saved_media_anchor(), 0x1234abcd);
+                    assert_eq!(parsed.saved_voice_memo_anchor(), 31);
+                    assert_eq!(parsed.database_pid(), 0x8172_6354_4536_2718);
+                }
             }
         }
     }
@@ -339,7 +347,10 @@ mod tests {
             (8, 0, "file length"),
             (12, 0, "major version"),
             (12, 2, "major version"),
+            (16, 0, "minor version"),
+            (16, 114, "minor version"),
             (16, 116, "minor version"),
+            (16, 118, "minor version"),
             (20, 0, "section count"),
             (20, MAX_SECTIONS + 1, "section count"),
         ] {
