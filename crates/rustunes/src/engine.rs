@@ -26,6 +26,7 @@ pub use crate::engine::execution::delete::{
     Report as DeletionResult, TrackId,
 };
 pub use crate::engine::execution::device::{Config as DeviceConfig, Event as DeviceEvent};
+pub use crate::engine::execution::leftover_files::{LeftoverFile, LeftoverOffer, total_bytes};
 pub use crate::engine::execution::sync::Options as SyncRequest;
 pub use crate::engine::planning::source_collection::SelectionOptions;
 pub use crate::engine::recovery::resume::{

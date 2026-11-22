@@ -58,6 +58,10 @@ pub struct Options<'a> {
     /// first; when the plan matches one, they go first and the sync plans
     /// again without them.
     pub removals: &'a [u64],
+    /// `sync`'s offer to remove the song files on the phone no song uses,
+    /// made once, after earlier work is settled and before anything is sent
+    /// (`leftover_files`). None for `push`, a replacement and a saved plan.
+    pub leftover_files: Option<&'a crate::engine::LeftoverOffer<'a>>,
 }
 
 /// How many times a sync plans again on its own after an insert batch was
@@ -271,6 +275,20 @@ pub(crate) async fn run_with(
             saved.index.unfilled().is_empty(),
             "the phone holds tracks without audio that no unfinished insertion explains; nothing was sent"
         );
+        // Nothing an earlier run began is unfinished now: a real run settled
+        // it above, and a dry run refused it.
+        if let Some(offer) = options.leftover_files {
+            Box::pin(crate::engine::execution::leftover_files::offer(
+                offer,
+                &saved,
+                &journal,
+                &run,
+                options.dry_run,
+                engine,
+                options.seconds,
+            ))
+            .await?;
+        }
     }
     let plan = run.join("plan.json");
     let plan_options = options.selection.clone();
@@ -1181,6 +1199,7 @@ mod tests {
                         pinned: None,
                         library: None,
                         removals: &[],
+                        leftover_files: None,
                     })
                     .await
                     .map(|result| result.ready())

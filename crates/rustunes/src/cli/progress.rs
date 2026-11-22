@@ -207,6 +207,23 @@ pub(super) fn line(event: &Event<'_>) -> Result<Option<String>> {
         Event::DeletedOnPhone {
             tracks, installed, ..
         } => deleted_on_phone_line(*tracks, *installed),
+        Event::LeftoverFilesFound(files) => {
+            format!("Would offer to remove {}.", leftover_files(files))
+        }
+        Event::LeftoverFilesRemoved { removed, kept } => {
+            let mut text = format!("Removed {}.", leftover_files(removed));
+            if !kept.is_empty() {
+                text.push_str(&match kept.len() {
+                    1 => " Left 1 file that changed since it was found.".to_owned(),
+                    n => format!(" Left {n} files that changed since they were found."),
+                });
+            }
+            text
+        }
+        Event::LeftoverFilesUnchecked(_) => {
+            "Leftover song files on the iPhone couldn't be checked or removed this time; the sync goes on."
+                .into()
+        }
         Event::JournalStarted { journal, installed } => {
             let text = if *installed {
                 "Started this phone's journal: rustunes init prepared it and it holds no track"
@@ -389,6 +406,24 @@ pub(super) fn leftover_rows_line(songs: u64, until_cleared: Option<u64>) -> Stri
             if n == 1 { "song" } else { "songs" }
         ),
         None => format!("{start}."),
+    }
+}
+
+/// "2 leftover song files (81 MB)".
+pub(super) fn leftover_files(files: &[crate::engine::LeftoverFile]) -> String {
+    format!(
+        "{} ({})",
+        count(files.len() as u64, "leftover song file"),
+        size(crate::engine::total_bytes(files))
+    )
+}
+
+/// A size as people read it: "81 MB", "1.5 GB", "40 KB".
+pub(super) fn size(bytes: u64) -> String {
+    match bytes {
+        0..1_000_000 => format!("{} KB", bytes.div_ceil(1000)),
+        1_000_000..1_000_000_000 => format!("{} MB", (bytes + 500_000) / 1_000_000),
+        _ => format!("{:.1} GB", bytes as f64 / 1e9),
     }
 }
 

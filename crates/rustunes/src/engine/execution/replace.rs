@@ -434,6 +434,7 @@ pub(crate) async fn run(
             pinned: r.pinned,
             library: None,
             removals: &[],
+            leftover_files: None,
         },
         Some(id),
         engine,

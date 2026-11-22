@@ -1748,7 +1748,7 @@ async fn settle_with(
     // its planned path or exactly the sent audio there: a song deleted in
     // the Music app while its file was still being copied keeps the file
     // outstanding, which lands later, named by no row (docs/04, section
-    // 4.6). Anything else is unexplained.
+    // 4.6). `sync` offers to remove it. Anything else is unexplained.
     let mut bound = Vec::new();
     let mut locationless = BTreeSet::new();
     let mut removed = BTreeMap::new();

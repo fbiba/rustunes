@@ -1212,6 +1212,10 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                 )?;
                 return Ok(ExitCode::from(3));
             }
+            // Song files no song uses are offered for removal once, before
+            // anything new is sent; declining keeps them and the sync goes on.
+            let confirm = |files: &[engine::LeftoverFile]| deletion::confirm_leftovers(files, yes);
+            let leftovers = engine::LeftoverOffer::new(&confirm);
             // The sync plans against the journal the removal used: the
             // removal carried it forward or started it, if that was needed,
             // and on a dry run it is in the removal's run directory.
@@ -1231,6 +1235,7 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                     pinned: None,
                     library: Some(&library),
                     removals: &left,
+                    leftover_files: Some(&leftovers),
                 })
                 .await?;
             // A source dropped while it was sent, or a removal left waiting,
@@ -1287,6 +1292,7 @@ async fn dispatch(cli: Cli, engine: &engine::Engine) -> Result<ExitCode> {
                     pinned: None,
                     library: matched.as_deref(),
                     removals: &[],
+                    leftover_files: None,
                 })
                 .await?;
             return Ok(if result.ready() && result.sent_all() {

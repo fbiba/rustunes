@@ -146,6 +146,7 @@ async fn caller_cancellation_and_deadline_refuse_before_state_or_device_work() {
             pinned: None,
             library: None,
             removals: &[],
+            leftover_files: None,
         })
         .await
         .unwrap_err();
@@ -237,6 +238,7 @@ async fn caller_cancellation_and_deadline_refuse_before_state_or_device_work() {
             pinned: None,
             library: None,
             removals: &[],
+            leftover_files: None,
         })
         .await
         .unwrap_err();
@@ -262,6 +264,7 @@ async fn caller_cancellation_and_deadline_refuse_before_state_or_device_work() {
                 pinned: None,
                 library: None,
                 removals: &[],
+                leftover_files: None,
             })
             .await
             .is_err()

@@ -133,3 +133,40 @@ fn starting_a_journal_says_whether_the_real_run_still_starts_it() {
         "{dry}"
     );
 }
+
+/// Song files no song uses are counted and sized as people read them, in
+/// what a dry run, a removal and a failed check say.
+#[test]
+fn leftover_song_files_are_said_plainly() {
+    use crate::engine::LeftoverFile;
+    assert_eq!(size(999), "1 KB");
+    assert_eq!(size(40_000), "40 KB");
+    assert_eq!(size(80_777_676), "81 MB");
+    assert_eq!(size(1_500_000_000), "1.5 GB");
+    let two = [
+        LeftoverFile::example("iTunes_Control/Music/F12/QZXW.m4a", 41_872_160),
+        LeftoverFile::example("iTunes_Control/Music/F40/RTMN.m4a", 38_905_516),
+    ];
+    assert_eq!(leftover_files(&two), "2 leftover song files (81 MB)");
+    assert_eq!(leftover_files(&two[..1]), "1 leftover song file (42 MB)");
+    let text = |event: &Event<'_>| line(event).unwrap().unwrap();
+    assert_eq!(
+        text(&Event::LeftoverFilesFound(&two)),
+        "Would offer to remove 2 leftover song files (81 MB)."
+    );
+    assert_eq!(
+        text(&Event::LeftoverFilesRemoved {
+            removed: &two,
+            kept: &[]
+        }),
+        "Removed 2 leftover song files (81 MB)."
+    );
+    assert_eq!(
+        text(&Event::LeftoverFilesRemoved {
+            removed: &two[..1],
+            kept: &two[1..]
+        }),
+        "Removed 1 leftover song file (42 MB). Left 1 file that changed since it was found."
+    );
+    assert!(!text(&Event::LeftoverFilesUnchecked("AFC refused")).contains("AFC"));
+}

@@ -86,6 +86,50 @@ pub(super) fn confirm_mirror(selection: Confirmation<'_>, yes: bool) -> Result<b
     );
     confirm(selection)
 }
+/// `sync`'s question about the song files on the phone that no song uses.
+/// Unlike its question about tracks, a no, or no terminal to ask on, keeps
+/// them and the sync goes on: removing them is tidying, which never holds
+/// back sending music.
+pub(super) fn confirm_leftovers(files: &[crate::engine::LeftoverFile], yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    let what = super::progress::leftover_files(files);
+    let prompt = format!(
+        "Your iPhone has {what} that no song in its library uses. They were left behind by earlier syncs. Remove them to free up the space?"
+    );
+    let fields = super::machine::leftover_fields(files);
+    let removed = if super::machine::enabled() {
+        super::machine::confirm("remove_leftover_files", prompt, fields.clone())?
+    } else if std::io::stdin().is_terminal() {
+        eprint!("{prompt} [y/N] ");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    } else {
+        let mut fields = fields;
+        fields["asked"] = false.into();
+        super::notice(
+            "leftover_files_kept",
+            super::machine::Level::Info,
+            format!("Kept {what}; run `rustunes sync --yes` to remove them."),
+            fields,
+        )?;
+        return Ok(false);
+    };
+    if !removed {
+        let mut fields = fields;
+        fields["asked"] = true.into();
+        super::notice(
+            "leftover_files_kept",
+            super::machine::Level::Info,
+            "Kept the leftover files. The next sync will ask again.",
+            fields,
+        )?;
+    }
+    Ok(removed)
+}
 /// "this track" or "these N tracks".
 fn tracks(count: usize) -> String {
     match count {

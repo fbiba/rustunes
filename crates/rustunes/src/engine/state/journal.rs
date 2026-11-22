@@ -654,6 +654,24 @@ impl Journal {
             .collect()
     }
 
+    /// The music path of every track a removal batch of this journal
+    /// targeted, in lower case: files the phone deletes itself, minutes
+    /// after the session.
+    pub fn removed_paths(&self) -> Result<BTreeSet<String>> {
+        self.ordinary_inspectable()?;
+        let mut q = self.connection.prepare(
+            "SELECT DISTINCT lower(path) FROM removal_targets WHERE path IS NOT NULL LIMIT 250001",
+        )?;
+        let paths = q
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        ensure!(
+            paths.len() <= 250_000,
+            "removed path inventory exceeds bound"
+        );
+        Ok(paths)
+    }
+
     pub fn prepare(&mut self, prepared: PreparedAttempt) -> Result<AttemptId> {
         self.ordinary_usable()?;
         validate_prepared(&prepared)?;

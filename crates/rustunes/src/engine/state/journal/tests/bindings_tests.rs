@@ -192,3 +192,28 @@ fn completed_native_artwork_without_resulting_version_is_rejected_on_reopen() {
     drop(j);
     assert!(Journal::open_read_only(&temp.journal(), &scope()).is_err());
 }
+
+/// The paths removal batches targeted are known, in lower case; those only
+/// inserted or still bound are not.
+#[test]
+fn the_paths_removals_targeted_are_known_in_lower_case() {
+    let t = super::test_support::Temp::new();
+    let mut j = Journal::create(&t.path(), &super::test_support::identity()).unwrap();
+    assert!(j.removed_paths().unwrap().is_empty());
+    let removed = super::test_support::alac_content(1);
+    let kept = super::test_support::alac_content(2);
+    super::test_support::insert_verified(&mut j, removed.clone());
+    super::test_support::insert_verified(&mut j, kept.clone());
+    super::test_support::retire(&mut j, &removed);
+    assert_eq!(
+        j.removed_paths().unwrap(),
+        [removed.path.to_ascii_lowercase()].into()
+    );
+    // Every path ever planned stays reserved, the kept one's too, so
+    // reservations cannot tell a leftover file from a live one.
+    assert!(
+        j.reserved_paths()
+            .unwrap()
+            .contains(&kept.path.to_ascii_lowercase())
+    );
+}

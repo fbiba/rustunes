@@ -297,6 +297,11 @@ pub(super) fn event(event: &Event<'_>) {
     let Some(line) = line.filter(|line| !line.is_empty()) else {
         return;
     };
+    if let Event::LeftoverFilesUnchecked(error) = event {
+        tracing::warn!(target: SHOWN, "{line}");
+        tracing::info!("Leftover song files: {error}");
+        return;
+    }
     if let Event::Observation(Observation::LeftoverItemRows(rows)) = event {
         tracing::warn!(target: SHOWN, "{line}");
         // The terminal line keeps it plain; the log keeps the rows.

@@ -167,6 +167,18 @@ pub enum Event<'a> {
         /// journal in use stays as it is.
         installed: bool,
     },
+    /// A dry run of `sync` found song files on the phone that no song uses,
+    /// which a real sync offers to remove.
+    LeftoverFilesFound(&'a [crate::engine::LeftoverFile]),
+    /// `sync` removed the song files no song used (`removed`); `kept`
+    /// changed after they were found, and were left alone.
+    LeftoverFilesRemoved {
+        removed: &'a [crate::engine::LeftoverFile],
+        kept: &'a [crate::engine::LeftoverFile],
+    },
+    /// `sync` could not look for, or finish removing, the song files no song
+    /// uses, and went on with the sync; why.
+    LeftoverFilesUnchecked(&'a str),
     /// With no journal and none to carry forward, the journal of a phone
     /// `rustunes init` prepared that holds no track was started from a fresh
     /// capture, as a pull would write it: it binds nothing.

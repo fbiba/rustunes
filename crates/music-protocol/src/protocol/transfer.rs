@@ -1391,6 +1391,44 @@ impl Transfer {
         self.remove_checked(path, bytes, true).await
     }
 
+    /// Remove a song file a sync left in a music folder that no track names,
+    /// which the caller found with the stat `found`. Only a path
+    /// `leftover_media_path` accepts, holding a regular file of the same
+    /// size and times as `found`, is removed, and then its absence is
+    /// confirmed; anything else there is left as it is. As with
+    /// `remove_staged_operation`, a locked connection can do this and
+    /// remove nothing else; that no track names the file is the caller's to
+    /// prove.
+    pub async fn remove_leftover_media(
+        &mut self,
+        path: &str,
+        found: &Attributes,
+    ) -> Result<LeftoverRemoval> {
+        ensure!(
+            !self.readonly_summary,
+            "removal refused by read-only AFC summary transport"
+        );
+        validate_path(path)?;
+        ensure!(
+            leftover_media_path(path),
+            "{path} is not a song file in a music folder; nothing removed"
+        );
+        let Some(now) = self.stat(path).await? else {
+            return Ok(LeftoverRemoval::Gone);
+        };
+        if now.get("st_ifmt").map(String::as_str) != Some("S_IFREG") || !same_file(found, &now) {
+            return Ok(LeftoverRemoval::Changed);
+        }
+        self.checked_removal = Some(path.to_owned());
+        let result = self
+            .status(AfcOpcode::RemovePath, path.as_bytes().to_vec(), Vec::new())
+            .await;
+        self.checked_removal = None;
+        result?;
+        self.require_absent(path).await?;
+        Ok(LeftoverRemoval::Removed)
+    }
+
     /// Read `path` back and remove it only if it holds `expected` (or, with
     /// `prefix`, the start of it). The one RemovePath a locked connection may
     /// send is for the path this just read.
@@ -1597,6 +1635,47 @@ fn readonly_operation(operation: AfcOpcode, header: &[u8], payload: &[u8]) -> Re
         }
         _ => bail!("mutating/unsupported AFC opcode refused by read-only transport"),
     }
+}
+
+/// What `Transfer::remove_leftover_media` did with a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeftoverRemoval {
+    Removed,
+    /// Nothing was there any more.
+    Gone,
+    /// Something else was there: another file, or the same one changed
+    /// since it was found. It was left as it is.
+    Changed,
+}
+
+/// The extensions of the song files a sync puts in a music folder: Apple's
+/// host names a file by its type (docs/06 §7), and rustunes by its format.
+pub const LEFTOVER_MEDIA_EXTENSIONS: [&str; 7] = ["m4a", "m4p", "m4b", "mp3", "aif", "wav", "flac"];
+
+/// Whether `path` names a song file directly in a music folder:
+/// `iTunes_Control/Music/Fnn/<name>.<ext>`, the name one plain component
+/// and the extension, in any case, one of `LEFTOVER_MEDIA_EXTENSIONS`.
+/// Nothing in `Music/Cache`, `Music/Downloads`, `Airlock` or elsewhere, and
+/// no other kind of file, is one.
+pub fn leftover_media_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("iTunes_Control/Music/F") else {
+        return false;
+    };
+    let Some((number, name)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    number.len() == 2
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && !stem.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && name.len() <= 255
+        && LEFTOVER_MEDIA_EXTENSIONS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(extension))
 }
 
 /// Whether two stats show the same unchanged file: a rename keeps all of these.
@@ -2343,6 +2422,7 @@ mod tests {
     mod bounded;
     mod fake_phone;
     mod interrupted_write;
+    mod leftover_media;
     mod locked;
     mod summary;
     mod through_temporary;

@@ -205,6 +205,7 @@ pub(crate) async fn run(
                     pinned: Some(pinned),
                     library: None,
                     removals: &left,
+                    leftover_files: None,
                 },
                 engine,
             ))
@@ -323,6 +324,7 @@ async fn additive(r: Request<'_>, engine: &Engine) -> Result<Outcome> {
             pinned: Some(&loaded.pinned),
             library: None,
             removals: &[],
+            leftover_files: None,
         },
         engine,
     ))

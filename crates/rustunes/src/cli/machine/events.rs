@@ -55,6 +55,15 @@ fn path(path: &Path) -> Value {
     path.to_string_lossy().into_owned().into()
 }
 
+/// How many song files no song uses, their bytes and their paths.
+pub(in crate::cli) fn leftover_fields(files: &[crate::engine::LeftoverFile]) -> Value {
+    json!({
+        "files": files.len(),
+        "bytes": crate::engine::total_bytes(files),
+        "paths": files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+    })
+}
+
 fn id(track: u64) -> String {
     format!("{track:016x}")
 }
@@ -368,6 +377,23 @@ pub(crate) fn event(event: &Event<'_>) -> Result<()> {
                 "journal": path(journal),
                 "installed": installed,
             }),
+        ),
+        Event::LeftoverFilesFound(files) => notice(
+            "leftover_files_found",
+            Info,
+            line()?,
+            leftover_fields(files),
+        ),
+        Event::LeftoverFilesRemoved { removed, kept } => {
+            let mut fields = leftover_fields(removed);
+            fields["kept"] = kept.iter().map(|f| f.path.clone()).collect();
+            notice("leftover_files_removed", Info, line()?, fields)
+        }
+        Event::LeftoverFilesUnchecked(error) => notice(
+            "leftover_files_unchecked",
+            Warning,
+            line()?,
+            json!({"error": error}),
         ),
         Event::JournalStarted { journal, installed } => notice(
             "journal_started",
