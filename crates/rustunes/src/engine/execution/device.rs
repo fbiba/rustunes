@@ -79,7 +79,8 @@ impl Config {
     /// Reach the phone over Wi-Fi instead of USB: find it by Bonjour, or at
     /// `address`, and secure sessions with the pairing record usbmuxd saved
     /// when it was paired over USB. No usbmuxd connection is made. Each
-    /// phone's last address is kept in `remembered`, so it can be woken there.
+    /// phone's last address and the Wi-Fi MAC its Bonjour name carried are
+    /// kept in `remembered`, so it can be woken while it sleeps.
     pub fn over_wifi(mut self, address: Option<IpAddr>, remembered: Option<PathBuf>) -> Self {
         self.wifi = Some(WifiConfig {
             address,

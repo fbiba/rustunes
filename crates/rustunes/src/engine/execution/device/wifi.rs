@@ -3,11 +3,14 @@
 //! usbmuxd saved when the phone was paired and trusted over USB. Services are
 //! reached on the TCP ports Lockdown names, exactly as usbmuxd forwards them.
 //!
-//! A sleeping phone keeps answering ARP but ignores Bonjour and new TCP
-//! connections. A unicast datagram to the Wake-on-LAN port wakes it within
-//! about a second, so the address each phone last answered at is remembered.
-//! A locked phone then stays awake only while this host answers its
-//! heartbeat and holds a power assertion.
+//! A sleeping phone ignores Bonjour and new TCP connections, and answers
+//! broadcast ARP late or not at all. Two datagrams wake it within seconds: a
+//! magic packet for the Wi-Fi MAC address it uses now, multicast to Bonjour's
+//! group as Apple's hosts send it, and any datagram to the Wake-on-LAN port at
+//! its address. Its Bonjour name starts with that MAC, so the MAC and the
+//! address each phone last answered with are remembered. A locked phone then
+//! stays awake only while this host answers its heartbeat and holds a power
+//! assertion.
 use super::{
     Connecting, DeviceProvider, LABEL, Listed, MAX_DEVICES, Route, Transport, WifiConfig,
     valid_identifier,
@@ -22,12 +25,14 @@ use std::{
     collections::{BTreeMap, HashSet},
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Where usbmuxd keeps pairing records on Linux, one `<UDID>.plist` each.
@@ -35,12 +40,30 @@ pub(super) const PAIRING_RECORDS: &str = "/var/lib/lockdown";
 const SERVICE: &str = "_apple-mobdev2._tcp.local.";
 const LOCKDOWN_PORT: u16 = 62078;
 /// The phone's radio wakes its system for unicast datagrams to the echo (7)
-/// or discard (9) port, whatever they carry; other ports and broadcasts do not.
+/// or discard (9) port, whatever they carry, and for a magic packet for the
+/// Wi-Fi MAC it uses now, multicast to `WAKE_GROUP` on the discard port.
+/// Subnet broadcasts, other ports and other MACs do not wake it.
 const WAKE_PORT: u16 = 9;
+/// Bonjour's IPv4 group, where Apple's hosts multicast the wake.
+const WAKE_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+/// Apple's Bonjour sends a burst of magic packets with each of the first
+/// three queries of a resolve that asks it to wake the phone, so the bursts
+/// overlap.
+const WAKE_BURSTS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(1100),
+    Duration::from_millis(4100),
+];
+const BURST_PACKETS: u32 = 18;
+const BURST_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_RECORD_BYTES: u64 = 1 << 20;
 /// How long to wait for Bonjour answers. A selected phone ends the wait as
 /// soon as it resolves; otherwise every answering phone is collected.
 const BROWSE: Duration = Duration::from_secs(4);
+/// The wait once a wake was sent: the last burst leaves about 6 s in, and a
+/// woken phone announces itself a second or two after the packet that woke
+/// it.
+const WOKEN_BROWSE: Duration = Duration::from_secs(10);
 /// A locked phone can take several seconds to wake its radio for a new
 /// connection.
 const CONNECT: Duration = Duration::from_secs(15);
@@ -120,66 +143,301 @@ fn wake(address: SocketAddr, mac: &str) {
         let _ = socket.send_to(&magic_packet(mac), target);
     }
 }
+/// Six 0xff bytes, then the MAC sixteen times: 102 bytes. An unreadable MAC
+/// leaves the six 0xff bytes, as any datagram to the wake port at the phone's
+/// address wakes it.
 fn magic_packet(mac: &str) -> Vec<u8> {
-    let octets: Vec<u8> = mac
-        .split(':')
-        .filter_map(|octet| u8::from_str_radix(octet, 16).ok())
-        .collect();
     let mut packet = vec![0xff; 6];
-    if octets.len() == 6 {
+    if let Some(octets) = mac_octets(mac) {
         for _ in 0..16 {
-            packet.extend(&octets);
+            packet.extend(octets);
         }
     }
     packet
 }
+fn mac_octets(mac: &str) -> Option<[u8; 6]> {
+    let mut octets = [0; 6];
+    let mut texts = mac.split(':');
+    for octet in &mut octets {
+        let text = texts.next()?;
+        if !(1..=2).contains(&text.len()) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        *octet = u8::from_str_radix(text, 16).ok()?;
+    }
+    texts.next().is_none().then_some(octets)
+}
+/// A MAC written as six hex octets separated by `:`, in lowercase.
+fn normal_mac(mac: &str) -> Option<String> {
+    let octets = mac_octets(mac)?.map(|octet| format!("{octet:02x}"));
+    Some(octets.join(":"))
+}
+/// The Wi-Fi MAC a phone's Bonjour instance name starts with:
+/// `<MAC>@<IPv6>`, with `-supportsRP-<n>` after it on newer phones. It is the
+/// MAC the phone uses on this network now, the one its wake answers to.
+fn name_mac(fullname: &str) -> Option<String> {
+    let (mac, _) = fullname.split_once('@')?;
+    normal_mac(mac)
+}
 
-/// The last address each phone answered at, one file per UDID. Failing to
-/// read or write it never fails a run.
+/// What this host learned of each phone the last time it answered, in two
+/// files per UDID: `<UDID>` holds its address and `<UDID>.mac` the Wi-Fi MAC
+/// its Bonjour name carried. Older builds read the first as an address, so it
+/// holds nothing else. Failing to read or write them never fails a run.
 struct Remembered(Option<PathBuf>);
 impl Remembered {
     fn get(&self, udid: &str) -> Option<IpAddr> {
-        let path = self.0.as_ref()?.join(udid);
-        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+        self.read(udid)?.parse().ok()
     }
-    /// A sleeping phone ignores Bonjour until woken where it last answered.
-    fn wake(&self, records: &[Record]) {
+    fn mac(&self, udid: &str) -> Option<String> {
+        normal_mac(&self.read(&mac_file(udid))?)
+    }
+    fn read(&self, name: &str) -> Option<String> {
+        let path = self.0.as_ref()?.join(name);
+        Some(std::fs::read_to_string(path).ok()?.trim().to_owned())
+    }
+    /// What there is to wake these phones by.
+    fn known(&self, records: &[Record]) -> Wake {
+        let mut known = Wake::default();
         for record in records {
+            let mac = self.mac(&record.udid);
             if let Some(address) = self.get(&record.udid) {
-                wake(
-                    socket_address(address, 0, WAKE_PORT),
-                    &record.pairing.wifi_mac_address,
-                );
+                let payload = mac.as_deref().unwrap_or(&record.pairing.wifi_mac_address);
+                known
+                    .addresses
+                    .push((record.udid.clone(), address, payload.to_owned()));
             }
+            known.macs.extend(mac);
         }
+        tracing::debug!(
+            "{} last address(es) and {} Wi-Fi MAC(s) remembered to wake the phone(s) by",
+            known.addresses.len(),
+            known.macs.len()
+        );
+        known
     }
     fn set(&self, udid: &str, address: IpAddr) {
+        if self.get(udid) != Some(address) {
+            self.write(udid, &address.to_string(), "Wi-Fi address");
+        }
+    }
+    fn set_mac(&self, udid: &str, mac: &str) {
+        if self.mac(udid).as_deref() != Some(mac) {
+            self.write(&mac_file(udid), mac, "Wi-Fi MAC");
+        }
+    }
+    /// Replaces the file whole, so a reader never sees half a value.
+    fn write(&self, name: &str, value: &str, what: &str) {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         let Some(directory) = &self.0 else {
             return;
         };
-        if self.get(udid) == Some(address) {
-            return;
-        }
         let write = || -> std::io::Result<()> {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(directory)?;
-            let temporary = directory.join(format!(".{udid}.tmp"));
+            let temporary = directory.join(format!(".{name}.tmp"));
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
                 .open(&temporary)?;
-            std::io::Write::write_all(&mut file, format!("{address}\n").as_bytes())?;
-            std::fs::rename(temporary, directory.join(udid))
+            std::io::Write::write_all(&mut file, format!("{value}\n").as_bytes())?;
+            std::fs::rename(temporary, directory.join(name))
         };
         if let Err(error) = write() {
-            tracing::debug!("The phone's Wi-Fi address was not remembered: {error}");
+            tracing::debug!("The phone's {what} was not remembered: {error}");
         }
     }
+}
+fn mac_file(udid: &str) -> String {
+    format!("{udid}.mac")
+}
+
+/// What this host remembers to wake the paired phones by.
+#[derive(Default)]
+struct Wake {
+    /// Each phone's last address, with the MAC its magic packet carries
+    /// there: the one its Bonjour name last carried, or the record's
+    /// hardware MAC.
+    addresses: Vec<(String, IpAddr, String)>,
+    /// The MACs their Bonjour names last carried, for the multicast wake.
+    macs: Vec<String>,
+}
+impl Wake {
+    /// A unicast datagram to each phone's last address, now.
+    fn unicast(&self) {
+        for (_, address, mac) in &self.addresses {
+            wake(socket_address(*address, 0, WAKE_PORT), mac);
+        }
+    }
+    /// How long to browse: long enough for a woken phone to announce itself
+    /// when a wake was sent.
+    fn window(&self) -> Duration {
+        if self.addresses.is_empty() && self.macs.is_empty() {
+            BROWSE
+        } else {
+            WOKEN_BROWSE
+        }
+    }
+}
+
+/// When each multicast wake leaves, from the start of the browse: Apple's
+/// three bursts, merged in order.
+fn wake_schedule() -> Vec<Duration> {
+    let mut schedule: Vec<Duration> = WAKE_BURSTS
+        .iter()
+        .flat_map(|&start| (0..BURST_PACKETS).map(move |packet| start + BURST_INTERVAL * packet))
+        .collect();
+    schedule.sort();
+    schedule
+}
+/// Apple's wake, which needs no address: a magic packet for each remembered
+/// MAC, multicast on every interface on Apple's schedule, until the schedule
+/// ends or the browse does and drops the sender of `stop`. Failures are only
+/// logged.
+fn multicast_wake(macs: &[String], stop: &mpsc::Receiver<()>) {
+    let start = Instant::now();
+    if macs.is_empty() {
+        return;
+    }
+    let sockets: Vec<(String, UdpSocket)> = multicast_interfaces()
+        .into_iter()
+        .filter_map(|interface| match wake_socket(&interface) {
+            Ok(socket) => Some((interface.name, socket)),
+            Err(error) => {
+                tracing::debug!("No multicast wake on {}: {error}", interface.name);
+                None
+            }
+        })
+        .collect();
+    tracing::debug!(
+        "Multicast wake for {} phone(s) on {} interface(s): {}",
+        macs.len(),
+        sockets.len(),
+        sockets
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if sockets.is_empty() {
+        return;
+    }
+    let packets: Vec<Vec<u8>> = macs.iter().map(|mac| magic_packet(mac)).collect();
+    let mut failed = HashSet::new();
+    for at in wake_schedule() {
+        let wait = (start + at).saturating_duration_since(Instant::now());
+        if !matches!(
+            stop.recv_timeout(wait),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            return;
+        }
+        for (name, socket) in &sockets {
+            for packet in &packets {
+                if let Err(error) = socket.send_to(packet, (WAKE_GROUP, WAKE_PORT))
+                    && failed.insert(name.as_str())
+                {
+                    tracing::debug!("The multicast wake failed on {name}: {error}");
+                }
+            }
+        }
+    }
+}
+
+/// An interface the multicast wake leaves by.
+struct Interface {
+    name: String,
+    index: u32,
+    address: Ipv4Addr,
+}
+/// Every interface that is up, not loopback or point-to-point and can
+/// multicast, with an IPv4 address, once each. The phone's network need not
+/// hold the default route: a VPN may.
+fn multicast_interfaces() -> Vec<Interface> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `list` is a valid place for the list's head; it is freed below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        tracing::debug!(
+            "The network interfaces could not be listed: {}",
+            std::io::Error::last_os_error()
+        );
+        return Vec::new();
+    }
+    let mut interfaces: Vec<Interface> = Vec::new();
+    let mut next = list;
+    while !next.is_null() {
+        // SAFETY: a node of the list getifaddrs returned, freed only below.
+        let entry = unsafe { &*next };
+        next = entry.ifa_next;
+        if !wakes_through(entry.ifa_flags) || entry.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: a non-null address of a live node.
+        if i32::from(unsafe { (*entry.ifa_addr).sa_family }) != libc::AF_INET {
+            continue;
+        }
+        // SAFETY: an `AF_INET` address is a `sockaddr_in`.
+        let address = unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_in>() };
+        // SAFETY: a live node's name is a NUL-terminated string.
+        let (name, index) = unsafe {
+            (
+                std::ffi::CStr::from_ptr(entry.ifa_name),
+                libc::if_nametoindex(entry.ifa_name),
+            )
+        };
+        if index != 0 && !interfaces.iter().any(|known| known.index == index) {
+            interfaces.push(Interface {
+                name: name.to_string_lossy().into_owned(),
+                index,
+                address: Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
+            });
+        }
+    }
+    // SAFETY: the list getifaddrs returned, freed once; nothing borrowed from
+    // it is used after this.
+    unsafe { libc::freeifaddrs(list) };
+    interfaces
+}
+/// Up, not loopback or point-to-point, and able to multicast. A link-local
+/// multicast cannot wake a phone across a routed tunnel, and would show its
+/// MAC to the tunnel's far end.
+fn wakes_through(flags: libc::c_uint) -> bool {
+    let flags = flags as libc::c_int;
+    flags & libc::IFF_UP != 0
+        && flags & libc::IFF_LOOPBACK == 0
+        && flags & libc::IFF_POINTOPOINT == 0
+        && flags & libc::IFF_MULTICAST != 0
+}
+/// A socket whose multicasts leave by `interface` and stay on its link.
+fn wake_socket(interface: &Interface) -> std::io::Result<UdpSocket> {
+    let socket = UdpSocket::bind((interface.address, 0))?;
+    socket.set_multicast_ttl_v4(1)?;
+    let request = libc::ip_mreqn {
+        imr_multiaddr: libc::in_addr { s_addr: 0 },
+        imr_address: libc::in_addr {
+            s_addr: u32::from_ne_bytes(interface.address.octets()),
+        },
+        imr_ifindex: interface.index as libc::c_int,
+    };
+    // SAFETY: a live socket, and an option of the type and size the kernel
+    // reads for `IP_MULTICAST_IF`.
+    let status = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_MULTICAST_IF,
+            (&raw const request).cast(),
+            std::mem::size_of_val(&request) as libc::socklen_t,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(socket)
 }
 
 /// The phone found in this scope, with its heartbeat and power assertion.
@@ -205,48 +463,42 @@ pub(super) async fn find(config: &WifiConfig, selected: Option<&str>) -> Result<
         config.pairing_records.display()
     );
     let remembered = Remembered(config.remembered.clone());
-    let (record, address, scope_id) = match config.address {
-        Some(address) => (record_at(address, records).await?, address, 0),
+    let (record, answer, unanswered) = match config.address {
+        Some(address) => (
+            record_at(address, records).await?,
+            Answer::at(address),
+            None,
+        ),
         None => {
-            remembered.wake(&records);
-            let mut found = browse(&records, selected).await?;
-            if found.is_empty()
-                && let [record] = records.as_slice()
-                && let Some(address) = remembered.get(&record.udid)
-            {
-                // Still asleep or not announcing: try where it last answered.
-                tracing::debug!(
-                    "No Bonjour answer; trying {address}, where the phone last answered"
-                );
-                found.insert(record.udid.clone(), (address, 0));
-            }
-            ensure!(
-                !found.is_empty(),
-                "no paired iPhone answered over Wi-Fi; wake or unlock it on this network, or pass --wifi-address. If it is awake and still does not answer, it may no longer trust this computer: pair and trust it over USB, then run again"
-            );
-            ensure!(
-                found.len() == 1,
-                "multiple paired iPhones found over Wi-Fi; select the intended device with --device UDID"
-            );
-            let (udid, (address, scope_id)) = found.pop_first().expect("one phone");
+            let wake = remembered.known(&records);
+            wake.unicast();
+            let found = browse(&records, selected, &wake).await?;
+            // A phone tried at its last address after no Bonjour answer may
+            // not answer there either.
+            let unanswered = found.is_empty().then(|| no_answer(&wake));
+            let (udid, answer) = choose(found, &wake)?;
             let record = records
                 .into_iter()
                 .find(|record| record.udid == udid)
-                .expect("found phones come from the records");
-            (record, address, scope_id)
+                .expect("chosen phones come from the records");
+            (record, answer, unanswered)
         }
     };
     let provider = DeviceProvider {
         udid: record.udid,
         route: Route::Wifi(Phone {
-            address,
-            scope_id,
+            address: answer.address,
+            scope_id: answer.scope_id,
             pairing: Arc::new(record.pairing),
         }),
     };
     super::lock_phone(&provider.udid)?;
-    confirm(&provider).await?;
-    remembered.set(&provider.udid, address);
+    confirm(&provider, unanswered).await?;
+    remembered.set(&provider.udid, answer.address);
+    // A name without a MAC leaves the last one remembered.
+    if let Some(mac) = &answer.mac {
+        remembered.set_mac(&provider.udid, mac);
+    }
     let (heartbeat, keep_awake) = held_awake(&provider).await;
     Ok(Found {
         provider,
@@ -255,16 +507,62 @@ pub(super) async fn find(config: &WifiConfig, selected: Option<&str>) -> Result<
     })
 }
 
-/// Paired phones answering Bonjour, without opening a session.
+/// The phone to open: the one paired phone that answered Bonjour or, when
+/// none did, the one with a last address to try. A paired session then
+/// proves which phone is there.
+fn choose(mut found: BTreeMap<String, Answer>, wake: &Wake) -> Result<(String, Answer)> {
+    if found.is_empty() {
+        return match wake.addresses.as_slice() {
+            [(udid, address, _)] => {
+                // Still asleep or not announcing: try where it last answered.
+                tracing::debug!(
+                    "No Bonjour answer; trying {address}, where the phone last answered"
+                );
+                Ok((udid.clone(), Answer::at(*address)))
+            }
+            [] => bail!(no_answer(wake)),
+            _ => bail!(
+                "no paired iPhone answered over Wi-Fi, and several have a last address to try; select one with --device UDID"
+            ),
+        };
+    }
+    ensure!(
+        found.len() == 1,
+        "multiple paired iPhones found over Wi-Fi; select the intended device with --device UDID"
+    );
+    Ok(found.pop_first().expect("one phone"))
+}
+/// Why no phone answered: what was tried, and how rustunes learns the phone
+/// again.
+fn no_answer(wake: &Wake) -> String {
+    const UNTRUSTED: &str = "If it is awake and still does not answer, it may no longer trust this computer: pair and trust it over USB, then run again";
+    let tried = match (wake.addresses.is_empty(), wake.macs.is_empty()) {
+        (true, true) => {
+            return format!(
+                "no paired iPhone answered over Wi-Fi, and rustunes has no saved address or Wi-Fi identity to wake a locked one by; unlock the phone on this network and run again, so rustunes learns them, or pass --wifi-address. {UNTRUSTED}"
+            );
+        }
+        (false, true) => "at its last address",
+        (true, false) => "by its last Wi-Fi identity",
+        (false, false) => "at its last address and by its last Wi-Fi identity",
+    };
+    format!(
+        "no paired iPhone answered over Wi-Fi after rustunes tried to wake it {tried}; it may have a new address or Wi-Fi identity since it last answered. Unlock it once on this network and run again, so rustunes learns them, or pass --wifi-address. {UNTRUSTED}"
+    )
+}
+
+/// Paired phones answering Bonjour, woken as `find` wakes them, without
+/// opening a session.
 pub(super) async fn list(config: &WifiConfig) -> Result<Vec<Listed>> {
     let records = records(&config.pairing_records, None)?;
-    Remembered(config.remembered.clone()).wake(&records);
-    Ok(browse(&records, None)
+    let wake = Remembered(config.remembered.clone()).known(&records);
+    wake.unicast();
+    Ok(browse(&records, None, &wake)
         .await?
         .into_iter()
-        .map(|(udid, (address, _))| Listed {
+        .map(|(udid, answer)| Listed {
             udid,
-            transport: Transport::Wifi(address),
+            transport: Transport::Wifi(answer.address),
         })
         .collect())
 }
@@ -366,13 +664,34 @@ async fn record_at(address: IpAddr, mut records: Vec<Record>) -> Result<Record> 
 
 type Keys = Vec<(String, Vec<u8>, String)>;
 
+/// A paired phone's Bonjour answer.
+#[derive(Debug, PartialEq)]
+struct Answer {
+    address: IpAddr,
+    scope_id: u32,
+    /// The Wi-Fi MAC its instance name starts with, if it does.
+    mac: Option<String>,
+}
+impl Answer {
+    /// A phone reached at an address without a Bonjour answer.
+    fn at(address: IpAddr) -> Self {
+        Self {
+            address,
+            scope_id: 0,
+            mac: None,
+        }
+    }
+}
+
 /// Bonjour answers matched to pairing records, by UDID. iOS 26.4 and later
 /// publish an identifier and auth tags derived from the record's HostID;
 /// earlier versions name the service after the phone's Wi-Fi MAC address.
+/// Apple's multicast wake runs alongside for the remembered MACs.
 async fn browse(
     records: &[Record],
     selected: Option<&str>,
-) -> Result<BTreeMap<String, (IpAddr, u32)>> {
+    wake: &Wake,
+) -> Result<BTreeMap<String, Answer>> {
     let keys: Keys = records
         .iter()
         .map(|record| {
@@ -384,48 +703,70 @@ async fn browse(
         })
         .collect();
     let selected = selected.map(str::to_owned);
-    tokio::task::spawn_blocking(move || browse_blocking(&keys, selected.as_deref()))
+    let window = wake.window();
+    let macs = wake.macs.clone();
+    tokio::task::spawn_blocking(move || browse_blocking(&keys, selected.as_deref(), window, &macs))
         .await
         .context("Bonjour discovery task failed")?
 }
-fn browse_blocking(keys: &Keys, selected: Option<&str>) -> Result<BTreeMap<String, (IpAddr, u32)>> {
+fn browse_blocking(
+    keys: &Keys,
+    selected: Option<&str>,
+    window: Duration,
+    macs: &[String],
+) -> Result<BTreeMap<String, Answer>> {
     let daemon = ServiceDaemon::new().context("starting Bonjour discovery")?;
     let events = daemon.browse(SERVICE).context("browsing Bonjour")?;
-    let deadline = std::time::Instant::now() + BROWSE;
+    tracing::debug!("Browsing Bonjour for up to {} s", window.as_secs());
+    let deadline = Instant::now() + window;
     let mut found = BTreeMap::new();
     let mut answers = 0;
-    while let Ok(event) = events.recv_deadline(deadline) {
-        let ServiceEvent::ServiceResolved(service) = event else {
-            continue;
-        };
-        answers += 1;
-        let txt = service.get_properties();
-        let udid = matching(service.get_fullname(), txt, keys);
-        let (Some(udid), Some(address)) = (udid, preferred(service.get_addresses())) else {
-            if udid.is_some() {
-                tracing::debug!("A paired phone answered Bonjour without an address");
-            } else if let Some(Some(_)) = txt.get_property_val("identifier") {
-                // Other Apple devices answer too, and so does a paired phone
-                // that no longer trusts this computer: its tags match none.
-                tracing::debug!(
-                    "A Bonjour answer with an identifier and {} auth tag(s) matched no pairing record",
-                    auth_tags(txt).len()
-                );
-            } else {
-                tracing::debug!(
-                    "A Bonjour answer named by a Wi-Fi address matched no pairing record"
-                );
+    let (stop, stopped) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || multicast_wake(macs, &stopped));
+        while let Ok(event) = events.recv_deadline(deadline) {
+            let ServiceEvent::ServiceResolved(service) = event else {
+                continue;
+            };
+            answers += 1;
+            let txt = service.get_properties();
+            let udid = matching(service.get_fullname(), txt, keys);
+            let (Some(udid), Some(address)) = (udid, preferred(service.get_addresses())) else {
+                if udid.is_some() {
+                    tracing::debug!("A paired phone answered Bonjour without an address");
+                } else if let Some(Some(_)) = txt.get_property_val("identifier") {
+                    // Other Apple devices answer too, and so does a paired
+                    // phone that no longer trusts this computer: its tags
+                    // match none.
+                    tracing::debug!(
+                        "A Bonjour answer with an identifier and {} auth tag(s) matched no pairing record",
+                        auth_tags(txt).len()
+                    );
+                } else {
+                    tracing::debug!(
+                        "A Bonjour answer named by a Wi-Fi address matched no pairing record"
+                    );
+                }
+                continue;
+            };
+            tracing::debug!("A paired phone answered Bonjour at {}", address.0);
+            found.insert(
+                udid.to_owned(),
+                Answer {
+                    address: address.0,
+                    scope_id: address.1,
+                    mac: name_mac(service.get_fullname()),
+                },
+            );
+            // Only paired phones can match, so once each has answered (or
+            // the selected one has) nothing else can turn up.
+            if selected == Some(udid) || found.len() == keys.len() {
+                break;
             }
-            continue;
-        };
-        tracing::debug!("A paired phone answered Bonjour at {}", address.0);
-        found.insert(udid.to_owned(), address);
-        // Only paired phones can match, so once each has answered (or the
-        // selected one has) nothing else can turn up.
-        if selected == Some(udid) || found.len() == keys.len() {
-            break;
         }
-    }
+        // The wake ends with the browse.
+        drop(stop);
+    });
     let _ = daemon.shutdown();
     tracing::debug!(
         "{answers} Bonjour answer(s), {} from paired phones",
@@ -468,13 +809,18 @@ fn preferred(addresses: &HashSet<ScopedIp>) -> Option<(IpAddr, u32)> {
 
 /// A paired session proves the phone accepts this host's record; the UDID it
 /// reports inside that session must be the one the record is filed under.
-async fn confirm(provider: &DeviceProvider) -> Result<()> {
+/// `unanswered` explains a phone that does not answer at all.
+async fn confirm(provider: &DeviceProvider, unanswered: Option<String>) -> Result<()> {
     let Transport::Wifi(address) = provider.transport() else {
         unreachable!("Wi-Fi providers only");
     };
-    let mut lockdown = LockdownClient::connect(provider)
+    let connected = LockdownClient::connect(provider)
         .await
-        .with_context(|| format!("connecting to Lockdown at {address} over Wi-Fi"))?;
+        .with_context(|| format!("connecting to Lockdown at {address} over Wi-Fi"));
+    let mut lockdown = match unanswered {
+        Some(unanswered) => connected.context(unanswered)?,
+        None => connected?,
+    };
     lockdown
         .start_session(&provider.get_pairing_file().await?)
         .await

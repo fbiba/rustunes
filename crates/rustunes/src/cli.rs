@@ -52,8 +52,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "UDID")]
     device: Option<String>,
     /// Reach the phone over Wi-Fi instead of USB. It must have been paired and
-    /// trusted over USB once, be on this network and be awake; it is found by
-    /// Bonjour and secured with the pairing record usbmuxd saved.
+    /// trusted over USB once and be on this network; it is found by Bonjour and
+    /// secured with the pairing record usbmuxd saved. Have it awake the first
+    /// time: after that it is woken even while locked.
     #[arg(long, global = true)]
     wifi: bool,
     /// Reach the phone over Wi-Fi at this address instead of finding it by
@@ -916,7 +917,7 @@ fn device_config(cli: &Cli) -> Result<engine::DeviceConfig> {
         config
     })
 }
-/// Where the phone's last Wi-Fi address is remembered.
+/// Where each phone's last Wi-Fi address and Wi-Fi MAC are remembered.
 pub(crate) fn wifi_memory() -> Option<PathBuf> {
     default_state_directory()
         .ok()
