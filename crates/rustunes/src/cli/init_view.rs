@@ -234,6 +234,10 @@ fn show_check(report: &Value, out: &mut impl Write) -> Result<()> {
             "not ready: the music library is inconsistent, and rustunes will not read it: {}",
             readiness["reason"].as_str().unwrap_or("?")
         ),
+        Some("interrupted_sync") => "not ready: an interrupted sync left files on the iPhone that \
+             stop rustunes from changing its music. If a rustunes command was interrupted, run it \
+             again: it finishes the job and removes these files"
+            .to_owned(),
         Some("never_synced") => {
             "never synced with a music library. Run rustunes init to prepare it".to_owned()
         }

@@ -1361,8 +1361,10 @@ impl Transfer {
     /// without it they stay for good and refuse every later staging. That the
     /// message never went is the caller's to prove (from its own send trace);
     /// this checks the bytes. Each of SIGNATURE, then METADATA, that exists
-    /// must be a regular file holding exactly `signature` / `operation`; only
-    /// then is that one path removed and its absence confirmed. A locked
+    /// must be a regular file holding `signature` / `operation`, or the start
+    /// of them (none at all included), as a host killed while it wrote them
+    /// leaves them; only then is that one path removed and its absence
+    /// confirmed. A locked
     /// connection can do this and remove nothing else. Returns the paths
     /// removed, in order.
     pub async fn remove_staged_operation(
@@ -1372,7 +1374,7 @@ impl Transfer {
     ) -> Result<Vec<&'static str>> {
         let mut removed = Vec::new();
         for (path, expected) in [(SIGNATURE, &signature[..]), (METADATA, operation)] {
-            if self.remove_checked(path, expected, false).await? {
+            if self.remove_checked(path, expected, true).await? {
                 removed.push(path);
             }
         }

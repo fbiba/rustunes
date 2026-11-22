@@ -56,3 +56,50 @@ async fn other_bytes_a_longer_file_or_a_folder_are_never_removed() {
         assert!(!phone.log.contains(&AfcOpcode::RemovePath));
     }
 }
+
+/// A staged operation pair whose write a killed host cut short, down to an
+/// empty operation file and no signature, is removed as the whole pair is.
+#[tokio::test]
+async fn a_staged_pair_cut_short_is_removed() {
+    let operation = b"<plist>operation</plist>";
+    let signature = [9_u8; 21];
+    for (written, signed) in [
+        (0, None),
+        (10, None),
+        (operation.len(), Some(0)),
+        (operation.len(), Some(7)),
+    ] {
+        let trace = Temporary::new();
+        // Locked: no Started permit unlocked it.
+        let (mut transfer, peer) = pair(&trace.0, Duration::from_secs(5));
+        let mut phone = FakePhone::new(&[
+            "iTunes_Control",
+            "iTunes_Control/Sync",
+            "iTunes_Control/Sync/Media",
+        ]);
+        phone.tree.insert(
+            METADATA.to_owned(),
+            Node::File(operation[..written].to_vec()),
+        );
+        if let Some(signed) = signed {
+            phone.tree.insert(
+                SIGNATURE.to_owned(),
+                Node::File(signature[..signed].to_vec()),
+            );
+        }
+        let server = tokio::spawn(phone.serve(peer));
+        let removed = transfer
+            .remove_staged_operation(operation, &signature)
+            .await
+            .unwrap();
+        drop(transfer);
+        let phone = server.await.unwrap();
+        assert_eq!(
+            removed.len(),
+            1 + usize::from(signed.is_some()),
+            "{written}"
+        );
+        assert!(!phone.tree.contains_key(METADATA), "{written}");
+        assert!(!phone.tree.contains_key(SIGNATURE), "{written}");
+    }
+}

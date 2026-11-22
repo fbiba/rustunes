@@ -21,6 +21,33 @@ fn report(readiness: Value) -> Value {
     })
 }
 
+/// A synced phone whose staging folder holds an interrupted sync's files is
+/// not ready, in plain words, with what to do.
+#[test]
+fn an_interrupted_sync_is_not_ready() {
+    let text = shown(&report(json!({
+        "state": "interrupted_sync",
+        "initialised_by_rustunes": true,
+        "staged": ["Sync_00000000.plist", "Sync_00000000.plist.cig"],
+    })));
+    assert!(
+        text.contains("In Sync/Media: Sync_00000000.plist, Sync_00000000.plist.cig\n"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "Verdict: not ready: an interrupted sync left files on the iPhone that stop \
+             rustunes from changing its music. If a rustunes command was interrupted, run it \
+             again: it finishes the job and removes these files\n"
+        ),
+        "{text}"
+    );
+    let ready = shown(&report(
+        json!({"state": "synced", "initialised_by_rustunes": true}),
+    ));
+    assert!(ready.ends_with("Verdict: initialised by rustunes; ready to sync\n"));
+}
+
 /// Rows left for deleted tracks get one plain warning, with about how many
 /// new songs clear them when new songs reach them; the tables and counts stay
 /// in the JSON.

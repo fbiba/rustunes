@@ -101,6 +101,15 @@ pub(crate) enum Readiness {
     /// the catalogue refuses such a library. `reason` names the tables and
     /// the counts.
     Inconsistent { initialised: bool, reason: String },
+    /// As `Synced`, but `iTunes_Control/Sync/Media` holds `staged`: files a
+    /// sync left when it stopped before the phone took them. Every write
+    /// refuses while they are there. The command that left rustunes' own
+    /// removes them when it runs again; nothing in rustunes removes another
+    /// host's.
+    Interrupted {
+        initialised: bool,
+        staged: Vec<String>,
+    },
     /// No computer has synced the phone: `rustunes init` prepares it.
     NeverSynced,
     /// `rustunes init` began writing its prefs, but its first session did not
@@ -184,10 +193,15 @@ impl Inspection {
         let mut reasons = Vec::new();
         match &self.prefs {
             Prefs::Valid { .. } if library_synced => {
+                let staged: Vec<String> = self.staged.iter().flatten().cloned().collect();
                 return Ok(match inconsistency {
                     Some(reason) => Readiness::Inconsistent {
                         initialised: own,
                         reason,
+                    },
+                    None if !staged.is_empty() => Readiness::Interrupted {
+                        initialised: own,
+                        staged,
                     },
                     None => Readiness::Synced { initialised: own },
                 });
@@ -317,6 +331,7 @@ impl Inspection {
             "readiness": match readiness {
                 Readiness::Synced { initialised } => json!({"state": "synced", "initialised_by_rustunes": initialised}),
                 Readiness::Inconsistent { initialised, reason } => json!({"state": "inconsistent", "initialised_by_rustunes": initialised, "reason": reason}),
+                Readiness::Interrupted { initialised, staged } => json!({"state": "interrupted_sync", "initialised_by_rustunes": initialised, "staged": staged}),
                 Readiness::NeverSynced => json!({"state": "never_synced"}),
                 Readiness::InitUnfinished => json!({"state": "init_unfinished"}),
                 Readiness::Unclear(reasons) => json!({"state": "unclear", "reasons": reasons}),

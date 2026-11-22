@@ -144,10 +144,18 @@ pub(crate) async fn run(
     )?;
     match &readiness {
         Readiness::NeverSynced | Readiness::InitUnfinished => {}
-        Readiness::Synced { initialised: true } => {
+        // Files an interrupted sync left are for the next sync to settle:
+        // the phone is synced, so init has nothing to do.
+        Readiness::Synced { initialised: true }
+        | Readiness::Interrupted {
+            initialised: true, ..
+        } => {
             return Ok(Outcome::AlreadyInitialised { run });
         }
-        Readiness::Synced { initialised: false } => bail!(
+        Readiness::Synced { initialised: false }
+        | Readiness::Interrupted {
+            initialised: false, ..
+        } => bail!(
             "this iPhone is already synced with a music library; rustunes syncs it as it is. \
              init is only for an iPhone no computer has synced"
         ),

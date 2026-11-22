@@ -479,6 +479,54 @@ fn leftover_rows_from_deleted_tracks_leave_a_synced_phone_ready() {
     assert_eq!(report["database"]["songs_until_cleared"], 2);
 }
 
+/// Every write refuses while the staging folder holds anything, so a synced
+/// phone holding what an interrupted sync left there is not ready: rustunes'
+/// own pair, another host's, or a lone signature alike. The catalogue's own
+/// refusal comes first.
+#[test]
+fn files_an_interrupted_sync_left_make_a_synced_phone_not_ready() {
+    let record = InitRecord::mint().unwrap();
+    let mut inspection = with_prefs(fresh(), &record);
+    inspection.library = Some(synced_library());
+    inspection.staged = Some(Vec::new());
+    assert_eq!(
+        inspection.readiness(Some(&record)).unwrap(),
+        Readiness::Synced { initialised: true }
+    );
+    let pair = vec![
+        "Sync_00000000.plist".to_owned(),
+        "Sync_00000000.plist.cig".to_owned(),
+    ];
+    let signature = vec!["Sync_00000003.plist.cig".to_owned()];
+    for (own, initialised) in [(Some(&record), true), (None, false)] {
+        for staged in [&pair, &signature] {
+            inspection.staged = Some(staged.clone());
+            assert_eq!(
+                inspection.readiness(own).unwrap(),
+                Readiness::Interrupted {
+                    initialised,
+                    staged: staged.clone()
+                }
+            );
+        }
+    }
+    inspection.staged = Some(pair.clone());
+    let readiness = inspection.readiness(Some(&record)).unwrap();
+    let report = inspection.report(&readiness);
+    assert_eq!(
+        report["readiness"],
+        json!({"state": "interrupted_sync", "initialised_by_rustunes": true, "staged": pair})
+    );
+    inspection.library = Some(LibraryState {
+        item_rows: item_rows(2, &[("item_stats", 1, 0)]),
+        ..synced_library()
+    });
+    assert!(matches!(
+        inspection.readiness(Some(&record)).unwrap(),
+        Readiness::Inconsistent { .. }
+    ));
+}
+
 /// A track without a companion row makes the catalogue refuse the library,
 /// so a synced phone holding one is not ready, and the reason gives the
 /// counts.

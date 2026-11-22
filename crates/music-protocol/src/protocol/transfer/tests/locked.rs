@@ -152,8 +152,12 @@ async fn a_locked_connection_removes_only_a_staged_pair_holding_exactly_the_oper
 async fn staged_files_that_are_not_the_operation_are_never_removed() {
     let signature = [9_u8; 21];
     for (size, bytes, message) in [
-        (20, None, "is not this operation"),
-        (21, Some([8_u8; 21]), "differs from this operation"),
+        (22, None, "it is larger"),
+        (
+            21,
+            Some([8_u8; 21]),
+            "differs from what the interrupted write was writing",
+        ),
     ] {
         let trace = Temporary::new();
         let (mut transfer, mut peer) = pair(&trace.0, Duration::from_secs(2));

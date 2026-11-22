@@ -7,7 +7,9 @@
 //! folder. Every outgoing frame is traced before it is sent, so a send trace
 //! without that message proves the phone was never told to apply the pair.
 //! Then the pair, read back byte for byte against the journal's operation and
-//! signature, is removed, and the record settles NotApplied.
+//! signature, is removed, and the record settles NotApplied. A host killed
+//! while it wrote the pair leaves the start of those bytes, or an empty
+//! file, which goes the same way.
 use crate::{
     engine::execution::device,
     engine::execution::native_insert::{Control, create_trace},
