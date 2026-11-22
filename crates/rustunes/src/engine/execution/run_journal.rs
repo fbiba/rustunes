@@ -8,6 +8,9 @@
 //! phone's tracks, the journal is carried forward first as a pull would
 //! carry it; with none to carry, a phone `rustunes init` prepared that holds
 //! no track gets the journal a pull would write for it, which binds nothing.
+//! When the phone's journal binds a track the phone no longer holds (the
+//! song was deleted on the phone), it is written again without that binding
+//! first, as a pull would drop it, and is otherwise unchanged.
 //! Either happens only from a capture this run took: a saved snapshot may
 //! predate tracks the phone holds now. A dry run writes what it carries or
 //! starts into its run directory and plans against it there, leaving the
@@ -109,8 +112,9 @@ pub(crate) enum Resolution {
     /// The phone's journal, which is not there and was not started. The run
     /// goes on without one, and a real run creates it where it writes.
     Absent,
-    /// Carried forward from an earlier journal. When not `installed` (a dry
-    /// run), it is in the run directory and the phone's journal is as it was.
+    /// Carried forward from an earlier journal, or written again without
+    /// the tracks deleted on the phone. When not `installed` (a dry run), it
+    /// is in the run directory and the phone's journal is as it was.
     Carried { installed: bool },
     /// Started, binding nothing, for a phone `rustunes init` prepared that
     /// holds no track. When not `installed` (a dry run), it is in the run
@@ -153,13 +157,6 @@ impl RunJournal {
             &snapshot.identity.library_identity_sha256,
         )?;
         let exists = journal.try_exists()?;
-        if exists {
-            match Journal::open_read_only(&journal, &identity) {
-                Ok(_) => return Ok(Self::at(journal, Resolution::Current)),
-                Err(error) if journal::is_superseded(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
         // As `pull --dry-run` does, a dry run plans against what it writes
         // in its run directory and leaves the phone's journal as it is.
         let target = if ask.dry_run {
@@ -168,6 +165,33 @@ impl RunJournal {
             journal.clone()
         };
         let installed = !ask.dry_run;
+        if exists {
+            match Journal::open_read_only(&journal, &identity) {
+                Ok(current) => {
+                    // Songs deleted on the phone are forgotten first, from a
+                    // capture this run took; a saved one may predate them.
+                    let deleted = match taken {
+                        Taken::ByThisRun => {
+                            pull::deleted_on_phone(&journal, &current, snapshot, ask.run)?
+                        }
+                        Taken::Saved => None,
+                    };
+                    let Some(found) = deleted else {
+                        return Ok(Self::at(journal, Resolution::Current));
+                    };
+                    let tracks = pull::forget_deleted(snapshot, &current, found, &target, control)?;
+                    drop(current);
+                    crate::engine::observe(crate::engine::Event::DeletedOnPhone {
+                        tracks,
+                        journal: &target,
+                        installed,
+                    })?;
+                    return Ok(Self::at(target, Resolution::Carried { installed }));
+                }
+                Err(error) if journal::is_superseded(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let Some(found) = pull::find_earlier(ask.state, &journal, snapshot, ask.run)? else {
             if !exists && taken == Taken::ByThisRun && initialised_and_empty(ask.state, snapshot)? {
                 pull::write_unbound(&target, snapshot)?;

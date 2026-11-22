@@ -204,6 +204,9 @@ pub(super) fn line(event: &Event<'_>) -> Result<Option<String>> {
             text.push_str(&format!("\nJournal: {}", journal.display()));
             text
         }
+        Event::DeletedOnPhone {
+            tracks, installed, ..
+        } => deleted_on_phone_line(*tracks, *installed),
         Event::JournalStarted { journal, installed } => {
             let text = if *installed {
                 "Started this phone's journal: rustunes init prepared it and it holds no track"
@@ -352,6 +355,20 @@ pub(super) fn covered(result: &CoverResult) -> String {
             "Artwork verified in the permanent device cache. Audio and catalogue tracks preserved."
                 .into()
         }
+    }
+}
+
+/// What a run says when songs rustunes sent were deleted on the phone and
+/// it updated its records (only on a real run, `installed`).
+pub(super) fn deleted_on_phone_line(tracks: usize, installed: bool) -> String {
+    let songs = match tracks {
+        1 => "1 song rustunes sent was".to_owned(),
+        n => format!("{n} songs rustunes sent were"),
+    };
+    if installed {
+        format!("{songs} deleted on the iPhone; rustunes updated its records to match.")
+    } else {
+        format!("{songs} deleted on the iPhone; the real run updates rustunes' records to match.")
     }
 }
 

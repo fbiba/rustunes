@@ -204,7 +204,7 @@ pub(crate) fn reason(
         }
         // Refusals that hold the run.
         "journal_reconciliation_required" => {
-            "rustunes' journal has unfinished work, or a track it sent changed on the phone; that must be settled before anything new is added. `rustunes status` shows it."
+            "an earlier rustunes command was interrupted, or a song rustunes sent changed on the iPhone, so nothing new is added until that is settled. If a command was interrupted, run it again to finish it; otherwise run `rustunes pull` to bring rustunes' records up to date."
                 .into()
         }
         "mp3_journal_required" => {
@@ -485,4 +485,4 @@ fn atom_field(atom: &str) -> &str {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -899,6 +899,10 @@ fn holds(plan: &crate::engine::planning::additive::Plan) -> Vec<Hold> {
         .collect();
     for row in &plan.sources {
         if let Decision::Conflict { code, message } = &row.decision {
+            // What holds the journal holds every new source: said once.
+            if *code == "journal_reconciliation_required" && !plan.journal_blockers.is_empty() {
+                continue;
+            }
             holds.push(Hold {
                 path: Some(row.relative_path.clone()),
                 code: (*code).into(),
@@ -914,20 +918,24 @@ fn holds(plan: &crate::engine::planning::additive::Plan) -> Vec<Hold> {
     holds
 }
 
-/// A journal blocker (`additive::Plan::journal_blockers`) in plain words.
+/// A journal blocker (`additive::Plan::journal_blockers`) in plain words,
+/// with what to do.
 fn journal_reason(blocker: &str) -> String {
     match blocker {
-        "outstanding_prepared_requires_resolution" => {
-            "an earlier run prepared a change it never started; `rustunes status` shows it and how to cancel it.".into()
-        }
-        "outstanding_started_requires_reconciliation" => {
-            "an earlier run started a change it didn't finish; `rustunes status` shows it and how to settle it.".into()
+        "outstanding_prepared_requires_resolution"
+        | "outstanding_started_requires_reconciliation" => {
+            "an earlier rustunes command was interrupted before it finished. Run that command again to finish it, then run this one again.".into()
         }
         _ => match blocker.strip_prefix("verified_binding_drift:") {
+            // A song deleted on the phone is forgotten before planning
+            // (`RunJournal`), except from a saved snapshot or an explicit
+            // journal; `pull` forgets it, and settles a changed one.
             Some(track) => format!(
-                "track {track}, which rustunes sent, no longer matches what it sent; `rustunes status` shows it."
+                "a song rustunes sent (track {track}) is no longer on the iPhone as rustunes sent it. Run `rustunes pull` to bring rustunes' records up to date, then run this again."
             ),
-            None => format!("rustunes' journal has unfinished work ({blocker}); `rustunes status` shows it."),
+            None => format!(
+                "rustunes' records for this iPhone hold unfinished work ({blocker}). Run the interrupted command again to finish it."
+            ),
         },
     }
 }
@@ -1053,6 +1061,55 @@ fn preserved_mpeg_keep(
 }
 #[cfg(test)]
 mod tests {
+    /// What holds the journal is said once, in plain words with what to do,
+    /// not again for every new source it holds; nothing sends people to
+    /// `rustunes status`, which cannot show it.
+    #[test]
+    fn a_held_journal_is_explained_once_with_what_to_do() {
+        use crate::engine::planning::{additive::skip::tests::row, change::tests::sync};
+        let mut plan = sync(vec![
+            row("new.m4a", "journal_reconciliation_required", "held"),
+            row("other.m4a", "journal_reconciliation_required", "held"),
+            row("twice.m4a", "multiple_existing_audio_matches", "held"),
+        ]);
+        plan.journal_blockers = vec![
+            "outstanding_started_requires_reconciliation".into(),
+            "verified_binding_drift:00000000000000aa".into(),
+        ];
+        let holds = holds(&plan);
+        let shown: Vec<_> = holds
+            .iter()
+            .map(|h| (h.path.as_deref(), h.code.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (None, "outstanding_started_requires_reconciliation"),
+                (None, "verified_binding_drift:00000000000000aa"),
+                (Some("twice.m4a"), "multiple_existing_audio_matches"),
+            ]
+        );
+        assert_eq!(
+            holds[0].reason,
+            "an earlier rustunes command was interrupted before it finished. Run that command \
+             again to finish it, then run this one again."
+        );
+        assert_eq!(
+            holds[1].reason,
+            "a song rustunes sent (track 00000000000000aa) is no longer on the iPhone as \
+             rustunes sent it. Run `rustunes pull` to bring rustunes' records up to date, then \
+             run this again."
+        );
+        assert!(holds.iter().all(|h| !h.reason.contains("status")));
+        // Without a journal blocker, a source's own hold is shown.
+        plan.journal_blockers.clear();
+        assert_eq!(holds_of(&plan), ["new.m4a", "other.m4a", "twice.m4a"]);
+    }
+
+    fn holds_of(plan: &crate::engine::planning::additive::Plan) -> Vec<String> {
+        holds(plan).into_iter().filter_map(|h| h.path).collect()
+    }
+
     #[test]
     fn only_a_batch_undone_cleanly_plans_again() {
         let reason = "insert batch 7 added 96 of its 100 tracks";

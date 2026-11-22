@@ -355,6 +355,20 @@ pub(crate) fn event(event: &Event<'_>) -> Result<()> {
                 "unfinished": unfinished,
             }),
         ),
+        Event::DeletedOnPhone {
+            tracks,
+            journal,
+            installed,
+        } => notice(
+            "tracks_deleted_on_phone",
+            Info,
+            line()?,
+            json!({
+                "tracks": tracks,
+                "journal": path(journal),
+                "installed": installed,
+            }),
+        ),
         Event::JournalStarted { journal, installed } => notice(
             "journal_started",
             Info,

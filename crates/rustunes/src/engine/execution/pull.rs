@@ -323,6 +323,99 @@ pub(crate) async fn carry(
     })
 }
 
+/// The phone's journal at `journal`, which this build opens as `current`,
+/// when some track it binds is gone from the phone: no track of the capture
+/// `saved` has its ID, as after the song was deleted in the Music app. None
+/// when every bound track is there, and also when the journal holds work it
+/// left unfinished, which must be settled first, or a binding this build
+/// cannot read. Its private copy goes in `run`.
+pub(crate) fn deleted_on_phone(
+    journal: &Path,
+    current: &Journal,
+    saved: &snapshot::Snapshot,
+    run: &Path,
+) -> Result<Option<Found>> {
+    let held: BTreeSet<u64> = saved.catalog.tracks().iter().map(|t| t.sync_id).collect();
+    if current
+        .active_verified_bindings()?
+        .iter()
+        .all(|b| held.contains(&b.content.track_pid))
+    {
+        return Ok(None);
+    }
+    let scratch = run.join("earlier-journals");
+    fs::DirBuilder::new().mode(0o700).create(&scratch)?;
+    let prior = crate::engine::state::journal::read_prior(journal, &scratch.join("0"))?;
+    if !prior.unfinished.is_empty() || !prior.unreadable.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Found {
+        path: journal.to_path_buf(),
+        superseded: false,
+        prior,
+    }))
+}
+
+/// Write at `target` the journal `found` (from `deleted_on_phone`, which this
+/// build opens as `current`) less the bindings whose track the capture
+/// `saved` no longer holds. Every other binding is carried as it was: its
+/// track, path, cover record and conversion, and the source path planning
+/// attributes it to now (`additive::source_paths`, under `control`), even
+/// one that has since left the library, so a `sync` still removes its track.
+/// No other phone track is bound, and nothing is read from the phone. A
+/// journal already at `target` moves to `journal.previous`. Returns how many
+/// bindings were dropped.
+pub(crate) fn forget_deleted(
+    saved: &snapshot::Snapshot,
+    current: &Journal,
+    found: Found,
+    target: &Path,
+    control: &Control,
+) -> Result<usize> {
+    let identity = saved.journal_identity()?;
+    let held: BTreeSet<u64> = saved.catalog.tracks().iter().map(|t| t.sync_id).collect();
+    // Without the run history that names some sources, the ones the
+    // journal itself records.
+    let attributed =
+        crate::engine::planning::additive::source_paths(current, &identity, control).ok();
+    let pulled = kept(&found.prior, &held, attributed.as_ref());
+    write(
+        target,
+        &identity,
+        receipt(saved),
+        &pulled,
+        Some(&found.prior),
+        false,
+    )?;
+    Ok(found.prior.bindings.len() - pulled.len())
+}
+
+/// The bindings of `prior` whose track is in `held`, as they were, each with
+/// the source path `attributed` names for it (none where it names a reason
+/// instead), or without `attributed` the one `prior` reads.
+fn kept(
+    prior: &Prior,
+    held: &BTreeSet<u64>,
+    attributed: Option<&std::collections::BTreeMap<u64, std::result::Result<PathBuf, String>>>,
+) -> Vec<Pulled> {
+    prior
+        .bindings
+        .iter()
+        .filter(|b| held.contains(&b.content.track_pid))
+        .map(|b| Pulled {
+            content: b.content.clone(),
+            source: match attributed {
+                Some(paths) => paths
+                    .get(&b.content.track_pid)
+                    .and_then(|path| path.as_ref().ok())
+                    .cloned(),
+                None => b.source.clone(),
+            },
+            conversion: b.conversion.clone(),
+        })
+        .collect()
+}
+
 /// Write at `target`, where no journal is, the journal a pull writes for a
 /// phone that holds no track a sync made and no earlier journal knows: it
 /// binds nothing and records the capture `saved`.

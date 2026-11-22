@@ -67,7 +67,7 @@ use music_protocol::media::artwork::{self, Cover};
 use music_protocol::media::fingerprint::{SourceFingerprint, TransferredSource};
 use music_protocol::media::metadata::{self, Metadata};
 use music_protocol::protocol::session::{self, Session};
-use music_protocol::protocol::transfer::{MAX_SESSION_OPS, Transfer};
+use music_protocol::protocol::transfer::{MAX_AUDIO, MAX_SESSION_OPS, Transfer};
 
 const AIRLOCK: &str = "Airlock/Media";
 const ARTWORK: &str = "Airlock/Media/Artwork";
@@ -1744,8 +1744,11 @@ async fn settle_with(
     // A target is bound when its row holds the planned path and the complete
     // index read exactly the sent bytes there; a row the phone left without a
     // file location awaits compensation; a target without a row was deleted
-    // again by the phone, which the catalogue check and the absence of its
-    // planned file confirm. Anything else is unexplained.
+    // again by the phone, which the catalogue check confirms, with nothing at
+    // its planned path or exactly the sent audio there: a song deleted in
+    // the Music app while its file was still being copied keeps the file
+    // outstanding, which lands later, named by no row (docs/04, section
+    // 4.6). Anything else is unexplained.
     let mut bound = Vec::new();
     let mut locationless = BTreeSet::new();
     let mut removed = BTreeMap::new();
@@ -1865,12 +1868,14 @@ async fn settle_with(
                     run.display()
                 )
             })?;
-    let removed_paths: Vec<&str> = removed
+    let removed_contents: Vec<&Content> = removed
         .keys()
-        .map(|ordinal| batch.targets[*ordinal].target.content.path.as_str())
+        .map(|ordinal| &batch.targets[*ordinal].target.content)
         .collect();
-    if !removed_paths.is_empty() {
-        planned_absent(identity, &after, &run, &removed_paths, control)
+    let landed = if removed_contents.is_empty() {
+        BTreeSet::new()
+    } else {
+        planned_absent_or_sent(identity, &after, &run, &removed_contents, control)
             .await
             .with_context(|| {
                 format!(
@@ -1878,8 +1883,8 @@ async fn settle_with(
                     batch.id.as_i64(),
                     run.display()
                 )
-            })?;
-    }
+            })?
+    };
     if let Some(removal) = &removal {
         let library = music_protocol::catalogue::identity::parse(&before.raw_preferences)?;
         let remaining =
@@ -1932,10 +1937,14 @@ async fn settle_with(
         receipt["removed_by_phone"] = json!(
             removed
                 .iter()
-                .map(|(n, id)| json!({
-                    "ordinal":n,"track":format!("{id:016x}"),
-                    "planned_path_absent":batch.targets[*n].target.content.path,
-                }))
+                .map(|(n, id)| {
+                    let path = &batch.targets[*n].target.content.path;
+                    if landed.contains(path) {
+                        json!({"ordinal":n,"track":format!("{id:016x}"),"sent_audio_landed_at":path})
+                    } else {
+                        json!({"ordinal":n,"track":format!("{id:016x}"),"planned_path_absent":path})
+                    }
+                })
                 .collect::<Vec<_>>()
         );
     }
@@ -2324,31 +2333,87 @@ async fn connect(
     .await
 }
 
-/// No file exists at the planned permanent path of any target the phone
-/// deleted again.
-async fn planned_absent(
+/// At the planned permanent path of each target the phone deleted again
+/// (`targets`), nothing, or a regular file holding exactly the audio sent
+/// for it, read back whole: its file landed after its row was gone. Returns
+/// the paths where it landed.
+async fn planned_absent_or_sent(
     identity: &Identity,
     after: &Snapshot,
     run: &Path,
-    paths: &[&str],
+    targets: &[&Content],
     control: &Control,
-) -> Result<()> {
+) -> Result<BTreeSet<String>> {
     let mut afc = connect(
         identity,
         after,
         run,
         "removed-paths",
-        paths.len() * 4 + 16,
+        targets.len() * 4 + 16,
         control,
     )
     .await?;
-    for path in paths {
-        ensure!(
-            afc.stat(path).await?.is_none(),
-            "a file exists at {path}, where a target the phone deleted planned its audio"
-        );
+    let mut present = Vec::new();
+    for content in targets {
+        if afc.stat(&content.path).await?.is_some() {
+            present.push(*content);
+        }
     }
-    Ok(())
+    drop(afc);
+    let mut landed = BTreeSet::new();
+    for (n, content) in present.into_iter().enumerate() {
+        // One connection a file, allowed a read a chunk and its open, stats
+        // and close.
+        let operations = content
+            .source
+            .file_bytes
+            .div_ceil(music_protocol::protocol::afc::copy::CHUNK as u64)
+            * 2
+            + 32;
+        let mut afc = connect(
+            identity,
+            after,
+            run,
+            &format!("removed-path-{n:04}"),
+            usize::try_from(operations)?,
+            control,
+        )
+        .await?;
+        if sent_audio_landed(&mut afc, content).await? {
+            landed.insert(content.path.clone());
+        }
+    }
+    Ok(landed)
+}
+
+/// Whether the audio sent for `content` is at its planned path (true) or
+/// nothing is (false). Anything else there refuses.
+async fn sent_audio_landed(afc: &mut Transfer, content: &Content) -> Result<bool> {
+    let path = &content.path;
+    let Some(attributes) = afc.stat(path).await? else {
+        return Ok(false);
+    };
+    let not_sent = || {
+        format!(
+            "a file exists at {path}, where a target the phone deleted planned its audio, and it is not the audio sent"
+        )
+    };
+    ensure!(
+        attributes.get("st_ifmt").map(String::as_str) == Some("S_IFREG")
+            && attributes.get("st_size").map(String::as_str)
+                == Some(content.source.file_bytes.to_string().as_str()),
+        "{}",
+        not_sent()
+    );
+    ensure!(
+        afc.read_hash(path, content.source.file_bytes, MAX_AUDIO)
+            .await
+            .with_context(not_sent)?
+            == content.source.full_file_sha256,
+        "{}",
+        not_sent()
+    );
+    Ok(true)
 }
 
 /// The metadata staging names (for NotApplied, at most this batch's own

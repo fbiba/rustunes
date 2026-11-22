@@ -983,4 +983,4 @@ pub(crate) fn build(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

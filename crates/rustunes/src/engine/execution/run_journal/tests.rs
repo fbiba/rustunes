@@ -540,11 +540,12 @@ async fn only_a_journal_a_run_may_write_is_opened_for_writing() {
     test_support::insert_verified(&mut created, test_support::alac_content(3));
     drop(created);
     assert!(absent.exists().unwrap());
+    // From a saved snapshot, which forgets no track the capture lacks.
     let current = resolve(
         &state,
         &new_run(&state, 2),
         &saved,
-        Taken::ByThisRun,
+        Taken::Saved,
         false,
         None,
     )
@@ -604,6 +605,11 @@ fn observed() -> (crate::engine::Engine, Reported) {
             crate::engine::Event::JournalCarried {
                 journal, installed, ..
             } => ("carried", journal.to_path_buf(), installed),
+            crate::engine::Event::DeletedOnPhone {
+                tracks: 1,
+                journal,
+                installed,
+            } => ("deleted one", journal.to_path_buf(), installed),
             _ => return Ok(()),
         };
         sink.lock().unwrap().push(entry);
@@ -703,4 +709,103 @@ async fn a_journal_a_dry_run_carried_is_used_again_without_a_second_carry() {
     assert!(names(&sync).is_empty(), "{:?}", names(&sync));
     assert_eq!(tree(removal.path()), carried);
     assert!(superseded_now(&phone_journal, &saved));
+}
+
+/// A song rustunes sent that was deleted on the phone is forgotten before
+/// the run plans, from a capture this run took: its journal is written again
+/// without that binding, on a dry run into the run directory, on a real run
+/// in place with the one it replaces kept as `journal.previous`, and the run
+/// says so. A saved snapshot, which may predate the deletion, or a journal
+/// holding unfinished work, which is settled first, keeps the journal as it
+/// is.
+#[tokio::test]
+async fn a_song_deleted_on_the_phone_is_forgotten_before_the_run_plans() {
+    let (engine, reported) = observed();
+    let take = |reported: &Reported| std::mem::take(&mut *reported.lock().unwrap());
+    let t = test_support::Temp::new();
+    let (saved, state) = elsewhere_capture(&t);
+    let identity = saved.journal_identity().unwrap();
+    let phone = phone_journal(&state, &saved);
+    let deleted = test_support::alac_content(1);
+    let mut j = Journal::create(&phone, &identity).unwrap();
+    test_support::insert_verified(&mut j, deleted.clone());
+    drop(j);
+    let binds = |journal: &Path| {
+        Journal::open_read_only(journal, &identity)
+            .unwrap()
+            .lookup_active_verified(&deleted.source.audio)
+            .unwrap()
+            .is_some()
+    };
+
+    let run = new_run(&state, 1);
+    let resolved = engine
+        .scope(resolve(&state, &run, &saved, Taken::Saved, false, None))
+        .await
+        .unwrap();
+    assert_eq!(resolved.resolution(), Resolution::Current);
+    assert!(binds(&phone));
+
+    let run = new_run(&state, 2);
+    let resolved = engine
+        .scope(resolve(&state, &run, &saved, Taken::ByThisRun, true, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.resolution(),
+        Resolution::Carried { installed: false }
+    );
+    assert_eq!(resolved.path(), run.join("journal"));
+    assert!(!binds(resolved.path()));
+    assert!(binds(&phone));
+    assert!(!phone.with_file_name("journal.previous").exists());
+    assert_eq!(
+        take(&reported),
+        [("deleted one", run.join("journal"), false)]
+    );
+
+    let run = new_run(&state, 3);
+    let resolved = engine
+        .scope(resolve(&state, &run, &saved, Taken::ByThisRun, false, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.resolution(),
+        Resolution::Carried { installed: true }
+    );
+    assert_eq!(resolved.path(), phone);
+    assert!(!binds(&phone));
+    assert!(binds(&phone.with_file_name("journal.previous")));
+    assert_eq!(take(&reported), [("deleted one", phone.clone(), true)]);
+    // Once forgotten, the journal is the phone's as it is.
+    let run = new_run(&state, 4);
+    let resolved = engine
+        .scope(resolve(&state, &run, &saved, Taken::ByThisRun, false, None))
+        .await
+        .unwrap();
+    assert_eq!(resolved.resolution(), Resolution::Current);
+    assert_eq!(take(&reported), []);
+
+    let t = test_support::Temp::new();
+    let (saved, state) = elsewhere_capture(&t);
+    let identity = saved.journal_identity().unwrap();
+    let phone = phone_journal(&state, &saved);
+    let mut j = Journal::create(&phone, &identity).unwrap();
+    test_support::insert_verified(&mut j, deleted.clone());
+    test_support::prepare_insert(&mut j, test_support::alac_content(2));
+    drop(j);
+    let run = new_run(&state, 1);
+    let resolved = engine
+        .scope(resolve(&state, &run, &saved, Taken::ByThisRun, false, None))
+        .await
+        .unwrap();
+    assert_eq!(resolved.resolution(), Resolution::Current);
+    assert!(
+        Journal::open_read_only(&phone, &identity)
+            .unwrap()
+            .lookup_active_verified(&deleted.source.audio)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(take(&reported), []);
 }

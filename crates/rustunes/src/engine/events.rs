@@ -157,6 +157,16 @@ pub enum Event<'a> {
         /// cannot resume.
         unfinished: &'a [String],
     },
+    /// `tracks` songs rustunes sent were deleted on the phone, and the
+    /// journal was written again without them, from a fresh capture, so the
+    /// run goes on: a sync sends them again from the library.
+    DeletedOnPhone {
+        tracks: usize,
+        journal: &'a Path,
+        /// False on a dry run: `journal` is in its run directory and the
+        /// journal in use stays as it is.
+        installed: bool,
+    },
     /// With no journal and none to carry forward, the journal of a phone
     /// `rustunes init` prepared that holds no track was started from a fresh
     /// capture, as a pull would write it: it binds nothing.

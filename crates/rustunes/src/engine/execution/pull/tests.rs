@@ -442,3 +442,64 @@ fn a_pulled_journal_replaces_the_one_in_use_which_stays_as_previous() {
         Journal::open_read_only(&target.with_file_name("journal.previous"), &identity).unwrap();
     assert!(previous.recorded_sources().unwrap().is_empty());
 }
+
+/// Forgetting the songs deleted on the phone drops exactly their bindings
+/// and keeps every other one as it was, with the source path planning
+/// attributes it to, even one gone from the library (so `sync` still
+/// removes its track) and none where planning names no path; without that
+/// attribution, the path the journal itself records.
+#[test]
+fn forgetting_deleted_songs_keeps_every_other_binding_as_it_was() {
+    let deleted = test_support::alac_content(30);
+    let mut moved = test_support::alac_content(31);
+    moved.artwork = Some(Artwork {
+        cache_id: 4,
+        sha256: [4; 32],
+        bytes: 400,
+    });
+    let unnamed = test_support::alac_content(32);
+    let earlier = prior(vec![
+        binding(deleted.clone(), Some("/library/deleted.m4a".into())),
+        PriorBinding {
+            conversion: Some(journal::Conversion {
+                source_path: "/library/moved.flac".into(),
+                source_bytes: 900,
+                source_sha256: [1; 32],
+                source_audio: [2; 32],
+                ffmpeg: "ffmpeg version 8.1.3".into(),
+            }),
+            ..binding(moved.clone(), Some("/library/recorded.m4a".into()))
+        },
+        binding(unnamed.clone(), Some("/library/unnamed.m4a".into())),
+    ]);
+    let held: BTreeSet<u64> = [moved.track_pid, unnamed.track_pid, 99].into();
+    let attributed = std::collections::BTreeMap::from([
+        (deleted.track_pid, Ok(PathBuf::from("/library/deleted.m4a"))),
+        (moved.track_pid, Ok(PathBuf::from("/library/left.m4a"))),
+        (unnamed.track_pid, Err("no run history".to_owned())),
+    ]);
+    let pulled = kept(&earlier, &held, Some(&attributed));
+    assert_eq!(pulled.len(), 2);
+    assert!(pulled[0].content == moved);
+    assert_eq!(
+        pulled[0].source.as_deref(),
+        Some(Path::new("/library/left.m4a"))
+    );
+    assert_eq!(
+        pulled[0].conversion.as_ref().map(|c| c.source_path.clone()),
+        Some(PathBuf::from("/library/moved.flac"))
+    );
+    assert!(pulled[1].content == unnamed);
+    assert_eq!(pulled[1].source, None);
+    let pulled = kept(&earlier, &held, None);
+    assert_eq!(
+        pulled
+            .iter()
+            .map(|p| p.source.clone().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            PathBuf::from("/library/recorded.m4a"),
+            PathBuf::from("/library/unnamed.m4a")
+        ]
+    );
+}

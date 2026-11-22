@@ -118,7 +118,7 @@ fn an_alac_validation_error_reads_as_the_tag_to_fix() {
     }
 }
 
-fn row(path: &str, code: &'static str, message: &str) -> SourceDecision {
+pub(crate) fn row(path: &str, code: &'static str, message: &str) -> SourceDecision {
     SourceDecision {
         relative_path: path.into(),
         managed_audio_replacement: None,

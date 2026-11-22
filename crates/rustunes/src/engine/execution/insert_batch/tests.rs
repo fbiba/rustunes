@@ -351,3 +351,59 @@ fn uploads_share_connections_while_their_allowances_fit() {
     );
     assert!(connections(&[]).is_empty());
 }
+
+/// A target the phone deleted again settles with nothing at its planned
+/// path, or with exactly the audio sent there: its file landed after a
+/// delete in the Music app. Anything else at that path refuses.
+#[tokio::test]
+async fn a_deleted_targets_late_file_must_be_the_audio_sent() {
+    use crate::engine::state::journal::test_support::{Temp, alac_content};
+    use music_protocol::protocol::transfer::CaptureControl;
+    use music_protocol::test_support::afc::{FakePhone, Node};
+    let sent = b"the audio rustunes sent".to_vec();
+    let mut content = alac_content(1);
+    content.source.file_bytes = sent.len() as u64;
+    content.source.full_file_sha256 = sha2::Sha256::digest(&sent).into();
+    let mut other = sent.clone();
+    other[0] = b'T';
+    let mut longer = sent.clone();
+    longer.push(b'!');
+    for (found, outcome) in [
+        (None, Ok(false)),
+        (Some(Node::File(sent.clone())), Ok(true)),
+        (Some(Node::File(other)), Err("it is not the audio sent")),
+        (Some(Node::File(longer)), Err("it is not the audio sent")),
+        (Some(Node::Directory), Err("it is not the audio sent")),
+    ] {
+        let mut phone = FakePhone::new(&[
+            "iTunes_Control",
+            "iTunes_Control/Music",
+            "iTunes_Control/Music/F39",
+        ]);
+        if let Some(node) = found {
+            phone.tree.insert(content.path.clone(), node);
+        }
+        let trace = Temp::new();
+        let control = CaptureControl {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut afc, server) = phone.connect(&trace.0, &control, 64).unwrap();
+        let result = sent_audio_landed(&mut afc, &content).await;
+        drop(afc);
+        let phone = server.await.unwrap();
+        match outcome {
+            Ok(landed) => assert_eq!(result.unwrap(), landed),
+            Err(message) => {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains(message), "{error}");
+            }
+        }
+        // Nothing is ever removed here.
+        assert!(
+            !phone
+                .log
+                .contains(&idevice::afc::opcode::AfcOpcode::RemovePath)
+        );
+    }
+}

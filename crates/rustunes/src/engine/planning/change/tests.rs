@@ -120,7 +120,7 @@ fn year(desired: u32) -> Decision {
     }
 }
 
-fn sync(rows: Vec<additive::SourceDecision>) -> additive::Plan {
+pub(crate) fn sync(rows: Vec<additive::SourceDecision>) -> additive::Plan {
     additive::Plan {
         schema: "rustunes.additive-plan",
         mode: "additive_dry_run",
