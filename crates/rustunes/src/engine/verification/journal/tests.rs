@@ -316,6 +316,73 @@ async fn successful_batch_checks_both_guards_and_only_then_confirms_audio() {
     );
 }
 
+/// A batch whose closing guard found the phone's state changed (a song
+/// ended) is read again over a fresh capture; a file read whole in the
+/// refused attempt, between two stats that agreed, is not read again while
+/// it keeps that stat, and the new attempt's guards still decide.
+#[tokio::test]
+async fn a_batch_read_again_takes_what_the_refused_attempt_read_while_its_stat_holds() {
+    let temp = Temp::new();
+    let current = current();
+    let content = temp.content();
+    let journal = temp.journal(&current, Some(content.clone()));
+    for changed in [false, true] {
+        let mut p = prepare(&journal, &current, Selection::All).unwrap();
+        let mut earlier = BTreeMap::new();
+        let mut reader = Mock::new(content.source.full_file_sha256);
+        reader.fail_final_guard = true;
+        let refused = read_batch_with(
+            &mut reader,
+            &p.state,
+            &p.device,
+            &p.bindings,
+            &mut p.report.tracks,
+            &p.batches[0],
+            0,
+            &control(),
+            &mut earlier,
+        )
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(reader.reads, 1);
+        EarlierRead::taken(
+            &p.bindings,
+            &mut p.report.tracks,
+            &p.batches[0],
+            &mut earlier,
+        );
+        assert_eq!(earlier.len(), 1);
+        if changed {
+            // Written since: its stat is another, so it is read again.
+            let read = earlier.values_mut().next().unwrap();
+            read.attributes.insert("st_mtime".into(), "5".into());
+        }
+        let mut reader = Mock::new(content.source.full_file_sha256);
+        read_batch_with(
+            &mut reader,
+            &p.state,
+            &p.device,
+            &p.bindings,
+            &mut p.report.tracks,
+            &p.batches[0],
+            0,
+            &control(),
+            &mut earlier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.guards, 2);
+        assert_eq!(reader.reads, usize::from(changed));
+        let track = &p.report.tracks[0];
+        assert!(track.audio_status == AudioStatus::VerifiedTransferredContainer);
+        assert_eq!(
+            track.audio_proof,
+            (!changed).then_some("stat_of_earlier_read")
+        );
+        assert!(earlier.is_empty());
+    }
+}
+
 #[test]
 fn sibling_album_cache_change_is_informational_and_never_claims_permanent_proof() {
     let first = Artwork {
@@ -488,6 +555,7 @@ async fn identity_and_cancel_guards_abort_before_connector_and_trace() {
         &trace,
         &control(),
         || async { panic!("identity mismatch reached connector") },
+        async |_| Ok(None),
     )
     .await;
     assert!(result.is_err());
@@ -510,6 +578,7 @@ async fn identity_and_cancel_guards_abort_before_connector_and_trace() {
                 label: "synthetic".into(),
             }))
         },
+        async |_| Ok(None),
     )
     .await;
     assert!(result.is_err());
@@ -528,7 +597,8 @@ async fn identity_and_cancel_guards_abort_before_connector_and_trace() {
                 Selection::All,
                 &trace,
                 &control,
-                || async { panic!("cancelled verification reached connector") }
+                || async { panic!("cancelled verification reached connector") },
+                async |_| Ok(None)
             )
             .await
             .is_err()
@@ -545,7 +615,8 @@ async fn identity_and_cancel_guards_abort_before_connector_and_trace() {
             Selection::All,
             &trace,
             &control(),
-            || async { panic!("preference mismatch reached connector") }
+            || async { panic!("preference mismatch reached connector") },
+            async |_| Ok(None)
         )
         .await
         .is_err()
@@ -567,6 +638,7 @@ async fn zero_bindings_reports_no_checks_without_discovery_or_journal_changes() 
         &trace,
         &control(),
         || async { panic!("empty journal reached connector") },
+        async |_| Ok(None),
     )
     .await
     .unwrap();

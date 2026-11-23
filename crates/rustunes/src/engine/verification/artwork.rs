@@ -298,6 +298,25 @@ pub(crate) struct TrackCheck {
     pub trace: PathBuf,
 }
 
+impl TrackCheck {
+    /// The same check traced in a new directory of the same name under
+    /// `root/again-{n}`, for a group read again over a fresh capture after
+    /// the phone's state changed under it: each read needs a new directory.
+    /// The caller creates `root/again-{n}`.
+    pub(crate) fn again(&self, root: &Path, n: usize) -> Result<Self> {
+        let name = self.trace.file_name().context("cover trace has no name")?;
+        Ok(Self {
+            target: self.target,
+            expected: TrackArtworkExpectation {
+                cache_id: self.expected.cache_id,
+                bytes: self.expected.bytes,
+                sha256: self.expected.sha256,
+            },
+            trace: root.join(format!("again-{n}")).join(name),
+        })
+    }
+}
+
 /// Bytes per AFC read request.
 const REQUEST: u64 = music_protocol::protocol::afc::copy::CHUNK as u64;
 /// Operations per track beyond its exact original's reads: one derivative of

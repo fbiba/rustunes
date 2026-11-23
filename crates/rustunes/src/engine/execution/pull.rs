@@ -36,6 +36,7 @@ use crate::{
     engine::planning::source_collection::{self, SelectionOptions, SourceCollection},
     engine::state::audio_index::OtherCodec,
     engine::state::current,
+    engine::state::held,
     engine::state::journal::{Artwork, Content, Identity, Journal, Prior, Pulled},
     engine::state::layout,
     engine::state::snapshot,
@@ -593,6 +594,11 @@ struct Covers {
 /// phone is taken to be unreadable now and the rest are left unproven.
 const COVER_FAILURE_RUN: usize = 25;
 
+/// Fresh state captures in a row, none proven between them, after a group
+/// found the phone's state changed under it: music playing writes the
+/// catalogue as each song ends. Each group takes a minute or less.
+const COVER_REFRESHES: usize = 4;
+
 /// The length and SHA-256 of the cover sync sends for the file at `path`,
 /// read as planning reads it: an ALAC M4A's own cover, or for any other
 /// source (MP3, FLAC, WAV, AIFF, an AAC M4A) the one an insert batch sends.
@@ -653,14 +659,14 @@ async fn prove_covers(
         return Ok(covers);
     }
     fs::DirBuilder::new().mode(0o700).create(&traces)?;
-    let current = current::capture_controlled(
+    let mut current = current::capture_controlled(
         &traces.join("state"),
         identity,
         control.deadline,
         Arc::clone(&control.cancelled),
     )
     .await?;
-    let (mut tried, mut failures, mut group) = (0, 0, 0);
+    let (mut tried, mut failures, mut group, mut refreshes, mut again) = (0, 0, 0, 0, 0);
     while !checks.is_empty() && failures < COVER_FAILURE_RUN {
         if control.cancelled.load(Ordering::Relaxed) {
             bail!("pull cancelled while reading covers back; no journal was written");
@@ -706,6 +712,35 @@ async fn prove_covers(
                 covers.proven += proved;
                 tried += proved;
                 failures = 0;
+                refreshes = 0;
+            }
+            // A song ended while the group was read: the same covers are read
+            // again over a fresh capture of the same library.
+            Err((_, error)) if held::is_drift(&error) && refreshes < COVER_REFRESHES => {
+                tracing::info!(
+                    "The phone's library changed while covers were read back ({error:#}); capturing it again"
+                );
+                let fresh = current::capture_controlled(
+                    &traces.join(format!("state-again-{group:04}")),
+                    identity,
+                    control.deadline,
+                    Arc::clone(&control.cancelled),
+                )
+                .await?;
+                current::ensure_same_but_listening(&current, &fresh).context(
+                    "the phone's library changed while covers were read back; no journal was written",
+                )?;
+                current = fresh;
+                refreshes += 1;
+                // The covers still to read go in new directories.
+                again += 1;
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(traces.join(format!("again-{again}")))?;
+                checks = checks
+                    .iter()
+                    .map(|check| check.again(&traces, again))
+                    .collect::<Result<_>>()?;
             }
             Err((position, _)) => {
                 // That cover stays unproven; the next sync sends it.

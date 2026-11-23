@@ -14,9 +14,12 @@ use sha2::{Digest, Sha256};
 use crate::{
     engine::execution::device,
     engine::execution::native_artwork::{self, ArtworkUpdate, FreshArtworkState},
+    engine::execution::removal_batch,
+    engine::recovery::retained::playback::{Window, between_runs},
     engine::state::current::{self, hex},
+    engine::state::held,
     engine::state::journal::{
-        Artwork, AttemptKind, CompletionEvidence, Identity, Journal, PreparedAttempt,
+        Artwork, AttemptKind, AttemptState, CompletionEvidence, Identity, Journal, PreparedAttempt,
     },
     engine::state::snapshot,
     engine::{CoverResult, Engine, Event},
@@ -240,12 +243,23 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         Arc::clone(&after_control.cancelled),
     )
     .await?;
-    let catalog_proof = artwork_verification::verify_independent_representative(
-        &current.catalog,
-        &after.catalog,
-        track_id,
-        cache,
-    )?;
+    let (catalog_proof, taken) = Window::SameRun.check(|window| match window {
+        Window::SameRun => artwork_verification::verify_independent_representative(
+            &current.catalog,
+            &after.catalog,
+            track_id,
+            cache,
+        ),
+        Window::LaterRun => {
+            artwork_verification::verify_independent_representative_after_listening(
+                &current.catalog,
+                &after.catalog,
+                track_id,
+                cache,
+                &between_runs::catalogue_listening,
+            )
+        }
+    })?;
     let file_proof = crate::engine::verification::artwork::verify_track(
         &after,
         track_id,
@@ -275,7 +289,7 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
         "preserved_album_original_after":protected_album_after,
         "transfer_receipt_sha256":hex(&pending.evidence.receipt_sha256),"after_state_receipt_sha256":hex(&after.receipt_sha256),
         "preserved_audio_sha256":hex(&pending.evidence.permanent_audio_sha256),"staged_jpeg_sha256":hex(&pending.evidence.staged_cover_sha256),
-        "phone_deletions":0});
+        "phone_deletions":0,"music_played_during_run":taken != Window::SameRun});
     let bytes = serde_json::to_vec_pretty(&receipt)?;
     private_write(&options.trace.join("verified.json"), &bytes)?;
     File::open(options.trace)?.sync_all()?;
@@ -293,6 +307,65 @@ pub(crate) async fn run(options: Options<'_>, engine: &Engine) -> Result<CoverRe
     )?;
     engine.emit(Event::CoverFinished(CoverResult::Verified))?;
     Ok(CoverResult::Verified)
+}
+
+/// `run`, and again from a fresh capture when the phone's state changed
+/// before its session started (`held::is_drift`; a song started or ended),
+/// up to `removal_batch::DRIFT_ATTEMPTS` times. Nothing was sent then: the
+/// unstarted update is cancelled first. Each later attempt keeps its trace
+/// in `attempt-N` inside the first one's.
+pub(crate) async fn run_retrying(options: Options<'_>, engine: &Engine) -> Result<CoverResult> {
+    let mut attempt = 1;
+    loop {
+        let trace = match attempt {
+            1 => options.trace.to_path_buf(),
+            n => options.trace.join(format!("attempt-{n}")),
+        };
+        match Box::pin(run(
+            Options {
+                trace: &trace,
+                ..options
+            },
+            engine,
+        ))
+        .await
+        {
+            Err(error)
+                if !options.dry_run
+                    && attempt < removal_batch::DRIFT_ATTEMPTS
+                    && held::is_drift(&error)
+                    && engine.check().is_ok()
+                    && cancel_unstarted(options.snapshot, options.journal)? =>
+            {
+                tracing::info!(
+                    "The phone's library changed before the cover was sent ({error:#}); capturing it again"
+                );
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// After `run` failed because the phone's state changed before its session
+/// started (`held::is_drift`; a song started or ended), cancel the cover
+/// update it left Prepared, so that it may run again from a fresh capture.
+/// False when no unstarted cover update is outstanding.
+pub(crate) fn cancel_unstarted(snapshot: &Path, journal: &Path) -> Result<bool> {
+    let saved = snapshot::open(snapshot)?;
+    let library = identity::parse(&saved.raw_preferences)?;
+    let identity = Identity::for_saved_device(saved.identity.device_identifier_sha256, &library)?;
+    let mut journal = Journal::open(journal, &identity)?;
+    match journal.outstanding_attempt()? {
+        Some(attempt)
+            if attempt.state == AttemptState::Prepared
+                && attempt.prepared.kind == AttemptKind::Artwork =>
+        {
+            journal.cancel_prepared(attempt.id)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Fail before any transfer when the required image decoder is unavailable.

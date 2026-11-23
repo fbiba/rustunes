@@ -241,7 +241,7 @@ impl Engine {
     }
     pub async fn cover(&self, request: CoverRequest<'_>) -> Result<CoverResult> {
         self.check()?;
-        self.scope(Box::pin(crate::engine::execution::cover::run(
+        self.scope(Box::pin(crate::engine::execution::cover::run_retrying(
             request, self,
         )))
         .await

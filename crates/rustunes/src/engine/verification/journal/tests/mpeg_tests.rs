@@ -427,9 +427,15 @@ async fn mpeg_incoherent_identity_refuses_before_discovery() {
     c.identity = Identity::new("foreign", &c.library).unwrap();
     let trace = temp.0.join("no-output");
     assert!(
-        verify(&journal, &c, Selection::All, &trace, &control(), || async {
-            panic!("MPEG identity refusal must precede discovery")
-        })
+        verify(
+            &journal,
+            &c,
+            Selection::All,
+            &trace,
+            &control(),
+            || async { panic!("MPEG identity refusal must precede discovery") },
+            async |_| Ok(None),
+        )
         .await
         .is_err()
     );

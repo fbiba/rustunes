@@ -797,7 +797,7 @@ async fn remove(
     .await
     .with_context(|| {
         format!(
-            "replacement {} stays Active; run resume if a batch is unfinished, then the same command again",
+            "replacement {} is not finished; running the same command again continues it, or says how",
             id.as_i64()
         )
     })?;

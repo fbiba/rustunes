@@ -36,16 +36,38 @@ const FIELDS: [&str; 7] = [
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Window {
-    /// The run's own post-write capture. The phone is not used during a run,
-    /// so the model must match exactly.
+    /// The run's own post-write capture, compared exactly. Music may play
+    /// while a run works, so a run's own check that this refuses is decided
+    /// by `LaterRun` (`Window::check`).
     #[default]
     SameRun,
-    /// A capture by a later `resume`, after the phone may have been used.
+    /// A capture after the phone may have been used: a later run's, or the
+    /// run's own when music played while it worked.
     LaterRun,
 }
 impl Window {
     pub(crate) fn is_same_run(&self) -> bool {
         *self == Self::SameRun
+    }
+    /// Runs `check` under this window and returns the window that passed. A
+    /// run's own check (`SameRun`) takes the exact model first. Music may
+    /// play while a run works, so when the exact model refuses, the later-run
+    /// rule decides over the same captures: it takes listening and the
+    /// phone's housekeeping and still pins everything the session wrote. Its
+    /// refusal is the one returned; the exact one goes to the log. A later
+    /// run's check is the later-run rule alone.
+    pub(crate) fn check<T>(self, mut check: impl FnMut(Self) -> Result<T>) -> Result<(T, Self)> {
+        if self == Self::LaterRun {
+            return check(Self::LaterRun).map(|value| (value, Self::LaterRun));
+        }
+        let exact = match check(Self::SameRun) {
+            Ok(value) => return Ok((value, Self::SameRun)),
+            Err(error) => error,
+        };
+        tracing::info!(
+            "The exact check refused ({exact:#}); checking again for music played during the run"
+        );
+        check(Self::LaterRun).map(|value| (value, Self::LaterRun))
     }
     /// What the phone may have done to rows whose track is gone, for a
     /// write whose session transferred files (`transfers`: an insert) or
@@ -127,6 +149,7 @@ fn absorb(
         &table(expected, "container_item")?,
         &table(observed, "container_item")?,
         &items,
+        &deleted_tracks(&table(observed, "entity_revision")?, budget)?,
         budget,
     )?;
     let revisions = check_revisions(
@@ -155,6 +178,7 @@ fn absorb(
             &table(expected, "container_item")?,
             &table(observed, "container_item")?,
             &table(expected, "item")?,
+            history.names_deleted,
             budget,
         )?),
         _ => None,
@@ -179,10 +203,17 @@ fn absorb(
 const MEDIA_TYPES: &str = "container_item_media_type";
 
 /// The Playback History's rows in `container_item_media_type` count its
-/// entries whose track is in the library, by media type (entries naming
-/// tracks removed earlier are not counted). Each existing row may move by
-/// exactly the change in such entries; every other row stays exact, and a
-/// row appearing or going refuses.
+/// entries by media type. Each existing row may move by exactly the change
+/// in entries whose track is in the library. The phone does not lower them
+/// when a removal leaves entries naming gone tracks, so they may count more
+/// than the entries of tracks in the library. When the player appends an
+/// entry for a track deleted while it played (`recount`), the phone counts
+/// again (observed): each row may instead become the number of entries whose
+/// track is in the library, and a row left with none goes. A row so gone
+/// comes back with the next entries for tracks in the library, counting
+/// them from none. Every other row stays exact, and any other row appearing
+/// or going refuses.
+#[allow(clippy::too_many_arguments)]
 fn history_media_types(
     pid: i64,
     old: &Table,
@@ -190,6 +221,7 @@ fn history_media_types(
     old_entries: &Table,
     new_entries: &Table,
     items: &Table,
+    recount: bool,
     budget: &Budget,
 ) -> Result<Value> {
     ensure!(
@@ -239,21 +271,54 @@ fn history_media_types(
         old_other == new_other,
         "unrelated playlist media type count changed"
     );
+    // Counted again with no entry left for a track of its type in the
+    // library, a row goes (observed).
     ensure!(
-        old_counts.keys().eq(new_counts.keys()),
-        "Playback History media type rows added or removed"
+        old_counts
+            .keys()
+            .all(|kind| { new_counts.contains_key(kind) || recount && !after.contains_key(kind) }),
+        "Playback History media type rows removed"
     );
+    let kinds: BTreeSet<i64> = old_counts
+        .keys()
+        .chain(new_counts.keys())
+        .copied()
+        .collect();
     let mut changes = Vec::new();
-    for (kind, was) in &old_counts {
-        let now = new_counts[kind];
-        let delta = after.get(kind).copied().unwrap_or(0) - before.get(kind).copied().unwrap_or(0);
-        ensure!(
-            now - was == delta,
-            "Playback History media type {kind} count moved by {} for {delta} library entries",
-            now - was
-        );
-        if now != *was {
-            changes.push(json!({"media_type":kind,"before":was,"after":now}));
+    for kind in kinds {
+        let live = after.get(&kind).copied().unwrap_or(0);
+        let delta = live - before.get(&kind).copied().unwrap_or(0);
+        match (
+            old_counts.get(&kind).copied(),
+            new_counts.get(&kind).copied(),
+        ) {
+            (Some(was), None) => changes
+                .push(json!({"media_type":kind,"before":was,"after":null,"counted_again":true})),
+            // A history emptied by a clear counts again from none when the
+            // next entry for a track in the library comes (observed).
+            (None, Some(now)) => {
+                ensure!(
+                    delta > 0 && now == delta,
+                    "Playback History media type {kind} row appeared with {now} for {delta} library entries"
+                );
+                changes.push(json!({"media_type":kind,"before":null,"after":now}));
+            }
+            (Some(was), Some(now)) => {
+                let counted_again = recount && now == live;
+                ensure!(
+                    now - was == delta || counted_again,
+                    "Playback History media type {kind} count moved by {} for {delta} library entries",
+                    now - was
+                );
+                if now - was != delta {
+                    changes.push(
+                        json!({"media_type":kind,"before":was,"after":now,"counted_again":true}),
+                    );
+                } else if now != was {
+                    changes.push(json!({"media_type":kind,"before":was,"after":now}));
+                }
+            }
+            (None, None) => {}
         }
     }
     Ok(json!(changes))

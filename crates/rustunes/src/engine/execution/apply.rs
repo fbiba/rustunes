@@ -21,6 +21,7 @@ use crate::{
     engine::planning::collections::{CandidateIds, Planner},
     engine::planning::saved_plan,
     engine::planning::source_collection::mp3::preparation::PreparedSource,
+    engine::recovery::retained::playback::{Window, between_runs},
     engine::state::current::{self, hex},
     engine::state::held::{ArtworkDb, HeldState},
     engine::state::journal::{AttemptKind, CompletionEvidence, Content, Journal, PreparedAttempt},
@@ -330,25 +331,33 @@ async fn apply_step(
     )
     .await
     .context("transfer returned but poststate capture failed; journal requires reconciliation")?;
-    let checked = insert_verification::verify_insert(
-        &current.catalog,
-        &after.catalog,
-        &ExpectedInsert {
-            track_id,
-            album_id,
-            artist_id,
-            path,
-            file_bytes: source.fingerprint.file_bytes,
-            metadata: (&source.metadata).into(),
-            presented: true,
-        },
-    );
-    let checked = checked
+    let expected = ExpectedInsert {
+        track_id,
+        album_id,
+        artist_id,
+        path,
+        file_bytes: source.fingerprint.file_bytes,
+        metadata: (&source.metadata).into(),
+        presented: true,
+    };
+    let (checked, taken) = Window::SameRun
+        .check(|window| match window {
+            Window::SameRun => {
+                insert_verification::verify_insert(&current.catalog, &after.catalog, &expected)
+            }
+            Window::LaterRun => insert_verification::verify_insert_after_listening(
+                &current.catalog,
+                &after.catalog,
+                &expected,
+                &between_runs::catalogue_listening,
+            ),
+        })
         .context("post-transfer catalogue verification failed; journal requires reconciliation")?;
     let receipt = serde_json::json!({"schema":"rustunes.verified-insertion","catalogue":checked,
         "plan_sha256":hex(&plan_sha256),"transfer_receipt_sha256":hex(&pending.evidence.receipt_sha256),
         "after_state_receipt_sha256":hex(&after.receipt_sha256),"permanent_audio_sha256":hex(&pending.evidence.permanent_audio_sha256),
-        "source":row.relative_path,"audio_verified":true,"artwork_verified":false,"phone_deletions":0});
+        "source":row.relative_path,"audio_verified":true,"artwork_verified":false,"phone_deletions":0,
+        "music_played_during_run":taken != Window::SameRun});
     let bytes = serde_json::to_vec_pretty(&receipt)?;
     private_write(&step.join("verified.json"), &bytes)?;
     File::open(&step)?.sync_all()?;
@@ -615,7 +624,7 @@ async fn ordinary_insert(
     control: &Control,
 ) -> Result<native_insert::PendingVerification> {
     let frozen = refresh::FrozenIntent::new(i.prepared, i.selected, i.timestamp);
-    for attempt in 1..=2u8 {
+    for attempt in 1..=refresh::ATTEMPTS {
         control.check()?;
         let preflight = i.step.join(format!("preflight-{attempt:04}"));
         fs::DirBuilder::new().mode(0o700).create(&preflight)?;

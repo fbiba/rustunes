@@ -53,6 +53,9 @@ pub(super) async fn run(
     } else {
         journal::Selection::TrackIds(request.tracks.into_iter().collect())
     };
+    // Music playing writes the phone's state as each song ends; a batch or
+    // group that finds it changed is read again over a fresh capture.
+    let (deadline, cancelled) = (control.deadline, Arc::clone(&control.cancelled));
     journal::verify(
         &journal,
         &current,
@@ -63,6 +66,16 @@ pub(super) async fn run(
             cancelled: control.cancelled,
         },
         device::provider,
+        async |again: usize| {
+            current::capture_controlled(
+                &request.trace.join(format!("state-again-{again}")),
+                &identity,
+                deadline,
+                Arc::clone(&cancelled),
+            )
+            .await
+            .map(Some)
+        },
     )
     .await
 }

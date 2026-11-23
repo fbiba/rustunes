@@ -82,6 +82,49 @@ impl std::fmt::Display for ReadbackPathAbsent {
 }
 impl std::error::Error for ReadbackPathAbsent {}
 
+/// A readback whose file changed under it: a regular file of another size
+/// as it was about to be opened, or another size or other attributes once it
+/// was closed. Something wrote the file since the caller's own stat (the
+/// phone writes its catalogue log as a song ends). The diagnostic is the one
+/// the read gave before this type existed. No public constructor.
+#[derive(Debug)]
+pub struct ReadbackChanged {
+    path: String,
+    message: String,
+}
+impl ReadbackChanged {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+impl std::fmt::Display for ReadbackChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for ReadbackChanged {}
+
+/// `regular_size` for a readback's own stat of `path`: a well-formed regular
+/// file of another size is `ReadbackChanged`; any other refusal stays as it
+/// is.
+fn readback_size(path: &str, attrs: &Attributes, size: u64) -> Result<()> {
+    regular_size(attrs, size).map_err(|error| {
+        let other_size = attrs.get("st_ifmt").map(String::as_str) == Some("S_IFREG")
+            && attrs
+                .get("st_size")
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some_and(|actual| actual != size);
+        match other_size {
+            true => ReadbackChanged {
+                path: path.to_owned(),
+                message: error.to_string(),
+            }
+            .into(),
+            false => error,
+        }
+    })
+}
+
 /// Maximum bytes in one retained Current-profile metadata observation.
 pub const CURRENT_METADATA_LIMIT: usize = 16 * 1024;
 pub(crate) const CURRENT_READ_RECEIPTS: usize = 8;
@@ -1268,7 +1311,7 @@ impl Transfer {
             expected_bytes: expected,
             operation_sequence: first_operation,
         })?;
-        regular_size(&before, expected)?;
+        readback_size(path, &before, expected)?;
         let handle = self.open(path, AfcFopenMode::RdOnly).await?;
         let result = async {
             let mut remaining = expected;
@@ -1306,13 +1349,18 @@ impl Transfer {
             .stat(path)
             .await?
             .context("readback path disappeared")?;
-        regular_size(&after, expected)?;
-        ensure!(same_file(&before, &after), "readback attributes changed");
+        readback_size(path, &after, expected)?;
+        let changed = || ReadbackChanged {
+            path: path.to_owned(),
+            message: "readback attributes changed".into(),
+        };
+        if !same_file(&before, &after) {
+            return Err(changed().into());
+        }
         if self.readonly_summary {
-            ensure!(
-                same_stat(Some(&before), Some(&after)),
-                "readback attributes changed"
-            );
+            if !same_stat(Some(&before), Some(&after)) {
+                return Err(changed().into());
+            }
             let mut record = Dictionary::new();
             record.insert("Path".into(), path.into());
             record.insert("Bytes".into(), expected.into());

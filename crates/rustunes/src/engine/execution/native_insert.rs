@@ -131,9 +131,10 @@ where
 }
 
 /// Only the deferred engine's closed, read-only pre-session branch constructs
-/// this error, from a refreshable drift. A Ready-session or unknown failure,
-/// or a held file that appeared, disappeared or changed during the guard,
-/// cannot grant refresh authority.
+/// this error, from a guard that found any held file other than its binding:
+/// the phone wrote its state (a song ended), before or during the guard, and
+/// nothing was prepared or sent. A Ready-session or unknown failure cannot
+/// grant refresh authority.
 #[derive(Debug)]
 pub(crate) struct PreSessionStateDrift {
     drift: StateReadDrift,
@@ -181,8 +182,7 @@ fn finish_read_only_preflight(
     control.check()?;
     if let Err(error) = guarded {
         return Err(match error.downcast::<StateReadDrift>() {
-            Ok(drift) if drift.refreshable() => PreSessionStateDrift { drift }.into(),
-            Ok(drift) => drift.into(),
+            Ok(drift) => PreSessionStateDrift { drift }.into(),
             Err(other) => other,
         });
     }

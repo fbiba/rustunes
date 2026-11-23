@@ -213,17 +213,13 @@ fn during(
 }
 
 /// The drift `result` failed with: the file it names and how it differed.
-/// Only a bound file there with other contents grants a refresh, wherever
-/// the caller adds context.
+/// Every kind is drift, wherever the caller adds context.
 fn drift(result: Result<()>) -> (&'static str, Drift) {
     let error = result.unwrap_err().context("a caller's context");
     let drift = error
         .downcast_ref::<StateReadDrift>()
         .unwrap_or_else(|| panic!("not drift: {error:#}"));
-    assert_eq!(
-        is_refreshable_drift(&error),
-        matches!(drift.drift, Drift::Size | Drift::Digest)
-    );
+    assert!(is_drift(&error));
     (drift.file, drift.drift)
 }
 
@@ -290,7 +286,7 @@ async fn a_large_catalogue_is_read_in_several_requests_within_the_cost() {
 }
 
 #[tokio::test]
-async fn each_bound_file_with_other_bytes_is_refreshable_drift_naming_it() {
+async fn each_bound_file_with_other_bytes_is_drift_naming_it() {
     let captured = Captured::new(FULL);
     let state = captured.held(ArtworkDb::Held);
     for (path, name) in FILES {
@@ -334,6 +330,62 @@ async fn a_bound_file_gone_or_a_file_bound_absent_there_is_drift_naming_it() {
         phone.file(path, b"appeared");
         let (result, _) = guard(&state, phone, false).await;
         assert_eq!(drift(result), (name, Drift::Appeared));
+    }
+}
+
+/// A bound file the phone writes between the guard's stat of it and its
+/// readback, or while it is read (a song ends and the catalogue log grows),
+/// is drift as well, and so is one removed before its read: not a failed
+/// read the caller cannot tell from a fault.
+#[tokio::test]
+async fn a_bound_file_written_or_gone_under_its_read_is_drift_naming_it() {
+    let captured = Captured::new(FULL);
+    let state = captured.held(ArtworkDb::Held);
+    for (path, name) in FILES {
+        if path == device_files::DATABASE_SHM {
+            continue;
+        }
+        // Grown just before the read's own stat, the second of the file.
+        let mut phone = captured.phone();
+        let mut stats = 0;
+        phone.before_each(move |request, phone| {
+            if request.operation == AfcOpcode::GetFileInfo && request.path.as_deref() == Some(path)
+            {
+                stats += 1;
+                if stats == 2 {
+                    let Some(Node::File(mut bytes)) = phone.tree.get(path).cloned() else {
+                        panic!("{path}");
+                    };
+                    bytes.push(0);
+                    phone.file(path, &bytes);
+                }
+            }
+        });
+        let (result, _) = guard(&state, phone, false).await;
+        assert_eq!(drift(result), (name, Drift::Attributes));
+        // Written while it is read: a new mtime by the closing stat.
+        let mut phone = captured.phone();
+        phone.before_each(move |request, phone| {
+            if request.operation == AfcOpcode::Read && request.path.as_deref() == Some(path) {
+                phone.set_attribute(path, "st_mtime", Some("3"));
+            }
+        });
+        let (result, _) = guard(&state, phone, false).await;
+        assert_eq!(drift(result), (name, Drift::Attributes));
+        // Removed just before the read's own stat.
+        let mut phone = captured.phone();
+        let mut stats = 0;
+        phone.before_each(move |request, phone| {
+            if request.operation == AfcOpcode::GetFileInfo && request.path.as_deref() == Some(path)
+            {
+                stats += 1;
+                if stats == 2 {
+                    phone.tree.remove(path);
+                }
+            }
+        });
+        let (result, _) = guard(&state, phone, false).await;
+        assert_eq!(drift(result), (name, Drift::Disappeared));
     }
 }
 
@@ -580,11 +632,32 @@ async fn a_malformed_or_oversized_stat_is_a_refusal_not_drift() {
         let (result, _) = guard(&state, phone, false).await;
         let error = result.unwrap_err().context("a caller's context");
         assert!(
-            error.downcast_ref::<StateReadDrift>().is_none() && !is_refreshable_drift(&error),
+            error.downcast_ref::<StateReadDrift>().is_none() && !is_drift(&error),
             "{key}: {error:#}"
         );
     }
-    assert!(!is_refreshable_drift(&anyhow::anyhow!(
+    assert!(!is_drift(&anyhow::anyhow!(
         "state read drift in MediaLibrary.sqlitedb-wal: regular file size changed"
+    )));
+}
+
+/// Any held file found other than its binding is the phone writing its
+/// state; other errors are not.
+#[test]
+fn every_kind_of_drift_and_nothing_else_is_drift() {
+    for drift in [
+        Drift::Size,
+        Drift::Digest,
+        Drift::Appeared,
+        Drift::Disappeared,
+        Drift::Attributes,
+    ] {
+        let error =
+            anyhow::Error::from(StateReadDrift::fixture("MediaLibrary.sqlitedb-wal", drift))
+                .context("insert batch");
+        assert!(is_drift(&error));
+    }
+    assert!(!is_drift(&anyhow::anyhow!(
+        "state read drift in a message only"
     )));
 }

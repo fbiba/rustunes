@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::state::current::DeviceFile;
+use crate::engine::state::current::{DeviceFile, ensure_catalog};
 use std::{
     path::PathBuf,
     sync::{
@@ -64,6 +64,13 @@ fn refresh_requires_exact_projected_catalogue_and_artwork_despite_new_raw_hashes
         )
         .is_err()
     );
+    // Music played since the plan: a completed play is listening.
+    let played = music_protocol::test_support::catalogue::modified_collection_catalog(
+        89,
+        "UPDATE item_stats SET play_count_user=play_count_user+1, \
+         play_count_recent=play_count_recent+1, has_been_played=1",
+    );
+    ensure_catalog(&before, &played).unwrap();
 }
 #[test]
 fn refresh_reselects_all_sources_and_refuses_added_missing_edited_or_excluded_entries() {
@@ -195,12 +202,15 @@ async fn refresh_capture_shares_deadline_and_cancellation_without_polling_after_
 }
 
 #[test]
-fn only_one_typed_pre_session_refresh_and_no_error_text_fallback() {
+fn bounded_typed_pre_session_refreshes_and_no_error_text_fallback() {
     let c = control();
     let e = anyhow::Error::from(PreSessionStateDrift::fixture())
         .context("ordinary pre-session attempt");
-    assert!(may_refresh(&e, 1, &c).unwrap());
-    assert!(!may_refresh(&e, 2, &c).unwrap());
+    // Music playing writes the phone's state at every song.
+    for attempt in 1..ATTEMPTS {
+        assert!(may_refresh(&e, attempt, &c).unwrap());
+    }
+    assert!(!may_refresh(&e, ATTEMPTS, &c).unwrap());
     for text in [
         "unexpected file size",
         "read-only pre-session drift",

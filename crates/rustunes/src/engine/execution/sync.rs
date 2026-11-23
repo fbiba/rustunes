@@ -618,7 +618,7 @@ pub(crate) async fn run_with(
             number: index + 1,
             total: covers.len(),
         })?;
-        Box::pin(cover::run(
+        Box::pin(cover::run_retrying(
             cover::Options {
                 file: source,
                 snapshot: &snapshot_path,

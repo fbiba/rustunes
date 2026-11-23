@@ -26,6 +26,7 @@ use crate::{
     engine::execution::run_journal::{Ask, RunJournal, Taken},
     engine::planning::source_collection::mp3::preparation::PreparedSource,
     engine::recovery::retained::playback::{Window, between_runs},
+    engine::state::held,
     engine::state::journal::{
         CoordinationId, Identity, Journal, MetadataBatchId, MetadataBatchRecord,
         MetadataBatchState, MetadataIntent, StartedMetadataBatch,
@@ -122,7 +123,7 @@ pub(crate) async fn run(
     ensure!(!planned.updates.is_empty(), "the edit changes nothing");
     ensure!(
         journal.outstanding_metadata_batch()?.is_none(),
-        "an earlier metadata batch is unfinished; run resume first"
+        "an earlier metadata batch is not finished; nothing was sent; running the same command again finishes it, or says how"
     );
     // The plan is checked against this exact state again before preparing.
     planner::check_conformant(&before.sql.tables, &planned.updates)?;
@@ -211,11 +212,11 @@ pub(crate) async fn run(
     ) {
         (Ok(settled), _) => Ok(settled),
         (Err(error), Ok(())) => Err(error.context(format!(
-            "metadata batch {} is Started; run resume to observe it again",
+            "metadata batch {} is not finished; running the same command again finishes it, or says how",
             id.as_i64()
         ))),
         (Err(error), Err(wire)) => Err(error.context(format!(
-            "metadata batch {} is Started after a transport error ({wire:#}); run resume to observe it again",
+            "metadata batch {} is not finished after a connection error ({wire:#}); running the same command again finishes it, or says how",
             id.as_i64()
         ))),
     }
@@ -268,11 +269,14 @@ pub(crate) async fn settle(
                 .cloned()
                 .collect()
         };
-        ensure!(
-            targets_unchanged(&kept(&before), &kept(&after), window),
-            "the anchor did not move but a target changed; batch {} stays Started",
-            batch.id.as_i64()
-        );
+        window.check(|window| {
+            ensure!(
+                targets_unchanged(&kept(&before), &kept(&after), window),
+                "the anchor did not move but a target changed; batch {} stays Started",
+                batch.id.as_i64()
+            );
+            Ok(())
+        })?;
         let library = music_protocol::catalogue::identity::parse(&after.raw_preferences)?;
         let staged = removal_batch::staged_names(identity, &library, &run, control).await?;
         let staged_removed = removal_batch::remove_unfinished(
@@ -303,21 +307,22 @@ pub(crate) async fn settle(
             updated: 0,
         });
     }
-    let receipt = match window {
-        Window::SameRun => metadata_edit_sql::verify(
-            &before_sql.tables,
-            &after_sql.tables,
-            &batch.operation,
-            batch.base_anchor,
-        ),
-        Window::LaterRun => metadata_edit_sql::verify_later(
-            &before_sql.tables,
-            &after_sql.tables,
-            &batch.operation,
-            batch.base_anchor,
-        ),
-    }
-    .with_context(|| {
+    let (receipt, taken) = window
+        .check(|window| match window {
+            Window::SameRun => metadata_edit_sql::verify(
+                &before_sql.tables,
+                &after_sql.tables,
+                &batch.operation,
+                batch.base_anchor,
+            ),
+            Window::LaterRun => metadata_edit_sql::verify_later(
+                &before_sql.tables,
+                &after_sql.tables,
+                &batch.operation,
+                batch.base_anchor,
+            ),
+        })
+        .with_context(|| {
         format!(
             "the phone's catalogue is not the modelled edit; batch {} stays Started and {} keeps the delta",
             batch.id.as_i64(),
@@ -331,6 +336,9 @@ pub(crate) async fn settle(
         "after_index_sha256":hex(&after.index_receipt_sha256),
         "edit":receipt,"audio_files_unchanged":true,
     });
+    if window != taken {
+        verification["music_played_during_run"] = json!(true);
+    }
     removal_batch::allocation_changed(&mut verification, &before, &after);
     let bytes = serde_json::to_vec_pretty(&verification)?;
     durable_write(&run, "verification.json", &bytes)?;
@@ -451,17 +459,54 @@ pub(crate) async fn set(
         return Ok(SetOutcome::Cancelled);
     }
     let mut journal = resolved.writable(&identity)?;
-    let settled = run(
-        &mut journal,
-        &identity,
-        &before,
-        &planned,
-        None,
-        o.host_name,
-        &control,
-    )
-    .await
-    .with_context(|| format!("evidence: {}", directory.display()))?;
+    let (mut before, mut planned, mut attempt) = (before, planned, 1);
+    let settled = loop {
+        let result = run(
+            &mut journal,
+            &identity,
+            &before,
+            &planned,
+            None,
+            o.host_name,
+            &control,
+        )
+        .await;
+        match result {
+            // A song started or ended before the session began (the
+            // confirmation may have taken a while): nothing was sent, so the
+            // shown edit is planned again from a fresh capture and sent.
+            Err(error)
+                if attempt < removal_batch::DRIFT_ATTEMPTS
+                    && held::is_drift(&error)
+                    && control.check().is_ok()
+                    && matches!(journal.outstanding_metadata_batch(), Ok(None)) =>
+            {
+                tracing::info!(
+                    "The phone's library changed before the edit was sent ({error:#}); capturing it again"
+                );
+                attempt += 1;
+                let (again, fresh) = removal_batch::capture_fresh(
+                    &directory.join(format!("edit-attempt-{attempt}")),
+                    &control,
+                )
+                .await?;
+                ensure!(
+                    again.device_digest() == identity.device_digest()
+                        && again.library_digest() == identity.library_digest(),
+                    "the connected phone or library changed; nothing was sent"
+                );
+                let replanned = plan(&fresh.sql.tables, &fresh.current.catalog, &o.requests)?;
+                ensure!(
+                    replanned.updates == planned.updates,
+                    "the track changed on the phone after the edit was shown; nothing was sent"
+                );
+                (before, planned) = (fresh, replanned);
+            }
+            result => {
+                break result.with_context(|| format!("evidence: {}", directory.display()))?;
+            }
+        }
+    };
     ensure!(
         settled.state == MetadataBatchState::Verified,
         "the phone did not apply the edit (batch {} is {}); evidence: {}",
@@ -702,10 +747,15 @@ pub(crate) async fn update_all(
     let mut fresh = fresh_ids()?;
     let mut tracks = 0;
     let mut planned_sessions = 0;
-    for session in 1..=MAX_SESSIONS + 1 {
+    let mut session = 1;
+    let mut attempt = 1;
+    while session <= MAX_SESSIONS + 1 {
         let control = control();
         let (identity, before) = removal_batch::capture_fresh(
-            &directory.join(format!("session-{session:03}")),
+            &directory.join(match attempt {
+                1 => format!("session-{session:03}"),
+                n => format!("session-{session:03}-attempt-{n}"),
+            }),
             &control,
         )
         .await?;
@@ -737,7 +787,7 @@ pub(crate) async fn update_all(
         );
         let planned = plan(&before.sql.tables, &before.current.catalog, &kept)?;
         let mut journal = Journal::open(journal_path, &identity)?;
-        let settled = run(
+        let settled = match run(
             &mut journal,
             &identity,
             &before,
@@ -746,7 +796,24 @@ pub(crate) async fn update_all(
             host_name,
             &control,
         )
-        .await?;
+        .await
+        {
+            // A song started or ended before the session began: nothing was
+            // sent, so this session is planned again from a fresh capture.
+            Err(error)
+                if attempt < removal_batch::DRIFT_ATTEMPTS
+                    && held::is_drift(&error)
+                    && control.check().is_ok()
+                    && matches!(journal.outstanding_metadata_batch(), Ok(None)) =>
+            {
+                tracing::info!(
+                    "The phone's library changed before metadata session {session} was sent ({error:#}); capturing it again"
+                );
+                attempt += 1;
+                continue;
+            }
+            result => result?,
+        };
         ensure!(
             settled.state == MetadataBatchState::Verified,
             "the phone did not apply metadata batch {} ({}); evidence: {}",
@@ -755,6 +822,8 @@ pub(crate) async fn update_all(
             settled.evidence.display()
         );
         progress(session, planned_sessions.max(session))?;
+        session += 1;
+        attempt = 1;
     }
     unreachable!("the session loop returns or refuses")
 }

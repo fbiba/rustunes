@@ -615,7 +615,7 @@ async fn remove(
     if let Some(journal) = journal {
         ensure!(
             journal.outstanding_removal_batch()?.is_none(),
-            "an earlier removal batch is unfinished; run resume first"
+            "an earlier removal batch is not finished; nothing was sent; running the same command again finishes it, or says how"
         );
         drop(journal);
         if let Some(hash) = journal_pin {
@@ -795,6 +795,7 @@ async fn finish_clear(
 ) -> Result<Option<removal_batch::Settled>> {
     let mut batch = None;
     let mut attempt = 1;
+    let mut retries = removal_batch::Retries::default();
     let (found, after) = loop {
         let directory = run.join(match attempt {
             1 => "clear-playlists".to_owned(),
@@ -841,7 +842,11 @@ async fn finish_clear(
         )
         .await;
         drop(journal);
-        // Rolled back or never sent: once more from fresh state.
+        // Rolled back or never sent: again from fresh state.
+        let retry = match &result {
+            Ok(settled) if settled.state == BatchState::Verified => false,
+            outcome => retries.again(outcome.as_ref().err(), journal_path, identity, &control)?,
+        };
         match result {
             Ok(settled) if settled.state == BatchState::Verified => {
                 batch = Some(settled);
@@ -850,12 +855,7 @@ async fn finish_clear(
                         .await?;
                 break (found, after);
             }
-            Ok(_) | Err(_)
-                if attempt < removal_batch::BATCH_ATTEMPTS
-                    && removal_batch::may_try_again(journal_path, identity, &control)? =>
-            {
-                attempt += 1
-            }
+            _ if retry => attempt += 1,
             Ok(settled) => bail!(
                 "playlist batch {} did not apply on the phone, after {attempt} attempts; coordination {} stays Active and running clear again continues it",
                 settled.batch.as_i64(),

@@ -1016,3 +1016,62 @@ fn full_table_comparisons_read_a_database_built_new_or_on_ios_26() {
         std::fs::remove_dir_all(&fixture.dir).unwrap();
     }
 }
+
+/// Two captures of one run while music played: a completed play is taken by
+/// `verify_listening_between` and refused by `verify_revision_housekeeping`,
+/// which allows the phone's renumbering alone; a content change is refused
+/// by both.
+#[test]
+fn a_play_between_two_captures_of_a_run_is_taken_as_listening_only() {
+    use music_protocol::test_support::catalogue::NativeFixture;
+    use sha2::{Digest, Sha256};
+    let fixture = NativeFixture::built_new();
+    let snapshot = |database: &std::path::Path, name: &str| {
+        let bytes = std::fs::read(database).unwrap();
+        let capture = Capture {
+            database,
+            database_sha256: Sha256::digest(bytes).into(),
+            wal: None,
+        };
+        reader::materialize(capture, &fixture.dir.join(name), &mut Budget::new()).unwrap()
+    };
+    let before = fixture.before.as_path();
+    let a = snapshot(before, "a");
+    let edited = |sql: &str, name: &str| {
+        let path = fixture.dir.join(format!("{name}.sqlite"));
+        std::fs::copy(before, &path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+        snapshot(&path, name)
+    };
+    let played = edited(
+        "UPDATE item_stats SET play_count_user=play_count_user+1, \
+         play_count_recent=play_count_recent+1, has_been_played=1, \
+         date_played=date_played+100 WHERE item_pid=(SELECT MIN(item_pid) FROM item); \
+         INSERT INTO entity_revision(revision,entity_pid,deleted,class,revision_type) \
+         VALUES((SELECT MAX(revision)+1 FROM entity_revision), \
+         (SELECT MIN(item_pid) FROM item),0,0,1)",
+        "played",
+    );
+    assert!(verify_revision_housekeeping(&a, &played, &Budget::new()).is_err());
+    let taken = verify_listening_between(&a, &played, &Budget::new()).unwrap();
+    let listening = taken.listening.unwrap();
+    assert_eq!(listening["completed_events"][0]["play_count_delta"], 1);
+    assert!(taken.revisions.is_empty() && taken.stray_rows.is_empty());
+    assert!(
+        verify_listening_between(&a, &a, &Budget::new())
+            .unwrap()
+            .listening
+            .is_none()
+    );
+    let renamed = edited(
+        "UPDATE item_extra SET title='Renamed' WHERE item_pid=(SELECT MIN(item_pid) FROM item)",
+        "renamed",
+    );
+    assert!(verify_revision_housekeeping(&a, &renamed, &Budget::new()).is_err());
+    let error = verify_listening_between(&a, &renamed, &Budget::new()).unwrap_err();
+    assert!(error.to_string().contains("item_extra"), "{error}");
+    std::fs::remove_dir_all(&fixture.dir).unwrap();
+}

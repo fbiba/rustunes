@@ -329,6 +329,44 @@ pub(crate) fn verify_revision_housekeeping(
     revision_housekeeping(&a.tables, &b.tables, budget)
 }
 
+/// `verify_revision_housekeeping` for two captures of a run while music
+/// played: `b` may also hold what listening and the phone's housekeeping
+/// wrote since `a`, as a later run's window takes it (`between_runs`), and
+/// the phone's changes to rows whose track is gone. Every other row of every
+/// table must be exact.
+pub(crate) fn verify_listening_between(
+    a: &Snapshot,
+    b: &Snapshot,
+    budget: &Budget,
+) -> Result<Housekeeping> {
+    budget.check()?;
+    ensure!(
+        a.layout_observed()? && b.version == a.version && a.schema == b.schema,
+        "the catalogue's full SQL schema is unsupported or changed"
+    );
+    ensure!(
+        a.tables.keys().eq(b.tables.keys()),
+        "the catalogue's tables differ"
+    );
+    let mut expected = a.tables.clone();
+    let stray_rows = absorb_stray_rows(&mut expected, &b.tables, StrayWindow::BetweenRuns)?;
+    let listening = between_runs::Window::LaterRun.absorb(&mut expected, &b.tables, budget)?;
+    for (name, old) in &expected {
+        budget.check()?;
+        let new = &b.tables[name];
+        ensure!(
+            old.columns == new.columns && old.definitions == new.definitions,
+            "the catalogue's table definition differs: {name}"
+        );
+        ensure!(old.rows == new.rows, "the catalogue changed in {name}");
+    }
+    Ok(Housekeeping {
+        revisions: Vec::new(),
+        stray_rows,
+        listening,
+    })
+}
+
 /// What `verify_revision_housekeeping` accepted.
 #[derive(Debug)]
 pub(crate) struct Housekeeping {
@@ -336,6 +374,9 @@ pub(crate) struct Housekeeping {
     pub(crate) revisions: Vec<Value>,
     /// The rows whose track is gone that the sweep deleted.
     pub(crate) stray_rows: StrayRows,
+    /// What listening and the phone's housekeeping wrote while music played
+    /// (`verify_listening_between`), revisions included.
+    pub(crate) listening: Option<Value>,
 }
 
 fn revision_housekeeping(
@@ -361,6 +402,7 @@ fn revision_housekeeping(
     Ok(Housekeeping {
         revisions: housekeeping_revisions(a, b, budget)?,
         stray_rows,
+        listening: None,
     })
 }
 
@@ -499,6 +541,7 @@ fn verify_tables(
         &table(a, "container_item")?,
         &table(b, "container_item")?,
         &items,
+        &deleted_tracks(&table(b, "entity_revision")?, budget)?,
         budget,
     )?;
     let revisions = check_revisions(
@@ -568,6 +611,24 @@ struct Played {
 struct History {
     changed_container: Option<i64>,
     report: Value,
+    /// A new entry names a track the phone has deleted.
+    names_deleted: bool,
+}
+
+/// Tracks the phone has deleted: a track's full-record revision kept as a
+/// tombstone (`deleted` 2, class 0, type 0).
+fn deleted_tracks(revisions: &Table, budget: &Budget) -> Result<BTreeSet<i64>> {
+    let mut deleted = BTreeSet::new();
+    for row in revisions.rows.keys() {
+        budget.check()?;
+        if num(revisions, row, "deleted")? == 2
+            && num(revisions, row, "class")? == 0
+            && num(revisions, row, "revision_type")? == 0
+        {
+            deleted.insert(num(revisions, row, "entity_pid")?);
+        }
+    }
+    Ok(deleted)
 }
 fn check_history(
     a: &Table,
@@ -575,6 +636,7 @@ fn check_history(
     ai: &Table,
     bi: &Table,
     items: &BTreeMap<i64, Row>,
+    deleted: &BTreeSet<i64>,
     budget: &Budget,
 ) -> Result<History> {
     let old = keyed(a, "container_pid")?;
@@ -599,6 +661,7 @@ fn check_history(
         return Ok(History {
             changed_container: None,
             report: json!(null),
+            names_deleted: false,
         });
     };
     ensure!(
@@ -606,7 +669,8 @@ fn check_history(
             && num(a, row, "is_hidden")? == 1
             && num(a, row, "is_editable")? == 0
             && num(a, row, "is_owner")? == 1
-            && num(a, row, "contained_media_type")? == 8
+            // 0 once no entry names a track in the library (a clear).
+            && matches!(num(a, row, "contained_media_type")?, 0 | 8)
             && num(a, row, "is_src_remote")? == 0
             && num(a, row, "sync_id")? == 0,
         "unsupported Playback History container shape"
@@ -616,9 +680,20 @@ fn check_history(
         if *id != pid {
             ensure!(before == &new[id], "unrelated container changed");
         } else {
-            exact_except(a, before, &new[id], &["date_modified"])?;
+            exact_except(
+                a,
+                before,
+                &new[id],
+                &["date_modified", "contained_media_type"],
+            )?;
         }
     }
+    // Checked once the new entries are known (observed): the phone sets it
+    // to 0 as it counts the history again with no entry left for a track in
+    // the library, and back to 8 (songs) with the next entry for one.
+    let contained = |t: &Table, row: &Row| num(t, row, "contained_media_type");
+    let contained_before = contained(a, row)?;
+    let contained_after = contained(b, &new[&pid])?;
     let all_old = keyed(ai, "container_item_pid")?;
     let all_new = keyed(bi, "container_item_pid")?;
     let partition =
@@ -655,6 +730,7 @@ fn check_history(
         return Ok(History {
             changed_container: None,
             report: json!(null),
+            names_deleted: false,
         });
     }
     ensure!(
@@ -691,6 +767,8 @@ fn check_history(
     }
     let mut appended = Vec::new();
     let mut appended_per_item = BTreeMap::<i64, u64>::new();
+    let mut names_deleted = false;
+    let mut names_live = false;
     for row in &history_new[retained..] {
         budget.check()?;
         let id = num(bi, row, "container_item_pid")?;
@@ -701,11 +779,17 @@ fn check_history(
         );
         // Only a track in the library can be played. Older entries may name
         // tracks removed since: a removal keeps their history rows (removal
-        // batches), and the retained suffix is compared exactly above.
+        // batches), and the retained suffix is compared exactly above. A
+        // track deleted while it played gets one more entry as the player
+        // stops (observed): it names a track the phone has deleted, whose
+        // tombstone revision stays.
+        let gone = !items.contains_key(&item);
         ensure!(
-            items.contains_key(&item),
+            !gone || deleted.contains(&item),
             "new history entry references a foreign item"
         );
+        names_deleted |= gone;
+        names_live |= !gone;
         // Playback History records starts/selections independently of completed
         // play counters. Do not borrow a counter increment or claim a one-to-one
         // mapping: ordinary_stats/check_revisions validate that channel separately.
@@ -720,15 +804,31 @@ fn check_history(
             );
         }
         appended.push(
-            json!({"container_item_pid":id,"item_pid":item,"position":num(bi,row,"position")?}),
+            json!({"container_item_pid":id,"item_pid":item,"position":num(bi,row,"position")?,
+                "track_deleted":gone}),
+        );
+    }
+    if contained_before != contained_after {
+        let mut live = 0;
+        for row in &history_new {
+            live += usize::from(items.contains_key(&num(bi, row, "item_pid")?));
+        }
+        let emptied = contained_after == 0 && names_deleted && live == 0;
+        let filled = contained_before == 0 && contained_after == 8 && names_live;
+        ensure!(
+            emptied || filled,
+            "unrecognized playback change: contained_media_type"
         );
     }
     Ok(History {
         changed_container: Some(pid),
+        names_deleted,
         report: json!({"container_pid":pid,
         "before_date_modified":a.at(row,"date_modified")?,"after_date_modified":b.at(&new[&pid],"date_modified")?,
         "before_rows":history_old.len(),"after_rows":history_new.len(),"dropped_oldest":dropped,
             "retained_ordered_suffix":retained,"appended":appended,"appended_per_item":appended_per_item,
+            "contained_media_type":(contained_before != contained_after)
+                .then(|| json!({"before":contained_before,"after":contained_after})),
             "completed_play_attribution_claimed":false}),
     })
 }

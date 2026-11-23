@@ -36,7 +36,7 @@ use crate::{
     engine::recovery::retained::playback::{Window, between_runs},
     engine::state::audio_index::Absent,
     engine::state::current::{self, Current},
-    engine::state::held::{ArtworkDb, HeldState},
+    engine::state::held::{self, ArtworkDb, HeldState},
     engine::state::journal::{
         AttemptId, BatchId, BatchRecord, BatchState, CoordinationId, Identity, InsertBatchId,
         Journal, PlaylistTarget, RemovalIntent, RemovalTarget, StartedBatch,
@@ -70,6 +70,12 @@ const SETTLE_PAUSE: Duration = Duration::from_secs(10);
 /// Attempts per batch of a run: one the phone rolled back (NotApplied) or
 /// that was never sent is sent once more, as a new batch from fresh state.
 pub(crate) const BATCH_ATTEMPTS: usize = 2;
+/// Attempts per batch whose session did not start because the phone's state
+/// changed after its capture: music playing writes it at every song.
+pub(crate) const DRIFT_ATTEMPTS: usize = 4;
+/// Snapshot and state captures a before-state takes at most until both read
+/// the same catalogue: music playing writes it at every song.
+const BEFORE_ROUNDS: usize = 4;
 
 /// A complete before-state: snapshot (catalogue, complete audio index) and
 /// Current (CDB, ArtworkDB) captured back to back with identical SQL bytes.
@@ -199,14 +205,17 @@ async fn capture(
             "the connected phone or library differs from the journal"
         );
     }
-    let current = current::capture_with_artwork_controlled(
-        &directory.join("current"),
-        &observed,
-        control.deadline,
-        Arc::clone(&control.cancelled),
-    )
-    .await?;
-    let same = |snapshot: &Snapshot| {
+    let current_dir = directory.join("current");
+    let capture_current = || {
+        current::capture_with_artwork_controlled(
+            &current_dir,
+            &observed,
+            control.deadline,
+            Arc::clone(&control.cancelled),
+        )
+    };
+    let mut current = capture_current().await?;
+    let same = |current: &Current, snapshot: &Snapshot| {
         let (a, b) = (
             current.catalog.source_hashes(),
             snapshot.catalog.source_hashes(),
@@ -216,7 +225,7 @@ async fn capture(
             && a.wal == b.wal
             && a.wal_bytes == b.wal_bytes
     };
-    if !fresh && !same(&snapshot) {
+    if !fresh && !same(&current, &snapshot) {
         // The phone changed since the reused snapshot: index it again.
         fs::rename(&snapshot_dir, directory.join("snapshot-stale"))?;
         audio_capture::capture_allowing(&snapshot_dir, absent, control, device::provider).await?;
@@ -231,10 +240,34 @@ async fn capture(
             "the connected phone or library differs from the reused snapshot"
         );
     }
-    ensure!(
-        same(&snapshot),
-        "the phone's catalogue changed between the snapshot and the state capture; retry"
-    );
+    // A song that starts or ends between the two captures writes the
+    // catalogue: both are taken again, a few times at most.
+    let mut round = 1;
+    while !same(&current, &snapshot) {
+        ensure!(
+            round < BEFORE_ROUNDS,
+            "the phone's catalogue changed between the snapshot and the state capture {BEFORE_ROUNDS} times; retry"
+        );
+        for name in ["snapshot", "current", "current.capture-attempts"] {
+            let path = directory.join(name);
+            if path.try_exists()? {
+                fs::rename(path, directory.join(format!("{name}-changed-{round}")))?;
+            }
+        }
+        audio_capture::capture_allowing(&snapshot_dir, absent, control, device::provider).await?;
+        snapshot = snapshot::open_allowing(&snapshot_dir, absent)?;
+        let again = Identity::for_saved_device(
+            snapshot.identity.device_identifier_sha256,
+            &identity::parse(&snapshot.raw_preferences)?,
+        )?;
+        ensure!(
+            again.device_digest() == observed.device_digest()
+                && again.library_digest() == observed.library_digest(),
+            "the connected phone or library changed during the capture"
+        );
+        current = capture_current().await?;
+        round += 1;
+    }
     let sql = materialize(&snapshot, &directory.join("sql"), control)?;
     Ok((
         observed,
@@ -414,7 +447,7 @@ pub(crate) async fn run(
     control.check()?;
     ensure!(
         journal.outstanding_removal_batch()?.is_none(),
-        "an earlier removal batch is unfinished; run resume first"
+        "an earlier removal batch is not finished; nothing was sent; running the same command again finishes it, or says how"
     );
     let items = tracks
         .iter()
@@ -498,7 +531,7 @@ pub(crate) async fn run_playlists(
     control.check()?;
     ensure!(
         journal.outstanding_removal_batch()?.is_none(),
-        "an earlier removal batch is unfinished; run resume first"
+        "an earlier removal batch is not finished; nothing was sent; running the same command again finishes it, or says how"
     );
     let pids: Vec<i64> = playlists.iter().map(|p| p.container as i64).collect();
     removal_sql::qualify_deletion(&before.sql.tables, &pids)?;
@@ -637,13 +670,60 @@ async fn send_and_settle(
     match (observed, wire) {
         (Ok(settled), _) => Ok(settled),
         (Err(error), Ok(())) => Err(error.context(format!(
-            "removal batch {} is Started after {SETTLE_ATTEMPTS} observations; the next run (or resume) observes it again",
+            "removal batch {} is not finished after {SETTLE_ATTEMPTS} checks of the phone; running the same command again finishes it, or says how",
             id.as_i64()
         ))),
         (Err(error), Err(wire)) => Err(error.context(format!(
-            "removal batch {} is Started after a transport error ({wire:#}) and {SETTLE_ATTEMPTS} observations; the next run (or resume) observes it again",
+            "removal batch {} is not finished after a connection error ({wire:#}) and {SETTLE_ATTEMPTS} checks of the phone; running the same command again finishes it, or says how",
             id.as_i64()
         ))),
+    }
+}
+
+/// When a batch is tried again from fresh state: one the phone rolled back
+/// (NotApplied) or that failed before it was sent, once; one whose session
+/// did not start because the phone's state changed after its capture (a song
+/// started or ended), up to `DRIFT_ATTEMPTS` attempts in all. Never when the
+/// run was cancelled or something is left Started.
+#[derive(Default)]
+pub(crate) struct Retries {
+    other: usize,
+    drifted: usize,
+}
+impl Retries {
+    /// Whether to try again after an attempt that failed with `error`, or
+    /// that the phone did not apply (`None`).
+    pub(crate) fn again(
+        &mut self,
+        error: Option<&anyhow::Error>,
+        journal_path: &Path,
+        identity: &Identity,
+        control: &Control,
+    ) -> Result<bool> {
+        let again = may_try_again(journal_path, identity, control)?
+            && self.take(error.is_some_and(held::is_drift));
+        if again {
+            match error {
+                Some(error) => tracing::info!(
+                    "The removal batch was not sent ({error:#}); capturing the phone again"
+                ),
+                None => tracing::info!(
+                    "The phone did not apply the removal batch; capturing the phone again"
+                ),
+            }
+        }
+        Ok(again)
+    }
+    /// Counts one more attempt after one that drifted (`drift`) or not,
+    /// when the limits allow it.
+    fn take(&mut self, drift: bool) -> bool {
+        let (taken, limit) = match drift {
+            true => (&mut self.drifted, DRIFT_ATTEMPTS),
+            false => (&mut self.other, BATCH_ATTEMPTS),
+        };
+        let allowed = *taken + 1 < limit;
+        *taken += usize::from(allowed);
+        allowed
     }
 }
 
@@ -857,6 +937,7 @@ pub(crate) async fn remove_all(
             total: tracks.len(),
         })?;
         let mut attempt = 1;
+        let mut retries = Retries::default();
         let batch = loop {
             let control = control();
             let directory = run_directory.join(match attempt {
@@ -880,14 +961,15 @@ pub(crate) async fn remove_all(
                 .await
             }
             .await;
+            let retry = match &result {
+                Ok(batch) if batch.state == BatchState::Verified => false,
+                outcome => {
+                    retries.again(outcome.as_ref().err(), journal_path, identity, &control)?
+                }
+            };
             match result {
                 Ok(batch) if batch.state == BatchState::Verified => break batch,
-                Ok(_) | Err(_)
-                    if attempt < BATCH_ATTEMPTS
-                        && may_try_again(journal_path, identity, &control)? =>
-                {
-                    attempt += 1
-                }
+                _ if retry => attempt += 1,
                 Ok(batch) => bail!(
                     "removal batch {} did not apply on the phone, after {attempt} attempts; {removed} of {} tracks were removed",
                     batch.batch.as_i64(),
@@ -1043,23 +1125,26 @@ pub(crate) async fn settle(
     }
     let anchor = after.catalog.persisted_media_anchor();
     if anchor == batch.base_anchor {
-        let unchanged = match (playlists.is_empty(), window) {
-            (true, Window::SameRun) => {
-                removal_sql::not_applied(before_tables, after_tables, &items)?
-            }
-            (true, Window::LaterRun) => {
-                removal_sql::not_applied_later(before_tables, after_tables, &items)?
-            }
-            // Listening never touches an empty playlist.
-            (false, _) => {
-                removal_sql::deletion_not_applied(before_tables, after_tables, &playlists)?
-            }
-        };
-        ensure!(
-            unchanged,
-            "the anchor did not move but the catalogue changed; batch {} stays Started",
-            batch.id.as_i64()
-        );
+        window.check(|window| {
+            let unchanged = match (playlists.is_empty(), window) {
+                (true, Window::SameRun) => {
+                    removal_sql::not_applied(before_tables, after_tables, &items)?
+                }
+                (true, Window::LaterRun) => {
+                    removal_sql::not_applied_later(before_tables, after_tables, &items)?
+                }
+                // Listening never touches an empty playlist.
+                (false, _) => {
+                    removal_sql::deletion_not_applied(before_tables, after_tables, &playlists)?
+                }
+            };
+            ensure!(
+                unchanged,
+                "the anchor did not move but the catalogue changed; batch {} stays Started",
+                batch.id.as_i64()
+            );
+            Ok(())
+        })?;
         let staged = staged_names(identity, &library, &run, control).await?;
         let staged_removed = remove_unfinished(
             identity,
@@ -1104,41 +1189,40 @@ pub(crate) async fn settle(
         |expected: &mut removal_sql::Tables, observed: &removal_sql::Tables, floor: i64| {
             between_runs::absorb_above(expected, observed, &budget, floor)
         };
-    let removal = match (playlists.is_empty(), window) {
-        (true, Window::SameRun) => serde_json::to_value(
-            removal_sql::verify(before_tables, after_tables, &items, batch.base_anchor)
-                .with_context(unmodelled)?,
-        )?,
-        (true, Window::LaterRun) => serde_json::to_value(
-            removal_sql::verify_later(
-                before_tables,
-                after_tables,
-                &items,
-                batch.base_anchor,
-                &between_runs,
-            )
-            .with_context(unmodelled)?,
-        )?,
-        (false, Window::SameRun) => serde_json::to_value(
-            removal_sql::verify_deletion(
-                before_tables,
-                after_tables,
-                &playlists,
-                batch.base_anchor,
-            )
-            .with_context(unmodelled)?,
-        )?,
-        (false, Window::LaterRun) => serde_json::to_value(
-            removal_sql::verify_deletion_later(
-                before_tables,
-                after_tables,
-                &playlists,
-                batch.base_anchor,
-                &between_runs,
-            )
-            .with_context(unmodelled)?,
-        )?,
-    };
+    let (removal, taken) = window
+        .check(|window| {
+            Ok(match (playlists.is_empty(), window) {
+                (true, Window::SameRun) => serde_json::to_value(removal_sql::verify(
+                    before_tables,
+                    after_tables,
+                    &items,
+                    batch.base_anchor,
+                )?)?,
+                (true, Window::LaterRun) => serde_json::to_value(removal_sql::verify_later(
+                    before_tables,
+                    after_tables,
+                    &items,
+                    batch.base_anchor,
+                    &between_runs,
+                )?)?,
+                (false, Window::SameRun) => serde_json::to_value(removal_sql::verify_deletion(
+                    before_tables,
+                    after_tables,
+                    &playlists,
+                    batch.base_anchor,
+                )?)?,
+                (false, Window::LaterRun) => {
+                    serde_json::to_value(removal_sql::verify_deletion_later(
+                        before_tables,
+                        after_tables,
+                        &playlists,
+                        batch.base_anchor,
+                        &between_runs,
+                    )?)?
+                }
+            })
+        })
+        .with_context(unmodelled)?;
     survivors_unchanged(&before, &after, batch)?;
     let remaining = wait_absent(identity, &library, &run, batch, control).await?;
     ensure!(
@@ -1155,6 +1239,9 @@ pub(crate) async fn settle(
         "after_index_sha256":hex(&after.index_receipt_sha256),
         "removal":removal,"survivors_unchanged":true,"target_files_absent":true,
     });
+    if window != taken {
+        receipt["music_played_during_run"] = json!(true);
+    }
     allocation_changed(&mut receipt, &before, &after);
     let receipt = serde_json::to_vec_pretty(&receipt)?;
     durable_write(&run, "verification.json", &receipt)?;
@@ -1436,4 +1523,24 @@ pub(crate) fn sha(bytes: &[u8]) -> [u8; 32] {
 }
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod retries_tests {
+    use super::*;
+
+    /// A batch the phone rolled back, or that failed before it was sent, is
+    /// tried once more; one whose session a song change kept from starting
+    /// up to `DRIFT_ATTEMPTS` attempts in all, counted apart.
+    #[test]
+    fn drifted_attempts_are_counted_apart_from_the_one_retry() {
+        let mut retries = Retries::default();
+        assert!(retries.take(false));
+        assert!(!retries.take(false));
+        for _ in 1..DRIFT_ATTEMPTS {
+            assert!(retries.take(true));
+        }
+        assert!(!retries.take(true));
+        assert!(!retries.take(false));
+    }
 }

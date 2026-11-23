@@ -12,7 +12,7 @@ use crate::engine::execution::device::DeviceProvider;
 use crate::{
     engine::execution::native_insert::{create_trace, durable_write},
     engine::state::current::Current,
-    engine::state::held::{ArtworkDb, HeldState},
+    engine::state::held::{self, ArtworkDb, HeldState},
     engine::state::journal::{Binding, Identity, Journal},
     engine::verification::artwork::{self, TrackArtworkExpectation, VerifiedTrackArtworkBytes},
 };
@@ -172,17 +172,19 @@ struct Prepared {
 /// device. Identity/preparation failures create no output. After those gates,
 /// failure returns Err and preserves an explicitly incomplete report; earlier
 /// per-file evidence never becomes overall success or reconciliation.
-pub async fn verify<F, Fut>(
+pub async fn verify<F, Fut, R>(
     journal: &Journal,
     current: &Current,
     selection: Selection,
     trace: &Path,
     control: &ReadControl,
     mut connect: F,
+    mut refresh: R,
 ) -> Result<Report>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<DeviceProvider>>,
+    R: AsyncFnMut(usize) -> Result<Option<Current>>,
 {
     control.check()?;
     ensure!(
@@ -217,6 +219,10 @@ where
         .open(trace.join("progress.jsonl"))?;
     report(trace, "intent.json", &prepared.report)?;
     let result: Result<()> = async {
+        // The capture a batch or group reads over once a guard found the
+        // phone's state changed under an earlier one (`refreshed`).
+        let mut fresh: Option<Current> = None;
+        let mut again = 0;
         for (number, batch) in prepared.batches.iter().enumerate() {
             control.check()?;
             let batch_bytes: u64 = batch
@@ -232,44 +238,87 @@ where
                     bytes: batch_bytes,
                 },
             ))?;
-            let provider = if let Some(provider) = first_provider.take() {
-                provider
-            } else {
-                timeout_at(
-                    control
-                        .deadline
-                        .min(Instant::now() + Duration::from_secs(15)),
-                    connect(),
-                )
-                .await
-                .context("verification discovery deadline")??
-            };
-            ensure!(
-                provider.udid == current.device,
-                "discovered device differs from verification identity"
-            );
-            let batch_trace = trace.join(format!("batch-{number:04}"));
-            create_trace(&batch_trace)?;
-            let mut afc = Transfer::connect_bounded_readonly_summary(
-                &provider,
-                &batch_trace,
-                control.deadline,
-                batch.operations,
-                Arc::clone(&control.cancelled),
-            )
-            .await?;
-            read_batch(
-                &mut afc,
-                &prepared.state,
-                &prepared.device,
-                &prepared.bindings,
-                &mut prepared.report.tracks,
-                batch,
-                number,
-                control,
-            )
-            .await?;
-            drop(afc);
+            let mut refreshes = 0;
+            let mut earlier = BTreeMap::new();
+            loop {
+                let provider = if let Some(provider) = first_provider.take() {
+                    provider
+                } else {
+                    timeout_at(
+                        control
+                            .deadline
+                            .min(Instant::now() + Duration::from_secs(15)),
+                        connect(),
+                    )
+                    .await
+                    .context("verification discovery deadline")??
+                };
+                ensure!(
+                    provider.udid == current.device,
+                    "discovered device differs from verification identity"
+                );
+                let batch_trace = trace.join(match refreshes {
+                    0 => format!("batch-{number:04}"),
+                    n => format!("batch-{number:04}-again-{n}"),
+                });
+                create_trace(&batch_trace)?;
+                let unread: Vec<AudioFields> = batch
+                    .indices
+                    .iter()
+                    .map(|&index| AudioFields::of(&prepared.report.tracks[index]))
+                    .collect();
+                let read = async {
+                    let mut afc = Transfer::connect_bounded_readonly_summary(
+                        &provider,
+                        &batch_trace,
+                        control.deadline,
+                        batch.operations,
+                        Arc::clone(&control.cancelled),
+                    )
+                    .await?;
+                    read_batch_with(
+                        &mut afc,
+                        &prepared.state,
+                        &prepared.device,
+                        &prepared.bindings,
+                        &mut prepared.report.tracks,
+                        batch,
+                        number,
+                        control,
+                        &mut earlier,
+                    )
+                    .await
+                }
+                .await;
+                match read {
+                    Ok(()) => break,
+                    // A song ended while the batch was read: it is read again
+                    // over a fresh capture of the same library.
+                    Err(error) if held::is_drift(&error) && refreshes < STATE_REFRESHES => {
+                        EarlierRead::taken(
+                            &prepared.bindings,
+                            &mut prepared.report.tracks,
+                            batch,
+                            &mut earlier,
+                        );
+                        for (&index, fields) in batch.indices.iter().zip(unread) {
+                            fields.restore(&mut prepared.report.tracks[index]);
+                        }
+                        again += 1;
+                        let now = fresh.as_ref().unwrap_or(current);
+                        match refreshed(&mut refresh, again, now, &mut prepared.state).await? {
+                            Some(capture) => fresh = Some(capture),
+                            None => return Err(error),
+                        }
+                        tracing::info!(
+                            "The phone's library changed while audio batch {} was read ({error:#}); read it again",
+                            number + 1
+                        );
+                        refreshes += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             for &index in &batch.indices {
                 serde_json::to_writer(&mut progress, &prepared.report.tracks[index])?;
                 writeln!(progress)?;
@@ -326,6 +375,7 @@ where
         let mut reused = 0;
         let mut tried = 0;
         let mut unread = Vec::new();
+        let mut refreshes = 0;
         while tried < checks.len() {
             control.check()?;
             let art_control = crate::engine::execution::native_insert::Control {
@@ -334,16 +384,38 @@ where
                     .min(Instant::now() + Duration::from_secs(120)),
                 cancelled: Arc::clone(&control.cancelled),
             };
+            let now = fresh.as_ref().unwrap_or(current);
             let proofs = artwork::reuse_track_group(
-                current,
+                now,
                 &checks[tried..],
-                &trace.join(format!("artwork-reuse-{tried:04}")),
+                &trace.join(match refreshes {
+                    0 => format!("artwork-reuse-{tried:04}"),
+                    n => format!("artwork-reuse-{tried:04}-again-{n}"),
+                }),
                 &art_control,
                 &mut connect,
             )
             .await;
             let proofs = match proofs {
-                Ok(proofs) => proofs,
+                Ok(proofs) => {
+                    refreshes = 0;
+                    proofs
+                }
+                // A song ended while the group was checked: it is checked
+                // again over a fresh capture of the same library.
+                Err((_, error)) if held::is_drift(&error) && refreshes < STATE_REFRESHES => {
+                    tracing::info!(
+                        "The phone's library changed while covers were checked ({error:#}); check them again"
+                    );
+                    again += 1;
+                    match refreshed(&mut refresh, again, now, &mut prepared.state).await? {
+                        Some(capture) => fresh = Some(capture),
+                        None => return Err(error),
+                    }
+                    checks = retraced(&checks, trace, again)?;
+                    refreshes += 1;
+                    continue;
+                }
                 Err((position, error)) => {
                     let index = indices[tried + position];
                     let status = &mut prepared.report.tracks[index].artwork;
@@ -380,7 +452,7 @@ where
             ))?;
         }
         let indices: Vec<usize> = unread.iter().map(|&i| indices[i]).collect();
-        let checks: Vec<_> = {
+        let mut checks: Vec<_> = {
             let mut checks: Vec<_> = checks.into_iter().map(Some).collect();
             unread
                 .iter()
@@ -388,9 +460,13 @@ where
                 .collect()
         };
         let mut done = 0;
+        let mut refreshes = 0;
         while done < checks.len() {
             control.check()?;
-            let group_trace = trace.join(format!("artwork-group-{done:04}"));
+            let group_trace = trace.join(match refreshes {
+                0 => format!("artwork-group-{done:04}"),
+                n => format!("artwork-group-{done:04}-again-{n}"),
+            });
             let art_control = crate::engine::execution::native_insert::Control {
                 deadline: control
                     .deadline
@@ -398,8 +474,9 @@ where
                 cancelled: Arc::clone(&control.cancelled),
             };
             let completed = prepared.report.completed_artwork_tracks;
+            let now = fresh.as_ref().unwrap_or(current);
             let result = artwork::verify_track_group(
-                current,
+                now,
                 &checks[done..],
                 &group_trace,
                 &art_control,
@@ -416,7 +493,25 @@ where
             )
             .await;
             let (proofs, failure) = match result {
-                Ok(proofs) => (proofs, None),
+                Ok(proofs) => {
+                    refreshes = 0;
+                    (proofs, None)
+                }
+                // A song ended while the group was read: it is read again
+                // over a fresh capture of the same library.
+                Err((_, error)) if held::is_drift(&error) && refreshes < STATE_REFRESHES => {
+                    tracing::info!(
+                        "The phone's library changed while covers were read back ({error:#}); read them again"
+                    );
+                    again += 1;
+                    match refreshed(&mut refresh, again, now, &mut prepared.state).await? {
+                        Some(capture) => fresh = Some(capture),
+                        None => return Err(error),
+                    }
+                    checks = retraced(&checks, trace, again)?;
+                    refreshes += 1;
+                    continue;
+                }
                 Err(failure) => (Vec::new(), Some(failure)),
             };
             for proof in proofs {
@@ -469,6 +564,82 @@ fn verification(proof: &VerifiedTrackArtworkBytes) -> &'static str {
         "exact_track_original_and_decoded_derivative"
     } else {
         "exact_track_original_and_empty_phone_rendition"
+    }
+}
+
+/// Guard-found changes an audio batch or cover group may meet in a row,
+/// each read again over a fresh capture: music playing writes the catalogue
+/// as each song ends.
+const STATE_REFRESHES: usize = 4;
+
+/// The caller's fresh capture after a guard found the phone's state changed
+/// under a batch or group, when it allows one (`refresh` gives `None`
+/// otherwise). It must be `now`'s library but for listening; the audio
+/// guard then holds it in `state`.
+async fn refreshed<R>(
+    refresh: &mut R,
+    again: usize,
+    now: &Current,
+    state: &mut HeldState,
+) -> Result<Option<Current>>
+where
+    R: AsyncFnMut(usize) -> Result<Option<Current>>,
+{
+    let Some(fresh) = refresh(again).await? else {
+        return Ok(None);
+    };
+    crate::engine::state::current::ensure_same_but_listening(now, &fresh)
+        .context("the phone's library changed during verification")?;
+    let held = HeldState::new(&fresh, fresh.receipt_sha256, ArtworkDb::NotHeld)?;
+    held.ensure_catalog(&fresh.catalog)?;
+    *state = held;
+    Ok(Some(fresh))
+}
+
+/// `checks` traced afresh under `trace/again-{again}`: a cover read again
+/// needs new directories.
+fn retraced(
+    checks: &[artwork::TrackCheck],
+    trace: &Path,
+    again: usize,
+) -> Result<Vec<artwork::TrackCheck>> {
+    create_trace(&trace.join(format!("again-{again}")))?;
+    checks
+        .iter()
+        .map(|check| check.again(trace, again))
+        .collect()
+}
+
+/// What `read_batch` writes into a track's report, as it was before an
+/// attempt, so that a batch read again starts as the first attempt did.
+struct AudioFields {
+    status: AudioStatus,
+    finding: Option<&'static str>,
+    batch: Option<usize>,
+    attributes: Option<Attributes>,
+    proof: Option<&'static str>,
+    observed: Option<String>,
+}
+impl AudioFields {
+    fn of(report: &TrackReport) -> Self {
+        Self {
+            status: report.audio_status,
+            finding: report.finding,
+            batch: report.batch,
+            attributes: report.audio_attributes.clone(),
+            proof: report.audio_proof,
+            observed: report.audio_observed_sha256.clone(),
+        }
+    }
+    fn restore(self, report: &mut TrackReport) {
+        report.audio_status = self.status;
+        report.finding = self.finding;
+        report.batch = self.batch;
+        report.audio_attributes = self.attributes;
+        report.audio_proof = self.proof;
+        report.audio_observed_sha256 = self.observed;
+        // Only `read_batch` sets it, once per track.
+        report.mpeg_frame_readback = None;
     }
 }
 
@@ -864,6 +1035,7 @@ impl ReadBatch for Transfer {
         Ok(bytes)
     }
 }
+#[cfg(test)]
 async fn read_batch(
     reader: &mut impl ReadBatch,
     state: &HeldState,
@@ -873,6 +1045,75 @@ async fn read_batch(
     batch: &Batch,
     number: usize,
     control: &ReadControl,
+) -> Result<()> {
+    read_batch_with(
+        reader,
+        state,
+        device,
+        bindings,
+        reports,
+        batch,
+        number,
+        control,
+        &mut BTreeMap::new(),
+    )
+    .await
+}
+
+/// A file an attempt of its batch read whole between two stats of it that
+/// agreed, before the batch's closing state guard found the phone's state
+/// changed (a song ended). While the file keeps that stat its bytes are
+/// known, so the batch read again over a fresh capture of the same library
+/// does not read it again.
+struct EarlierRead {
+    attributes: Attributes,
+    sha256: String,
+    mpeg: Option<MpegFrameReport>,
+}
+
+impl EarlierRead {
+    /// What an attempt that the closing guard refused read, by path.
+    fn taken(
+        bindings: &[Binding],
+        reports: &mut [TrackReport],
+        batch: &Batch,
+        earlier: &mut BTreeMap<String, EarlierRead>,
+    ) {
+        for &index in &batch.indices {
+            let report = &mut reports[index];
+            if report.audio_status != AudioStatus::ReadPendingStateGuard {
+                continue;
+            }
+            if let (Some(attributes), Some(sha256)) = (
+                report.audio_attributes.clone(),
+                report.audio_observed_sha256.clone(),
+            ) {
+                earlier.insert(
+                    bindings[index].content.path.clone(),
+                    EarlierRead {
+                        attributes,
+                        sha256,
+                        mpeg: report.mpeg_frame_readback.take(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// `read_batch`, taking a file an earlier attempt read (`earlier`) as read
+/// while it keeps that read's stat.
+#[allow(clippy::too_many_arguments)]
+async fn read_batch_with(
+    reader: &mut impl ReadBatch,
+    state: &HeldState,
+    device: &[u8; 32],
+    bindings: &[Binding],
+    reports: &mut [TrackReport],
+    batch: &Batch,
+    number: usize,
+    control: &ReadControl,
+    earlier: &mut BTreeMap<String, EarlierRead>,
 ) -> Result<()> {
     control.check()?;
     reader.state_guard(state).await?;
@@ -907,6 +1148,21 @@ async fn read_batch(
                 // An MPEG-1 proof needs frame facts measured on the copied bytes;
                 // every other format's identity follows from the whole file's.
                 .filter(|copy| content.source.audio.mpeg().is_none() || copy.mpeg.is_some());
+        let read = match copy {
+            Some(_) => None,
+            None => earlier
+                .remove(&content.path)
+                .filter(|read| same_stat(Some(&read.attributes), Some(&before))),
+        };
+        if let Some(read) = read {
+            // Read whole in an earlier attempt, between two stats this one
+            // still finds: nothing is read again.
+            report.audio_proof = Some("stat_of_earlier_read");
+            report.mpeg_frame_readback = read.mpeg;
+            report.audio_observed_sha256 = Some(read.sha256);
+            report.audio_status = AudioStatus::ReadPendingStateGuard;
+            continue;
+        }
         let hash = if let Some(copy) = copy {
             // The file keeps the stat it had when a verified copy or this
             // host's upload measured its bytes, so nothing is copied.

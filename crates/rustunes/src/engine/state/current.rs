@@ -764,6 +764,99 @@ async fn capture_inner_options(
     })
 }
 
+/// Whether `fresh`, captured after `before`, is the same phone state but for
+/// music played in between: the same device, library, preferences, CDB and
+/// ArtworkDB bytes, and the same catalogue but for each track's playback,
+/// which may differ only as listening does (`catalogue_listening`). Every
+/// other field, statistic and artwork registration is compared exactly. A
+/// step that read the phone over `before` may go on over `fresh`.
+pub(crate) fn ensure_same_but_listening(before: &Current, fresh: &Current) -> Result<()> {
+    ensure!(
+        before.device == fresh.device
+            && before.identity.device_digest() == fresh.identity.device_digest()
+            && before.identity.library_digest() == fresh.identity.library_digest()
+            && before.raw_preferences == fresh.raw_preferences
+            && before.plist_preferences == fresh.plist_preferences
+            && before.cdb == fresh.cdb
+            && before.artwork_db == fresh.artwork_db,
+        "the phone's device, library, preferences, CDB or artwork bytes changed"
+    );
+    before.library.ensure_matches(&fresh.library)?;
+    ensure_catalog(&before.catalog, &fresh.catalog)
+}
+
+/// The catalogue as far as planning and verification read it: each track's
+/// playback may differ as listening does; every other field and statistic is
+/// compared exactly.
+pub(crate) fn ensure_catalog(before: &Catalog, fresh: &Catalog) -> Result<()> {
+    ensure!(
+        before.tracks().len() == fresh.tracks().len(),
+        "the phone's catalogue changed beyond listening"
+    );
+    for (was, now) in before.tracks().iter().zip(fresh.tracks()) {
+        let mut played = now.clone();
+        played.playback = was.playback.clone();
+        ensure!(
+            played == *was,
+            "the phone's catalogue changed beyond listening"
+        );
+        crate::engine::recovery::retained::playback::between_runs::catalogue_listening(
+            &was.playback,
+            &now.playback,
+        )
+        .with_context(|| format!("track {:016x}", was.sync_id))?;
+    }
+    ensure!(
+        before.database_pid() == fresh.database_pid()
+            && before.primary_container_pid() == fresh.primary_container_pid()
+            && before.persisted_media_anchor() == fresh.persisted_media_anchor()
+            && before.albums() == fresh.albums()
+            && before.artists() == fresh.artists()
+            && before.composers() == fresh.composers()
+            && before.track_composers() == fresh.track_composers()
+            && before.stats_except_playback() == fresh.stats_except_playback()
+            // The phone may delete an `item_store` row whose track is gone;
+            // no identity the plan avoided may appear.
+            && before.live_sync_ids() == fresh.live_sync_ids()
+            && fresh
+                .represented_sync_ids()
+                .is_subset(before.represented_sync_ids()),
+        "the phone's catalogue changed beyond listening"
+    );
+    for track in before.tracks() {
+        ensure!(
+            before.title_sort(track.sync_id) == fresh.title_sort(track.sync_id),
+            "a nullable sort title changed"
+        );
+    }
+    let a = before.artwork();
+    let b = fresh.artwork();
+    let counts = |a: music_protocol::catalogue::sqlite::ArtworkRowCounts| {
+        (a.cached_rows, a.registration_rows)
+    };
+    ensure!(
+        a.occupied_cache_ids() == b.occupied_cache_ids()
+            && a.cached_ids() == b.cached_ids()
+            && a.cached_objects() == b.cached_objects()
+            && a.track_cache_ids() == b.track_cache_ids()
+            && a.tracks_with_artwork_registration() == b.tracks_with_artwork_registration()
+            && a.album_cache_ids() == b.album_cache_ids()
+            && counts(a.source300_rows()) == counts(b.source300_rows())
+            && a.other_source_rows()
+                .iter()
+                .map(|(k, v)| (*k, counts(*v)))
+                .collect::<Vec<_>>()
+                == b.other_source_rows()
+                    .iter()
+                    .map(|(k, v)| (*k, counts(*v)))
+                    .collect::<Vec<_>>()
+            && a.unmapped_source300_token_rows() == b.unmapped_source300_token_rows()
+            && a.orphan_album_cache_ids() == b.orphan_album_cache_ids(),
+        "artwork registrations or cache occupancy changed"
+    );
+    Ok(())
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

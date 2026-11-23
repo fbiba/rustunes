@@ -292,6 +292,217 @@ fn history_media_type_count_follows_entries_for_tracks_in_the_library() {
     }
 }
 
+/// A track deleted while it played: the player appends one more entry for
+/// it as it stops, and the phone counts the history again. Track 77, removed
+/// earlier, keeps its tombstone revision; its entry 101 and an older one
+/// were still counted (3), and the new entry 104 names it. `count` is the after count, `entry`
+/// whether 104 is appended, `tombstone` whether 77's tombstone is there.
+fn deleted_while_playing(count: i64, entry: bool, tombstone: bool) -> (Tables, Tables) {
+    let (mut a, mut b) = media_type_fixture();
+    for (tables, count) in [(&mut a, 3), (&mut b, count)] {
+        let rows = &mut tables.get_mut(MEDIA_TYPES).unwrap().rows;
+        let old = rows.keys().find(|r| r[0] == i(9)).unwrap().clone();
+        rows.remove(&old);
+        rows.insert(vec![i(9), i(8), i(count)], 1);
+        if tombstone {
+            tables
+                .get_mut("entity_revision")
+                .unwrap()
+                .rows
+                .insert(vec![i(5), i(77), i(2), i(0), i(0)], 1);
+        }
+    }
+    if entry {
+        b.get_mut("container_item")
+            .unwrap()
+            .rows
+            .insert(vec![i(104), i(9), i(77), i(2), s(""), s(""), s("")], 1);
+    }
+    (a, b)
+}
+
+#[test]
+fn an_entry_for_a_track_deleted_while_it_played_is_taken_with_a_recount() {
+    // Counted again: the two entries whose track is in the library.
+    let (a, b) = deleted_while_playing(2, true, true);
+    let (expected, report) = absorbed(&a, &b).unwrap();
+    assert_eq!(expected[MEDIA_TYPES], b[MEDIA_TYPES]);
+    let report = report.unwrap();
+    assert_eq!(
+        report["history_media_type_counts"],
+        json!([{"media_type":8,"before":3,"after":2,"counted_again":true}])
+    );
+    assert_eq!(report["playback_history"]["appended"][1]["item_pid"], 77);
+    assert_eq!(
+        report["playback_history"]["appended"][1]["track_deleted"],
+        true
+    );
+    // Or by the change in such entries, as without the deleted track's entry.
+    absorbed(
+        &deleted_while_playing(4, true, true).0,
+        &deleted_while_playing(4, true, true).1,
+    )
+    .unwrap();
+    for (case, count, entry, tombstone) in [
+        (
+            "an entry naming a track the phone never deleted",
+            2,
+            true,
+            false,
+        ),
+        (
+            "a recount without an entry for a deleted track",
+            2,
+            false,
+            true,
+        ),
+        ("a count that is neither", 5, true, true),
+    ] {
+        let (a, b) = deleted_while_playing(count, entry, tombstone);
+        assert!(absorbed(&a, &b).is_err(), "{case}");
+    }
+}
+
+/// A removal of every track while one played (a clear): the model holds no
+/// track; 1, 2 and 77 keep tombstones. The player appends 103 for track 1,
+/// deleted as it played; the phone counts the history again, finds no entry
+/// for a track in the library, drops its media type row and sets its
+/// `contained_media_type` to 0. `live` keeps track 2 in the library.
+fn emptied_by_a_clear(live: bool, appended: bool) -> (Tables, Tables) {
+    let (mut a, mut b) = deleted_while_playing(2, false, true);
+    for tables in [&mut a, &mut b] {
+        let rows = match live {
+            true => vec![vec![i(2), i(8)]],
+            false => vec![],
+        };
+        tables.insert("item".into(), table(&["item_pid", "media_type"], rows));
+        tables.get_mut("item_stats").unwrap().rows.clear();
+        let revisions = &mut tables.get_mut("entity_revision").unwrap().rows;
+        revisions.retain(|r, _| r[1] == i(9) || r[1] == i(77));
+        revisions.insert(vec![i(6), i(1), i(2), i(0), i(0)], 1);
+        if !live {
+            revisions.insert(vec![i(7), i(2), i(2), i(0), i(0)], 1);
+        }
+    }
+    b.get_mut(MEDIA_TYPES)
+        .unwrap()
+        .rows
+        .retain(|r, _| r[0] != i(9));
+    change(
+        &mut b,
+        "container",
+        "container_pid",
+        9,
+        "contained_media_type",
+        i(0),
+    );
+    if !appended {
+        b.insert("container_item".into(), a["container_item"].clone());
+    }
+    (a, b)
+}
+
+#[test]
+fn a_clear_while_a_track_played_empties_the_history_count() {
+    let (a, b) = emptied_by_a_clear(false, true);
+    let (expected, report) = absorbed(&a, &b).unwrap();
+    assert_eq!(expected["container"], b["container"]);
+    assert_eq!(expected[MEDIA_TYPES], b[MEDIA_TYPES]);
+    let report = report.unwrap();
+    assert_eq!(
+        report["history_media_type_counts"],
+        json!([{"media_type":8,"before":3,"after":null,"counted_again":true}])
+    );
+    assert_eq!(
+        report["playback_history"]["contained_media_type"],
+        json!({"before":8,"after":0})
+    );
+    for (case, live, appended) in [
+        ("an entry still names a track in the library", true, true),
+        ("no entry for a deleted track", false, false),
+    ] {
+        let (a, b) = emptied_by_a_clear(live, appended);
+        assert!(absorbed(&a, &b).is_err(), "{case}");
+    }
+}
+
+/// The history a clear emptied (`contained_media_type` 0, no media type
+/// row) when the library is back and a song plays: the phone sets it to 8
+/// and its row counts the new entries for tracks in the library from none.
+/// Entry 102 names track 2, back in the library under a reused id; the new
+/// entry 103 names track 1, or (`live` false) track 77, deleted earlier.
+fn filled_after_a_clear(count: i64, contained: i64, live: bool) -> (Tables, Tables) {
+    let (mut a, mut b) = media_type_fixture();
+    for tables in [&mut a, &mut b] {
+        tables
+            .get_mut(MEDIA_TYPES)
+            .unwrap()
+            .rows
+            .retain(|r, _| r[0] != i(9));
+        tables
+            .get_mut("entity_revision")
+            .unwrap()
+            .rows
+            .insert(vec![i(5), i(77), i(2), i(0), i(0)], 1);
+    }
+    change(
+        &mut a,
+        "container",
+        "container_pid",
+        9,
+        "contained_media_type",
+        i(0),
+    );
+    change(
+        &mut b,
+        "container",
+        "container_pid",
+        9,
+        "contained_media_type",
+        i(contained),
+    );
+    b.get_mut(MEDIA_TYPES)
+        .unwrap()
+        .rows
+        .insert(vec![i(9), i(8), i(count)], 1);
+    if !live {
+        change(
+            &mut b,
+            "container_item",
+            "container_item_pid",
+            103,
+            "item_pid",
+            i(77),
+        );
+    }
+    (a, b)
+}
+
+#[test]
+fn the_history_a_clear_emptied_counts_again_from_none() {
+    let (a, b) = filled_after_a_clear(1, 8, true);
+    let (expected, report) = absorbed(&a, &b).unwrap();
+    assert_eq!(expected["container"], b["container"]);
+    assert_eq!(expected[MEDIA_TYPES], b[MEDIA_TYPES]);
+    let report = report.unwrap();
+    assert_eq!(
+        report["history_media_type_counts"],
+        json!([{"media_type":8,"before":null,"after":1}])
+    );
+    assert_eq!(
+        report["playback_history"]["contained_media_type"],
+        json!({"before":0,"after":8})
+    );
+    for (case, count, contained, live) in [
+        ("a row counting more than the new entries", 2, 8, true),
+        ("another media type", 1, 1, true),
+        ("no new entry for a track in the library", 1, 8, false),
+    ] {
+        let (a, b) = filled_after_a_clear(count, contained, live);
+        assert!(absorbed(&a, &b).is_err(), "{case}");
+    }
+}
+
 #[test]
 fn changes_listening_cannot_explain_are_refused() {
     let cases: Vec<(&str, Box<dyn Fn(&mut Tables)>)> = vec![
@@ -418,4 +629,51 @@ fn catalogue_listening_follows_the_same_rule() {
     let mut liked = before.clone();
     liked.liked_state = 3;
     assert!(catalogue_listening(&before, &liked).is_err());
+}
+
+/// A run's own check takes the exact model first and the later-run rule only
+/// when that refuses, over the same captures; the window that passed comes
+/// back. A later run's check is the later-run rule alone.
+#[test]
+fn a_runs_own_check_falls_back_to_the_later_run_rule() {
+    let mut asked = Vec::new();
+    let check = |exact: bool, later: bool| {
+        move |window: Window| -> Result<Window> {
+            match window {
+                Window::SameRun if exact => Ok(window),
+                Window::LaterRun if later => Ok(window),
+                _ => anyhow::bail!("{window:?} refused"),
+            }
+        }
+    };
+    let mut record = |window: Window, exact: bool, later: bool| {
+        let inner = check(exact, later);
+        let mut seen = Vec::new();
+        let result = window.check(|w| {
+            seen.push(w);
+            inner(w)
+        });
+        asked.push(seen);
+        result
+    };
+    assert_eq!(
+        record(Window::SameRun, true, true).unwrap(),
+        (Window::SameRun, Window::SameRun)
+    );
+    assert_eq!(
+        record(Window::SameRun, false, true).unwrap(),
+        (Window::LaterRun, Window::LaterRun)
+    );
+    let refused = record(Window::SameRun, false, false).unwrap_err();
+    assert_eq!(refused.to_string(), "LaterRun refused");
+    assert!(record(Window::LaterRun, true, false).is_err());
+    assert_eq!(
+        asked,
+        [
+            vec![Window::SameRun],
+            vec![Window::SameRun, Window::LaterRun],
+            vec![Window::SameRun, Window::LaterRun],
+            vec![Window::LaterRun],
+        ]
+    );
 }

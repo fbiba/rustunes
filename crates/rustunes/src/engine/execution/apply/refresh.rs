@@ -3,7 +3,7 @@
 use crate::{
     engine::execution::native_insert::{Control, PreSessionStateDrift},
     engine::planning::source_collection::{self, SourceCollection},
-    engine::state::current::{Current, receipt},
+    engine::state::current::{self, Current, receipt},
 };
 use anyhow::{Context, Result, ensure};
 use music_protocol::catalogue::sqlite::Catalog;
@@ -91,9 +91,13 @@ impl FrozenIntent {
     }
 }
 
+/// Pre-session attempts of one insertion: music playing writes the phone's
+/// state at every song, which a guard before the session finds.
+pub(super) const ATTEMPTS: u8 = 4;
+
 pub(super) fn may_refresh(error: &anyhow::Error, attempt: u8, control: &Control) -> Result<bool> {
     control.check()?;
-    Ok(attempt == 1 && error.downcast_ref::<PreSessionStateDrift>().is_some())
+    Ok(attempt < ATTEMPTS && error.downcast_ref::<PreSessionStateDrift>().is_some())
 }
 
 pub(super) async fn controlled<T>(
@@ -107,72 +111,11 @@ pub(super) async fn controlled<T>(
     }
 }
 
+/// The fresh capture must be the planned one but for listening
+/// (`current::ensure_same_but_listening`).
 pub(super) fn ensure_current(before: &Current, fresh: &Current) -> Result<()> {
-    ensure!(
-        before.device == fresh.device
-            && before.identity.device_digest() == fresh.identity.device_digest()
-            && before.identity.library_digest() == fresh.identity.library_digest()
-            && before.raw_preferences == fresh.raw_preferences
-            && before.plist_preferences == fresh.plist_preferences
-            && before.cdb == fresh.cdb
-            && before.artwork_db == fresh.artwork_db,
-        "refresh changed device, library, preferences, CDB or artwork bytes"
-    );
-    before.library.ensure_matches(&fresh.library)?;
-    ensure_catalog(&before.catalog, &fresh.catalog)
-}
-
-fn ensure_catalog(before: &Catalog, fresh: &Catalog) -> Result<()> {
-    ensure!(
-        before.database_pid() == fresh.database_pid()
-            && before.primary_container_pid() == fresh.primary_container_pid()
-            && before.persisted_media_anchor() == fresh.persisted_media_anchor()
-            && before.tracks() == fresh.tracks()
-            && before.albums() == fresh.albums()
-            && before.artists() == fresh.artists()
-            && before.composers() == fresh.composers()
-            && before.track_composers() == fresh.track_composers()
-            && before.stats_except_recent_play() == fresh.stats_except_recent_play()
-            // The phone may delete an `item_store` row whose track is gone;
-            // no identity the plan avoided may appear.
-            && before.live_sync_ids() == fresh.live_sync_ids()
-            && fresh
-                .represented_sync_ids()
-                .is_subset(before.represented_sync_ids()),
-        "refresh changed the frozen catalogue planning basis"
-    );
-    for track in before.tracks() {
-        ensure!(
-            before.title_sort(track.sync_id) == fresh.title_sort(track.sync_id),
-            "refresh changed a nullable sort title"
-        );
-    }
-    let a = before.artwork();
-    let b = fresh.artwork();
-    let counts = |a: music_protocol::catalogue::sqlite::ArtworkRowCounts| {
-        (a.cached_rows, a.registration_rows)
-    };
-    ensure!(
-        a.occupied_cache_ids() == b.occupied_cache_ids()
-            && a.cached_ids() == b.cached_ids()
-            && a.cached_objects() == b.cached_objects()
-            && a.track_cache_ids() == b.track_cache_ids()
-            && a.tracks_with_artwork_registration() == b.tracks_with_artwork_registration()
-            && a.album_cache_ids() == b.album_cache_ids()
-            && counts(a.source300_rows()) == counts(b.source300_rows())
-            && a.other_source_rows()
-                .iter()
-                .map(|(k, v)| (*k, counts(*v)))
-                .collect::<Vec<_>>()
-                == b.other_source_rows()
-                    .iter()
-                    .map(|(k, v)| (*k, counts(*v)))
-                    .collect::<Vec<_>>()
-            && a.unmapped_source300_token_rows() == b.unmapped_source300_token_rows()
-            && a.orphan_album_cache_ids() == b.orphan_album_cache_ids(),
-        "refresh changed artwork registrations or cache occupancy"
-    );
-    Ok(())
+    current::ensure_same_but_listening(before, fresh)
+        .context("refresh changed the frozen catalogue planning basis")
 }
 
 pub(super) fn ensure_sources(frozen: &SourceCollection, control: &Control) -> Result<()> {

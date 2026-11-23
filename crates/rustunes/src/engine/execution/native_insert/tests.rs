@@ -339,9 +339,10 @@ fn deferred_pre_session_drift_creates_no_attempt_or_reservation() {
 }
 
 /// A held file that appeared, disappeared or changed during the guard is
-/// drift, but grants no refresh: only other bytes in a bound file do.
+/// the phone writing its state as well (a song ending while the guard read
+/// it): it grants a refresh, and nothing is prepared.
 #[test]
-fn deferred_pre_session_drift_during_the_guard_is_not_refresh_authority() {
+fn deferred_pre_session_drift_during_the_guard_is_refresh_authority() {
     for drift in [Drift::Appeared, Drift::Disappeared, Drift::Attributes] {
         let temp = Temp::new();
         let source = temp.source();
@@ -358,8 +359,7 @@ fn deferred_pre_session_drift_during_the_guard_is_not_refresh_authority() {
             Err(StateReadDrift::fixture("iTunesCDB", drift).into()),
         )
         .unwrap_err();
-        assert!(!error.is::<PreSessionStateDrift>(), "{drift:?}");
-        assert!(error.is::<StateReadDrift>(), "{drift:?}");
+        assert!(error.is::<PreSessionStateDrift>(), "{drift:?}");
         assert!(journal.outstanding().unwrap().is_none());
         assert!(!temp.0.join("input.json").exists());
     }

@@ -470,7 +470,7 @@ pub(crate) async fn run(
     ensure!(!members.is_empty(), "insert batch has no members");
     ensure!(
         journal.outstanding_insert_batch()?.is_none(),
-        "an earlier insert batch is unfinished; run resume first"
+        "an earlier insert batch is not finished; nothing was sent; running the same command again finishes it, or says how"
     );
     let removal_targets = match removals {
         [] => Vec::new(),
@@ -481,7 +481,7 @@ pub(crate) async fn run(
             );
             ensure!(
                 journal.outstanding_removal_batch()?.is_none(),
-                "an earlier removal batch is unfinished; run resume first"
+                "an earlier removal batch is not finished; nothing was sent; running the same command again finishes it, or says how"
             );
             let items = removals
                 .iter()
@@ -569,28 +569,28 @@ pub(crate) async fn run(
         evidence: evidence.clone(),
         targets,
     };
-    let (id, session) = match removals {
-        [] => (journal.prepare_insert_batch(&intent)?, None),
-        _ => {
-            let ids = journal.prepare_session(
-                &intent,
-                &RemovalIntent {
-                    coordination: None,
-                    compensates: None,
-                    compensates_insert_batch: None,
-                    operation: operation.clone(),
-                    base_anchor,
-                    before_current: current.receipt_sha256,
-                    before_index: before.snapshot.index_receipt_sha256,
-                    input_receipt: input_sha,
-                    evidence: evidence.clone(),
-                    targets: removal_targets,
-                    playlists: Vec::new(),
-                },
-            )?;
-            (ids.insert, Some(ids))
-        }
+    let removal = match removals {
+        [] => None,
+        _ => Some(RemovalIntent {
+            coordination: None,
+            compensates: None,
+            compensates_insert_batch: None,
+            operation: operation.clone(),
+            base_anchor,
+            before_current: current.receipt_sha256,
+            before_index: before.snapshot.index_receipt_sha256,
+            input_receipt: input_sha,
+            evidence: evidence.clone(),
+            targets: removal_targets,
+            playlists: Vec::new(),
+        }),
     };
+    // The batch is journaled Prepared, which reserves its identities and
+    // paths for good, only once the Ready session's guards have held, just
+    // before Started. A guard that finds the phone's state changed (a song
+    // ended) leaves no journal row, so the batch starts again from a fresh
+    // capture with the same identities.
+    let mut prepared = None;
     let send = evidence.join("send");
     let wire = match send_session(
         before,
@@ -603,27 +603,44 @@ pub(crate) async fn run(
         control,
         // From here the batch is Started: nothing on the phone changed yet,
         // and only observation may settle it.
-        |ready, signature| match session {
-            Some(ids) => journal.start_session(ids, ready, signature),
-            None => journal.start_insert_batch(id, ready, signature),
+        |ready, signature| {
+            let (id, session) = match &removal {
+                None => (journal.prepare_insert_batch(&intent)?, None),
+                Some(removal) => {
+                    let ids = journal.prepare_session(&intent, removal)?;
+                    (ids.insert, Some(ids))
+                }
+            };
+            prepared = Some((id, session));
+            match session {
+                Some(ids) => journal.start_session(ids, ready, signature),
+                None => journal.start_insert_batch(id, ready, signature),
+            }
         },
     )
     .await
     {
         Sent::Unsent(error) => {
-            match session {
-                Some(ids) => journal.cancel_session(ids)?,
-                None => journal.cancel_insert_batch(id)?,
-            }
+            let cancelled = match prepared {
+                Some((_, Some(ids))) => {
+                    journal.cancel_session(ids)?;
+                    "the batch was cancelled"
+                }
+                Some((id, None)) => {
+                    journal.cancel_insert_batch(id)?;
+                    "the batch was cancelled"
+                }
+                None => "the batch was not journaled",
+            };
             let _ = durable_write(
                 &send,
                 "error.txt",
-                format!("{error:#}\nNothing was written to the phone; the batch was cancelled.\n")
-                    .as_bytes(),
+                format!("{error:#}\nNothing was written to the phone; {cancelled}.\n").as_bytes(),
             );
             return Err(error);
         }
         Sent::Started(wire) => wire.and_then(|wire| {
+            let (id, _) = prepared.context("a Started batch has no journal record")?;
             durable_write(
                 &send,
                 "wire.json",
@@ -636,6 +653,7 @@ pub(crate) async fn run(
             sync_trace(&send)
         }),
     };
+    let (id, _) = prepared.context("a Started batch has no journal record")?;
     if let Err(error) = &wire {
         let _ = durable_write(
             &send,
@@ -672,11 +690,11 @@ pub(crate) async fn run(
     ) {
         (Ok(settled), _) => Ok(settled),
         (Err(error), Ok(())) => Err(error.context(format!(
-            "insert batch {} is Started; run resume to observe it again",
+            "insert batch {} is not finished; running the same command again finishes it, or says how",
             id.as_i64()
         ))),
         (Err(error), Err(wire)) => Err(error.context(format!(
-            "insert batch {} is Started after a transport error ({wire:#}); run resume to observe it again",
+            "insert batch {} is not finished after a connection error ({wire:#}); running the same command again finishes it, or says how",
             id.as_i64()
         ))),
     }
@@ -1123,50 +1141,75 @@ pub(crate) async fn add_all(
             bytes,
             removals: removals.len(),
         })?;
-        let control = control();
-        let directory = run_directory.join(format!("batch-{:03}", number + 1));
-        // A removal target's file may be gone after an earlier removal of it
-        // that the phone rolled back.
-        let before = match removals.is_empty() {
-            true => removal_batch::capture_before(&directory, identity, &control).await?,
-            false => {
-                let taken = removal_batch::taken(journal_path, identity)?;
-                removal_batch::capture_for_removal(&directory, identity, &taken, &control).await?
+        let session = std::mem::take(&mut removals);
+        let mut attempt = 1;
+        let (batch, control) = loop {
+            let control = control();
+            let directory = run_directory.join(match attempt {
+                1 => format!("batch-{:03}", number + 1),
+                n => format!("batch-{:03}-attempt-{n}", number + 1),
+            });
+            let result = async {
+                // A removal target's file may be gone after an earlier
+                // removal of it that the phone rolled back.
+                let before = match session.is_empty() {
+                    true => removal_batch::capture_before(&directory, identity, &control).await?,
+                    false => {
+                        let taken = removal_batch::taken(journal_path, identity)?;
+                        removal_batch::capture_for_removal(&directory, identity, &taken, &control)
+                            .await?
+                    }
+                };
+                for member in keep_album_images(
+                    &before.current,
+                    &before.directory,
+                    chunk,
+                    &control,
+                    device::provider,
+                )
+                .await?
+                {
+                    left_out(member)?;
+                }
+                let mut journal = Journal::open(journal_path, identity)?;
+                run(
+                    &mut journal,
+                    identity,
+                    &before,
+                    &session,
+                    chunk,
+                    collection,
+                    coordination,
+                    host_name,
+                    &control,
+                )
+                .await
+            }
+            .await;
+            match result {
+                Ok(batch) => break (batch, control),
+                // A song started or ended before the session began: nothing
+                // was sent, so the batch starts again from a fresh capture.
+                Err(error)
+                    if attempt < removal_batch::DRIFT_ATTEMPTS
+                        && held::is_drift(&error)
+                        && control.check().is_ok()
+                        && nothing_started(journal_path, identity) =>
+                {
+                    tracing::info!(
+                        "The phone's library changed before batch {} was sent ({error:#}); capturing it again",
+                        number + 1
+                    );
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "{inserted} of {total} tracks were inserted before this batch"
+                    )));
+                }
             }
         };
-        for member in keep_album_images(
-            &before.current,
-            &before.directory,
-            chunk,
-            &control,
-            device::provider,
-        )
-        .await?
-        {
-            left_out(member)?;
-        }
         let chunk = &*chunk;
-        let mut journal = Journal::open(journal_path, identity)?;
-        let session = std::mem::take(&mut removals);
-        let batch = run(
-            &mut journal,
-            identity,
-            &before,
-            &session,
-            chunk,
-            collection,
-            coordination,
-            host_name,
-            &control,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "{inserted} of {} tracks were inserted before this batch",
-                total
-            )
-        })?;
-        drop(journal);
         removed += batch.removed;
         // The batch is settled: its conversions are done with.
         for member in chunk.iter().filter(|m| m.conversion.is_some()) {
@@ -1179,13 +1222,13 @@ pub(crate) async fn add_all(
                 .await
                 .with_context(|| {
                     format!(
-                        "insert batch {} left {unfilled} rows without audio and their removal did not finish; run resume",
+                        "insert batch {} left {unfilled} songs without audio and their removal did not finish; running the same command again finishes it, or says how",
                         batch.batch.as_i64()
                     )
                 })?;
             ensure!(
                 removal.state == crate::engine::state::journal::BatchState::Verified,
-                "insert batch {} left {unfilled} rows without audio; removal batch {} ended {}; run resume",
+                "insert batch {} left {unfilled} songs without audio; removal batch {} ended {}; running the same command again finishes it, or says how",
                 batch.batch.as_i64(),
                 removal.batch.as_i64(),
                 removal.state.as_str()
@@ -1247,6 +1290,15 @@ pub(crate) async fn add_all(
         removed += alone.iter().map(|b| b.removed).sum::<usize>();
     }
     Ok((settled, removed))
+}
+
+/// Whether the journal holds no Started insert or removal batch, so that a
+/// batch that failed before its session may start again.
+fn nothing_started(journal_path: &Path, identity: &Identity) -> bool {
+    Journal::open_read_only(journal_path, identity).is_ok_and(|journal| {
+        matches!(journal.outstanding_insert_batch(), Ok(None))
+            && matches!(journal.outstanding_removal_batch(), Ok(None))
+    })
 }
 
 /// Clear the cover of each member that must keep its album's image unless
@@ -1842,26 +1894,27 @@ async fn settle_with(
         None => None,
     };
     let prior = projected.as_ref().unwrap_or(&before.catalog);
-    let catalogue = match window {
-        Window::SameRun => insert_verification::verify_insert_batch_covered(
-            prior,
-            &after.catalog,
-            &expected,
-            &locationless,
-            &removed_tracks,
-            &covers,
-        ),
-        Window::LaterRun => insert_verification::verify_insert_batch_after_listening(
-            prior,
-            &after.catalog,
-            &expected,
-            &locationless,
-            &removed_tracks,
-            &covers,
-            &between_runs::catalogue_listening,
-        ),
-    }
-    .with_context(|| {
+    let (catalogue, taken) = window
+        .check(|window| match window {
+            Window::SameRun => insert_verification::verify_insert_batch_covered(
+                prior,
+                &after.catalog,
+                &expected,
+                &locationless,
+                &removed_tracks,
+                &covers,
+            ),
+            Window::LaterRun => insert_verification::verify_insert_batch_after_listening(
+                prior,
+                &after.catalog,
+                &expected,
+                &locationless,
+                &removed_tracks,
+                &covers,
+                &between_runs::catalogue_listening,
+            ),
+        })
+        .with_context(|| {
                 format!(
                     "the phone's catalogue is not the planned insertion; batch {} stays Started and {} keeps the after state",
                     batch.id.as_i64(),
@@ -1933,6 +1986,9 @@ async fn settle_with(
         "bound":bound.iter().map(|(n, h)| json!({"ordinal":n,"audio_sha256":hex(h)})).collect::<Vec<_>>(),
         "locationless":locationless.iter().map(|id| format!("{id:016x}")).collect::<Vec<_>>(),
     });
+    if window != taken {
+        receipt["music_played_during_run"] = json!(true);
+    }
     if !removed.is_empty() {
         receipt["removed_by_phone"] = json!(
             removed
@@ -1961,8 +2017,12 @@ async fn settle_with(
             let swept = &housekeeping.stray_rows;
             let mut evidence = json!({
                 "schema":"rustunes.cover-capture-housekeeping","capture":covers.capture,
-                "entity_revisions":housekeeping.revisions,"other_sql_exact":swept.is_empty(),
+                "entity_revisions":housekeeping.revisions,
+                "other_sql_exact":swept.is_empty() && housekeeping.listening.is_none(),
             });
+            if let Some(listening) = &housekeeping.listening {
+                evidence["music_played"] = listening.clone();
+            }
             if !swept.is_empty() {
                 evidence["stray_rows"] = serde_json::to_value(swept)?;
             }
@@ -2032,7 +2092,7 @@ async fn settle_with(
 struct CoverReadback {
     proofs: Vec<crate::engine::verification::artwork::VerifiedTrackArtworkBytes>,
     /// The capture's directory under the run.
-    capture: &'static str,
+    capture: String,
     /// The phone's revision housekeeping the capture showed since `after`,
     /// and the rows whose track is gone that the session's sweep deleted.
     housekeeping: Option<playback::Housekeeping>,
@@ -2040,14 +2100,19 @@ struct CoverReadback {
     drift: Option<String>,
 }
 
+/// Readbacks of a batch's covers, each over a fresh capture: a song that
+/// starts or ends while one runs changes the phone's state under it.
+const COVER_READBACKS: usize = 4;
+
 /// Read back each bound target's permanent cover over a capture of the same
 /// after state, as `verify` does: the exact original and a decodable
 /// derivative. Proofs come back in `checks` order. The capture's catalogue
 /// may differ from `after` only by the phone's revision housekeeping and the
-/// sweep of rows whose track is gone that ends the session. If the
-/// phone's state drifts during the readback (seen when its housekeeping
-/// landed there), the state is captured once more under the same rule and
-/// the readback starts again over that capture.
+/// sweep of rows whose track is gone that ends the session, or by what music
+/// played since wrote. If the phone's state drifts during the readback (seen
+/// when its housekeeping landed there), the state is captured again under
+/// the same rule and the readback starts again over that capture, up to
+/// `COVER_READBACKS` times.
 async fn verify_covers(
     after: &Snapshot,
     run: &Path,
@@ -2057,48 +2122,53 @@ async fn verify_covers(
     control: &Control,
 ) -> Result<CoverReadback> {
     cover::require_decoder()?;
-    let first = "current";
-    let (current, housekeeping) = cover_capture(after, run, first, identity, control).await?;
-    let drift = match read_covers(
-        &current,
-        run,
-        "artwork-group",
-        checks,
-        locationless,
-        control,
-    )
-    .await
-    {
-        Ok(proofs) => {
-            return Ok(CoverReadback {
-                proofs,
-                capture: first,
-                housekeeping,
-                drift: None,
-            });
+    let mut drift: Option<String> = None;
+    for attempt in 1..=COVER_READBACKS {
+        let (capture, prefix) = match attempt {
+            1 => ("current".to_owned(), "artwork-group".to_owned()),
+            2 => ("current-again".to_owned(), "artwork-again-group".to_owned()),
+            n => (
+                format!("current-again-{n}"),
+                format!("artwork-again-{n}-group"),
+            ),
+        };
+        let (current, housekeeping) = cover_capture(after, run, &capture, identity, control)
+            .await
+            .map_err(|error| match &drift {
+                Some(drift) => error.context(format!(
+                    "after the phone's state drifted during the readback: {drift}"
+                )),
+                None => error,
+            })?;
+        // Each attempt reads into new directories.
+        let again: Vec<TrackCheck>;
+        let checks = match attempt {
+            1 => checks,
+            n => {
+                create_trace(&run.join(format!("again-{n}")))?;
+                again = checks
+                    .iter()
+                    .map(|check| check.again(run, n))
+                    .collect::<Result<_>>()?;
+                &again
+            }
+        };
+        match read_covers(&current, run, &prefix, checks, locationless, control).await {
+            Ok(proofs) => {
+                return Ok(CoverReadback {
+                    proofs,
+                    capture,
+                    housekeeping,
+                    drift,
+                });
+            }
+            Err(error) if attempt < COVER_READBACKS && held::is_drift(&error) => {
+                drift = Some(format!("{error:#}"));
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) if held::is_refreshable_drift(&error) => format!("{error:#}"),
-        Err(error) => return Err(error),
-    };
-    let again = "current-again";
-    let (current, housekeeping) = cover_capture(after, run, again, identity, control)
-        .await
-        .with_context(|| format!("after the phone's state drifted during the readback: {drift}"))?;
-    let proofs = read_covers(
-        &current,
-        run,
-        "artwork-again-group",
-        checks,
-        locationless,
-        control,
-    )
-    .await?;
-    Ok(CoverReadback {
-        proofs,
-        capture: again,
-        housekeeping,
-        drift: Some(drift),
-    })
+    }
+    unreachable!("the last readback returns")
 }
 
 /// Captures the phone's state with artwork under `run/name`. Its catalogue
@@ -2206,7 +2276,13 @@ fn revision_housekeeping(
         &run.join(format!("{name}-sql")),
         &mut budget,
     )?;
-    playback::verify_revision_housekeeping(&observed, &captured, &budget)
+    // Music may have played since the observation.
+    playback::verify_revision_housekeeping(&observed, &captured, &budget).or_else(|exact| {
+        tracing::info!(
+            "The cover capture is not the observed state with housekeeping alone ({exact:#}); checking it for music played since"
+        );
+        playback::verify_listening_between(&observed, &captured, &budget)
+    })
 }
 
 /// The journal names the collections the batch created; every target must be
@@ -2287,17 +2363,22 @@ fn removals_unapplied(
     let before_sql = removal_batch::materialize(before, &run.join("sql-before"), control)?;
     let after_sql = removal_batch::materialize(after, &run.join("sql-after"), control)?;
     let items: Vec<i64> = removal.targets.iter().map(|t| t.item_pid).collect();
-    let unchanged = match window {
-        Window::SameRun => removal_sql::not_applied(&before_sql.tables, &after_sql.tables, &items)?,
-        Window::LaterRun => {
-            removal_sql::not_applied_later(&before_sql.tables, &after_sql.tables, &items)?
-        }
-    };
-    ensure!(
-        unchanged,
-        "the anchor did not move but the catalogue changed; removal batch {} stays Started",
-        removal.id.as_i64()
-    );
+    window.check(|window| {
+        let unchanged = match window {
+            Window::SameRun => {
+                removal_sql::not_applied(&before_sql.tables, &after_sql.tables, &items)?
+            }
+            Window::LaterRun => {
+                removal_sql::not_applied_later(&before_sql.tables, &after_sql.tables, &items)?
+            }
+        };
+        ensure!(
+            unchanged,
+            "the anchor did not move but the catalogue changed; removal batch {} stays Started",
+            removal.id.as_i64()
+        );
+        Ok(())
+    })?;
     Ok(())
 }
 

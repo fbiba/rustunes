@@ -377,7 +377,8 @@ where
             let physical = crate::engine::verification::journal::verify(journal,current,
                 crate::engine::verification::journal::Selection::All,&options.trace.join("managed-preservation"),
                 &crate::engine::verification::journal::ReadControl {deadline:control.deadline,cancelled:Arc::clone(&control.cancelled)},
-                &mut connect).await?;
+                // Recovery ties every proof to one exact state: no fresh capture.
+                &mut connect, async |_| Ok(None)).await?;
             control.check()?;
             ordinary_bridge::require_complete_preservation(current,&bindings,&physical)?;
             let before: BTreeSet<_> = bindings.iter().map(|b| Ok((b.content.track_pid,b.content_sha256()?,b.receipt_sha256,b.media_anchor)))

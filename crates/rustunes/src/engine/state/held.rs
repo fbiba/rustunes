@@ -28,7 +28,8 @@ use music_protocol::catalogue::sqlite::Catalog;
 use music_protocol::protocol::ancillary::EligibleSnapshot;
 use music_protocol::protocol::templates::{self, QUALIFIED_VOICE_MEMO_ANCHOR, Templates};
 use music_protocol::protocol::transfer::{
-    Attributes, MAX_ASSET, MAX_CATALOG, Transfer, regular_size, same_stat,
+    Attributes, MAX_ASSET, MAX_CATALOG, ReadbackChanged, ReadbackPathAbsent, Transfer,
+    regular_size, same_stat,
 };
 
 /// The largest prefs file held.
@@ -346,7 +347,8 @@ impl HeldState {
                 (Rule::Bytes { .. }, None) => return Err(file.drift(Drift::Disappeared)),
                 (Rule::Bytes { bytes, sha256, cap }, Some(attributes)) => {
                     check_size(attributes, file, *bytes, *cap)?;
-                    if afc.read_hash(file.path, *bytes, *cap).await? != *sha256 {
+                    let read = afc.read_hash(file.path, *bytes, *cap).await;
+                    if read.map_err(|error| changed_under_read(file, error))? != *sha256 {
                         return Err(file.drift(Drift::Digest));
                     }
                 }
@@ -361,6 +363,25 @@ impl HeldState {
             }
         }
         Ok(value)
+    }
+}
+
+/// A held file's readback that failed because the file changed between the
+/// guard's stat and the read, or during it (a song ended), is drift; any
+/// other failure stays as it is.
+fn changed_under_read(file: &HeldFile, error: anyhow::Error) -> anyhow::Error {
+    if error
+        .chain()
+        .any(|c| c.downcast_ref::<ReadbackChanged>().is_some())
+    {
+        file.drift(Drift::Attributes)
+    } else if error
+        .chain()
+        .any(|c| c.downcast_ref::<ReadbackPathAbsent>().is_some())
+    {
+        file.drift(Drift::Disappeared)
+    } else {
+        error
     }
 }
 
@@ -433,13 +454,6 @@ pub(crate) struct StateReadDrift {
 }
 
 impl StateReadDrift {
-    /// Whether a bound file is there with other contents: the phone wrote
-    /// its library between the capture and the guard, which may allow one
-    /// refresh from a fresh capture. A file that appeared, disappeared or
-    /// changed while the guard ran does not.
-    pub(crate) fn refreshable(&self) -> bool {
-        matches!(self.drift, Drift::Size | Drift::Digest)
-    }
     #[cfg(test)]
     pub(crate) fn fixture(file: &'static str, drift: Drift) -> Self {
         Self { file, drift }
@@ -461,15 +475,14 @@ impl std::fmt::Display for StateReadDrift {
 
 impl std::error::Error for StateReadDrift {}
 
-/// Whether `error` came from a guard finding a bound file there with other
-/// contents (`StateReadDrift::refreshable`), and not from a malformed,
-/// missing or oversized one or from one that changed during the guard.
-pub(crate) fn is_refreshable_drift(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<StateReadDrift>()
-            .is_some_and(StateReadDrift::refreshable)
-    })
+/// Whether `error` came from a guard finding any held file other than its
+/// binding: the phone wrote its state after the capture (a song starting or
+/// ending writes the catalogue). Before Started, nothing was sent, so the
+/// step may start again from a fresh capture.
+pub(crate) fn is_drift(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StateReadDrift>().is_some())
 }
 
 /// A binding with the given catalogue facts, for tests of the checks that
