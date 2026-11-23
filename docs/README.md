@@ -6,7 +6,8 @@ Music library over USB or Wi-Fi without Apple software. The work was carried
 out against one iPhone17,2 running iOS 27.0.1 (build 24A446), later updated
 to iOS 27.2 (build 24B119), the phone's firmware of both builds, and two
 versions of Apple's Windows "Apple Devices" application, 1.1540.23042.0 and
-1.1540.24088.0.
+1.1540.24088.0. For Wi-Fi, the Apple Mobile Device Support package of iTunes
+12.13 for Windows was read as well.
 
 The chapters below are the public record of that work. Each chapter ends
 with an "Evidence" section that describes the evidence it rests on: its kind,
@@ -19,7 +20,7 @@ tools used are in [`../ACKNOWLEDGEMENTS.md`](../ACKNOWLEDGEMENTS.md).
 |---|----------|----------|
 | 1 | [Overview and methodology](01-overview-and-methodology.md) | Problem statement, environment, methods (passive capture, Frida instrumentation, static analysis, controlled phone experiments), timeline, safety statement, glossary |
 | 2 | [ATC sync protocol](02-atc-sync-protocol.md) | The `com.apple.atc` wire protocol: framing, startup messages, Media sessions, operations, Ready and completion, signing |
-| 3 | [Transport: USB and Wi-Fi](03-transport-usb-and-wifi.md) | usbmuxd and lockdown, Bonjour discovery, phone sleep behaviour, AFC transfer sizes and pipelining (pipelined stats included), measured speeds, the `GetFileHash` leak |
+| 3 | [Transport: USB and Wi-Fi](03-transport-usb-and-wifi.md) | usbmuxd and lockdown, Bonjour discovery, phone sleep behaviour and how Apple's hosts wake a sleeping phone, AFC transfer sizes and pipelining (pipelined stats included), measured speeds, the `GetFileHash` leak |
 | 4 | [Media library database](04-media-library-database.md) | `MediaLibrary.sqlitedb` model, persistent IDs, metadata and sort-field mapping, grouping rules, artwork, statistics |
 | 5 | [Receiver operations](05-receiver-operations.md) | What the phone does on insert, update, delete and playlist operations, including interruption and recovery |
 | 6 | [Audio formats and gapless](06-audio-formats-and-gapless.md) | Accepted formats and codes, transcoding decisions, MP3 gapless computation and what the phone stored when it was sent, cover art and which cover image types the phone keeps |

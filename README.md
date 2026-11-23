@@ -307,7 +307,8 @@ rustunes sync --wifi                     # find the phone automatically
 rustunes sync --wifi-address 192.0.2.10  # or give its address
 ```
 
-The phone may be locked: rustunes wakes it and keeps it awake for the run.
+Once rustunes has found the phone awake on this network, it may be locked:
+rustunes wakes it and keeps it awake for the run.
 
 ### How tracks are matched
 
@@ -333,6 +334,14 @@ alone. To check a single file, use `rustunes validate FILE`. See
   phone, works out what the last run finished, and carries on without sending
   anything twice. `sync`, `push`, `delete`, `prune` and `clear` do this
   themselves. Other commands print the `rustunes resume` to run first.
+- **Deleted a song on the iPhone?** The next `sync` or `push` notices and
+  updates rustunes' records. If the song's file is still in your library, it
+  sends the song again. To keep it off the phone, remove the file from the
+  library.
+- **`device check` says an interrupted sync left files on the iPhone?**
+  While they are there, rustunes can't change the phone's music. If a
+  rustunes command was interrupted, run it again: it finishes the job and
+  removes them. rustunes doesn't remove files another program left there.
 - **"another rustunes run is using this phone"?** Wait for the other run to
   finish. Only one run can use a phone at a time.
 - **A command failed?** Its log is kept and its path printed. See
@@ -342,6 +351,15 @@ alone. To check a single file, use `rustunes validate FILE`. See
   Apple's software is expected to leave it so, with settings that name no
   music library. rustunes neither syncs nor initialises such a phone, and
   `rustunes device check` reports it as unclear.
+- **A warning about leftover entries from deleted songs?** The phone can
+  keep a few entries for a song that is gone, for example one deleted while
+  it was still being copied. They don't affect your music, and nothing needs
+  doing. When adding songs will clear them, the warning says about how many.
+- **"The iPhone's music library is inconsistent"?** A track on the phone
+  lacks one of the rows the phone keeps for every track. No ordinary use
+  causes this, and rustunes will not read or change such a library;
+  `rustunes device check` says it is not ready. Please report it with the
+  message, which gives the counts.
 
 > [!WARNING]
 > rustunes keeps no backup of the phone. A removed track exists only in your
@@ -373,7 +391,7 @@ These work with every command, before or after the command name.
 
 | Option | What it does |
 | --- | --- |
-| `--wifi` | Reach the phone over Wi-Fi instead of USB. It must have been paired over USB once, be on this network and be awake; it is found by Bonjour. |
+| `--wifi` | Reach the phone over Wi-Fi instead of USB. It must have been paired over USB once and be on this network; it is found by Bonjour. Have it awake the first time: after that rustunes wakes it even while it is locked, by the address and Wi-Fi identity it last answered with. If a locked phone stops answering, unlock it once so rustunes learns them again. |
 | `--wifi-address IP` | Reach the phone over Wi-Fi at this address instead of searching for it. Implies `--wifi`. |
 | `--device UDID` | Pick a phone by its identifier from `device list`, when more than one is connected. |
 | `--full-readback` | Audit mode: copy every track's audio back from the phone and rehash every local file, instead of trusting the fingerprint caches. Slow (minutes per pass); refreshes both caches. |
@@ -418,16 +436,30 @@ library (listed and confirmed first).
 | `--replace-library` | Remove every track from the phone, then send the whole library again, as one resumable operation. Refused while any file would be skipped. |
 | `--flac-to-alac` | Send each new FLAC as ALAC, converted with FFmpeg and checked to decode to exactly the same audio. |
 | `--batch-size N` | See [shared options](#options-shared-by-many-commands). |
-| `--yes` | Don't ask before removals or a replacement. |
+| `--yes` | Don't ask before removals, a replacement, or removing leftover song files. |
 | `--seconds N` | Time limit for reading the phone's library. |
 | `--host-name NAME`, `--state-dir DIR` | See [shared options](#options-shared-by-many-commands). |
 | `--journal DIR` | Use a journal created by `apply` instead of the automatic one. |
 
+`sync` also looks for leftover song files: files on the phone that no song
+uses, such as the file of a song deleted while it was still being copied. If
+it finds some, it asks once, before sending anything new:
+
+```
+Your iPhone has 2 leftover song files (81 MB) that no song in its library uses. They were left behind by earlier syncs. Remove them to free up the space? [y/N]
+```
+
+Answering no keeps them, and the sync goes on; the next sync asks again.
+With `--yes` they are removed without asking. Run from a script without
+`--yes`, `sync` keeps them and says how to remove them. `--dry-run` only says
+how many it would offer to remove. The iPhone may also delete some of them
+itself while it is idle. `push` leaves them alone.
+
 If any library file can't be read, `sync` holds back its removals for that run.
 Some problems stop the whole run before anything is sent, with what to fix: an
-unfinished session that needs `rustunes status`, a file whose audio is on the
-phone more than once, or a file rustunes can't place among the phone's albums
-and artists.
+interrupted command that must run again first, a song rustunes sent that
+changed on the phone, a file whose audio is on the phone more than once, or a
+file rustunes can't place among the phone's albums and artists.
 
 #### `rustunes push [PATH]`
 
@@ -602,7 +634,7 @@ rustunes catalog --output ~/rustunes-checks/catalog.csv
 | Command | What it does | Options |
 | --- | --- | --- |
 | `device list` | List connected phones by identifier. With `--wifi`, the paired phones answering on this network. | `--json` |
-| `device check` | Show the files and folders the phone holds for music syncing, what its music database records, and whether rustunes can sync it or it has never been synced. Read-only. | `--json`, `--trace-dir DIR` (keep the database copy) |
+| `device check` | Show the files and folders the phone holds for music syncing, what its music database records, and whether rustunes can sync it or it has never been synced. It also warns about entries the phone left for deleted songs, which don't affect your music, and says the phone is not ready when a track lacks one of its rows or an interrupted sync left files in its staging folder. Read-only. | `--json`, `--trace-dir DIR` (keep the database copy) |
 | `device info` | Show the phone's model and iOS version. | `--json`; `--domain DOMAIN` prints every value of this Lockdown domain as an XML plist instead (for example `com.apple.mobile.iTunes`, which lists the audio codecs the phone accepts) |
 | `library list` | List the tracks on the phone, with their IDs. | `--query TEXT` (case-insensitive search in title, artist and album), `--artist NAME` (exact artist or album artist), `--album NAME` (exact album) |
 | `library show ID` | Show a track's metadata and its location on the phone. | |
@@ -810,7 +842,7 @@ result. Prompts become records answered on stdin. The format is specified in
 | `~/.local/state/rustunes/devices/` | One journal per phone and library: what rustunes sent and verified. For a phone `init` prepared, also its library identity and the name of its latest `init` run |
 | `~/.local/state/rustunes/runs/` | One directory per run: its plan, snapshot and receipts. Trimmed once its work is finished, and removed once no journal needs it. Each phone's latest `init` run is kept whole |
 | `~/.local/state/rustunes/*-cache/` | Fingerprints of local files and phone files already proven |
-| `~/.local/state/rustunes/wifi/` | Each phone's last Wi-Fi address |
+| `~/.local/state/rustunes/wifi/` | Each phone's last Wi-Fi address and its Wi-Fi MAC, to wake it while it is locked |
 | `~/.local/state/rustunes/logs/` | The logs of the last 20 runs, and in `failed/` those of the last 20 that failed |
 | `~/.local/state/rustunes/locks/` | One lock per phone, held by the run using it |
 
@@ -825,11 +857,13 @@ also kept in `logs/failed/`, where later runs don't rotate it away, and the
 command ends with the lines of the log the terminal didn't show, and its path:
 
 ```text
-Error: no paired iPhone answered over Wi-Fi; wake or unlock it on this network, or pass --wifi-address. If it is awake and still does not answer, it may no longer trust this computer: pair and trust it over USB, then run again
+Error: no paired iPhone answered over Wi-Fi, and rustunes has no saved address or Wi-Fi identity to wake a locked one by; unlock the phone on this network and run again, so rustunes learns them, or pass --wifi-address. If it is awake and still does not answer, it may no longer trust this computer: pair and trust it over USB, then run again
 Last lines of the log not shown above:
    INFO rustunes: rustunes 0.1.0 on Fedora Linux 44 (kernel 7.2.11-200.fc44.x86_64, x86_64)
    INFO rustunes: Command line: ["rustunes", "--wifi", "sync"]
   DEBUG rustunes::engine::execution::device::wifi: 1 pairing record(s) in /var/lib/lockdown
+  DEBUG rustunes::engine::execution::device::wifi: 0 last address(es) and 0 Wi-Fi MAC(s) remembered to wake the phone(s) by
+  DEBUG rustunes::engine::execution::device::wifi: Browsing Bonjour for up to 4 s
   DEBUG rustunes::engine::execution::device::wifi: A Bonjour answer with an identifier and 2 auth tag(s) matched no pairing record
   DEBUG rustunes::engine::execution::device::wifi: 1 Bonjour answer(s), 0 from paired phones
 Log of this run: /home/me/.local/state/rustunes/logs/failed/1761790190123456789-4242.log

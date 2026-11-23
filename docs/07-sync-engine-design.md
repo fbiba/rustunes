@@ -327,7 +327,7 @@ operation:
 | Coordinations, the parent of a clear or a replacement | A clear or replacement is many sessions. It needs one durable parent that records progress with compare-and-swap and owns the journal while active |
 | Removal batches and their targets. A removal batch can compensate one Started insertion | A batch removes up to 499 rows in one session, which is what makes a full clear practical |
 | Insert batches and targets; metadata batches and targets; coordinations link all four kinds of step. At most one native write of any kind outstanding, with the exceptions in section 3.4 | Adding a library one track per session is too slow. A batch carries many tracks and their covers. A batch can end Partial, so the journal must model "some rows reached the catalogue with a file" |
-| The insert-target outcome "removed by the phone" | When the host abandons an insert session the phone may delete rows it had already created. Without this outcome such a batch could never be settled cleanly |
+| The insert-target outcome "removed by the phone" | When the host abandons an insert session the phone may delete rows it had already created. Without this outcome such a batch could never be settled cleanly. A song deleted in the Music app while its file was still being copied is one too, and its file can land afterwards, named by no row (chapter 04, section 4.6): the batch settles when nothing is at the planned path or, read back whole, exactly the audio sent, which `sync` then offers to remove (section 4.5) |
 | `removal_playlists`: ordinary playlists one removal batch deletes, each by container identifier and the name it had | `clear` should end with an empty catalogue, which includes the emptied ordinary playlists. A batch removes tracks or playlists, never both |
 | FLAC conversions, one row per converted insert target | Later runs match a FLAC source to the ALAC track converted from it without converting again (section 9.5) |
 | The NotApplied state for single attempts | Without it a Started insertion or cover the phone never applied would have no way out, and every later write would refuse (section 7.2) |
@@ -390,6 +390,22 @@ DESIGN, CONFIRMED on the phone.
   against it there, as `pull --dry-run` does; the phone's journal stays
   absent until a real run. Any other phone without a journal still needs
   `pull` before an insert batch.
+- **A track deleted on the phone.** When the journal in use binds a track the
+  capture no longer holds at all, as after the song was deleted in the Music
+  app, those commands first write the journal again without that binding,
+  as a pull drops it, and report it (`tracks_deleted_on_phone`, section
+  10.5). Without this, the binding no longer matches the phone, and every
+  later write would stop until a `pull`. Unlike a pull, it keeps every other
+  binding as it was: its cover record, its conversion and the source path
+  planning attributes it to, even one that has left the library, so the
+  mirror still removes its track. It binds no other phone track and reads
+  nothing from the phone. As a carry, it runs only from a capture the
+  command took, and on a dry run into the run directory; and only when the
+  journal holds no unfinished work and no binding this build cannot read:
+  unfinished work is settled first, and the command plans again. With a
+  saved snapshot or `--journal`, the binding still holds the run, and the
+  message names `pull`. A sync then plans the song's file, if it is still in
+  the library, as a new track, and sends it again.
 - **What is carried.** Each track the earlier journal bound and the capture
   still shows keeps its cover record, source path and FLAC conversion.
   A recorded source path that no longer exists gives way to the FLAC the track
@@ -700,6 +716,39 @@ leaves. One pushed from elsewhere stays through every `sync`.
   journal once, into the removal's run directory, and previews the sync
   against that journal; the phone's journal stays as it is.
 
+**Removing song files no song uses.** DESIGN.
+
+- A file can stay in a music folder after its song is gone: the file of a
+  song deleted on the phone while it was still being copied lands anyway, and
+  an interrupted copy can leave one (chapter 04, sections 4.6 and 9.3). The
+  phone deletes such files only in its daily maintenance, while it is idle.
+- After the removal, once earlier work is settled and before anything new is
+  sent, `sync` lists Apple's music folders `F00` to `F49` and any other `Fnn`
+  folder the library registers, and offers to remove each file there that is
+  all of these: a regular file with a song extension (`m4a`, `m4p`, `m4b`,
+  `mp3`, `aif`, `wav`, `flac`, in any case); named by no track of its
+  capture, compared without regard to case; at no path a removal batch of the
+  journal targeted, since the phone deletes those files itself minutes after
+  the session; and last changed more than 300 s before, by the phone's clock
+  (Lockdown's `TimeIntervalSince1970`), or an hour by the host's when that
+  cannot be read. Nothing outside those folders, and no other kind of file,
+  is ever offered. A file a stray `item_extra` row alone names is offered.
+- Nothing the journal holds is unfinished when it looks: a real run settles
+  it first and a dry run refuses it. A path the journal reserved for an
+  insertion is no exception: a song deleted in the Music app while its file
+  was still being copied leaves its file at that path (section 3.3).
+- It asks once, with the count and size, and `--yes` answers. Unlike the
+  removal's question, a no keeps the files and the sync goes on, and so does a
+  run with no terminal and no `--yes`, which says how to remove them. A dry
+  run only reports them. `push`, the replacements and saved plans never look.
+- Each file is removed over a locked connection that can remove nothing
+  else: right before, it is stated again, and only the same regular file,
+  of the same size and times, is removed; its absence is then confirmed. A
+  file that changed is left, and one already gone is not counted. The search, what it found and each
+  removal's result are kept in the run's `leftover-files` directory. No
+  journal record is made: an interrupted run leaves the rest for the next
+  sync. A failure to look, or to finish, is reported and the sync goes on.
+
 On the phone: with a covered ALAC, an MP3 and a singly inserted test tone
 deleted and another covered tone moved to a subdirectory, the preview selected
 exactly the three and kept the moved one, which the sync matched at its new
@@ -918,7 +967,9 @@ For each batch:
    a complete audio index, and the artwork state. An insert or removal batch
    takes the run's latest complete snapshot as its Before instead when a fresh
    catalogue read shows it unchanged; a snapshot whose catalogue differs is set
-   aside and captured again.
+   aside and captured again. When the catalogue changes between the snapshot
+   and the state capture (a song ended), both are taken again, up to four
+   rounds.
 2. Run read-only guards before any journal row exists: the namespace and the
    state agree with the plan. One state guard holds every state file the
    capture bound: the prefs pair, the catalogue and its log, the iTunesCDB
@@ -926,12 +977,18 @@ For each batch:
    when the session allocates cover identifiers or must leave it as it was.
    It stats them all, reads each bound file back whole and stats them all
    again; a removal or cover session checks its namespace between the two
-   stats. A file that differs fails the guard with a typed drift naming it.
+   stats. A file that differs fails the guard with a typed drift naming it,
+   and so does a file that changes or goes while the guard reads it back (a
+   song ending between the guard's stat and its read).
    A catalogue that drifted costs nothing, because no reservation was made.
-   If the first guard finds a bound file of another size or digest, one
-   refresh is allowed within the original deadline, rebuilding the same
-   operation from the same identifiers. A file that appeared, disappeared or
-   changed while the guard ran allows none.
+   Music playing writes the catalogue at every song, so a guard before
+   Started may find it changed at any time: nothing was sent, so the batch,
+   cancelled, starts again from a fresh capture, up to four attempts in all
+   (an edit `metadata set` showed is planned again and must be the one shown;
+   a cover update that never started is cancelled first). A single insertion
+   (`apply`) instead refreshes within the original deadline, up to four
+   attempts, rebuilding the same operation from the same identifiers; the
+   catalogue it was planned against may differ only by listening.
 3. Check each target against the removal or insert model on that state. Refuse
    shapes the model does not cover.
 4. Journal Prepared (immutable operation, anchor, Before receipts, reserved
@@ -1065,7 +1122,7 @@ Three separate checks, never merged:
 
 | Check | Compares | How |
 | --- | --- | --- |
-| Catalogue rows | A fresh read of the catalogue (all 45 tables, the saved companion files, the preferences) against an exact model of what the operation must change | The model is a set of rules per operation: a removal retires an item's rows and artwork tokens, leaves a tombstone revision, hands group representatives to a surviving member or zero, closes up playlist positions, and moves the anchor once. Every other cell must be unchanged, apart from recent play counters, the maintenance clock and the state the phone fills in on an entry it made itself ([chapter 4](04-media-library-database.md), section 3.1) |
+| Catalogue rows | A fresh read of the catalogue (all 45 tables, the saved companion files, the preferences) against an exact model of what the operation must change | The model is a set of rules per operation: a removal retires an item's rows and artwork tokens, leaves a tombstone revision, hands group representatives to a surviving member or zero, closes up playlist positions, and moves the anchor once. Every other cell must be unchanged, apart from recent play counters, the maintenance clock, the state the phone fills in on an entry it made itself ([chapter 4](04-media-library-database.md), section 3.1), and the phone's own changes to rows whose track is gone (section 7.3) |
 | Audio bytes | Each file on the phone against the source or the recorded fingerprint | Stat and fingerprint cache for known files; full copy and hash for new or changed ones; full readback on request |
 | Artwork renditions | The cover original and the phone's derived rendition | Read the permanent original, decode the rendition with FFmpeg, compare per the verifier. Grayscale JPEG covers leave a 0-byte rendition on the phone; the verifier accepts that when the original is exact. A cover under 144 px on its longer side gets no rendition; the verifier accepts its exact original alone. Renditions whose longer side equals the cache edge are accepted. For a PNG source the expected original is the JPEG the tool made from it (section 9.3) |
 
@@ -1270,8 +1327,11 @@ written. Each outgoing frame is written to the session's trace before it is
 sent, so a trace that holds the session's RequestingSync and no
 FinishedSyncingMetadata proves the phone was never told to apply the pair.
 With the anchor unmoved and nothing else changed, `resume` then reads each
-file back and removes it only when it holds exactly the record's operation or
-signature; the AFC connection stays locked for every other write. The folder
+file back and removes it only when it holds the record's operation or
+signature, or the start of it: a host killed while it wrote the pair leaves a
+short file, down to an empty `Sync_00000000.plist` and no `.cig` (CONFIRMED on
+the phone: the phone creates the file at its open). The AFC connection stays
+locked for every other write. The folder
 must then be empty, and the NotApplied proof names the files removed
 (`staged_removed`). A batch's trace is in its evidence; a single attempt's is
 in its run, so `resume` needs `--run-dir` for it, which the hint `sync` prints
@@ -1283,21 +1343,29 @@ phone's own SyncFinished, then gives the terminal digest, and recovery's fresh
 audio and cover readbacks cover the host-side hashes the receipt would have
 held. The verified evidence records the receipt as absent.
 
-### 7.3 Playback and housekeeping between runs
+### 7.3 Playback and housekeeping during and between runs
 
 CONFIRMED. DESIGN of the rule.
 
-Music is played between runs. On its own the phone also re-revisions every
-item and drops stale statistics revisions some minutes after listening or
-after a session. After a metadata session with no music played, all 399 items
-took new revisions in no particular order and 336 of 342 statistics revisions
-went. A dry run whose source inspection spanned that moment refused at
-preflight, and its retry passed.
+Music is played between runs, and while a run works: a run is meant to work
+with music playing, whatever the command. Each song that ends writes the
+catalogue (its play, its Playback History entry), so with music playing the
+phone's state changes at every song (CONFIRMED). On its own the phone also
+re-revisions every item and drops stale statistics revisions some minutes
+after listening or after a session. After a metadata session with no music
+played, all 399 items took new revisions in no particular order and 336 of 342
+statistics revisions went. A dry run whose source inspection spanned that
+moment refused at preflight, and its retry passed.
 
 The tool therefore passes a window to every verifier.
 
-- `SameRun`: the run's own post-write check. Exact.
-- `LaterRun`: used by `resume`. It absorbs only effects of listening and
+- `SameRun`: the run's own post-write check. It takes the exact model first.
+  When that refuses, music may have played while the run worked, and the
+  `LaterRun` rule decides over the same captures (`Window::check`): it still
+  pins everything the session wrote. The receipt then says
+  `music_played_during_run`, and the log keeps the exact refusal.
+- `LaterRun`: used by `resume`, by a later run settling a batch, and by a
+  run's own check as above. It absorbs only effects of listening and
   housekeeping:
   - completed plays and skips: lifetime counts only grow, each recent counter
     is the prior value plus later events (or only later events if the write's
@@ -1305,10 +1373,16 @@ The tool therefore passes a window to every verifier.
     events occur, ratings stay exact;
   - Playback History entries appended or dropped, and its revision. Older
     entries may name tracks removed since; a new entry must name a track in
-    the library;
+    the library, or a track the phone deleted (its tombstone revision stays):
+    the player appends one for a track deleted while it played;
   - the history's count of entries per media type
     (`container_item_media_type`), moving by exactly the change in its entries
-    whose track is in the library;
+    whose track is in the library, or, when a new entry names a deleted
+    track, counted again: the entries whose track is in the library. Counted
+    again with none left, the row goes and the history's
+    `contained_media_type` becomes 0. With the next entry for a track in the
+    library it becomes 8 again, and the row comes back counting the new such
+    entries from none;
   - full-record revisions of live items renumbered above the old maximum, and
     statistics revisions added or dropped once superseded;
   - the maintenance task date advancing.
@@ -1320,6 +1394,51 @@ Phone runs: a resume of an MPEG insert absorbed 5 plays, 1 skip, 4 history
 entries, 444 renumbered revisions and 5 statistics revisions in 35 s.
 CONFIRMED.
 
+Rows whose track is gone. The tables beside `item` keyed by `item_pid`
+(`item_extra`, `item_store`, `item_stats`, `item_state`, `item_search`,
+`item_playback`, `item_video`) can hold rows for a track that no longer
+exists, and the phone changes them on its own ([chapter
+4](04-media-library-database.md), section 4.6). Every full-table model takes
+those changes with one rule (`stray_rows` in `music-protocol`), as far as the
+window allows. A row is taken only when neither the model nor the capture
+has an `item` row for its pid, so a track's own rows stay exact:
+
+- the run's own check of a session that transfers no file (a removal, a
+  playlist deletion, a metadata edit): nothing; the rows must be as they were;
+- the run's own check of an insert, and the capture moments after it: the
+  rows of `item_store` and `item_stats` may be gone, since the phone deletes
+  them when the file transfers end;
+- a later run: any of these rows may be gone but an `item_state` row, which
+  the phone never deletes, and any may have appeared or changed, since a
+  write for a deleted track, one the run removed included, can come late.
+
+Between runs, the statistics rule counts only the rows of tracks in the
+library and leaves the others to this one. Insert recovery also lets the new
+track take an internal pid such rows hold: the import replaces them and takes
+over the `item_state` row. Any other reference to that pid is still refused.
+Receipts and evidence name what was taken, per table, as `stray_rows`. DESIGN,
+built on the phone's code; none of these changes has been seen on a phone.
+
+Two captures of one run moments apart, the observation and the capture an
+insert batch reads its covers back over, may differ by the phone's revision
+housekeeping and, while music plays, by what listening wrote, as `LaterRun`
+takes it; every other row is exact. A cover readback whose state drifted
+under it (a song ended) starts again over a fresh capture, up to four times.
+
+The read-only commands read for minutes, through several songs. `verify`
+holds each audio batch and each cover group with the state guard; one that
+finds the state changed is read again over a fresh capture, up to four times
+in a row, and that capture must be the same library but for listening (the
+same device, preferences, CDB and ArtworkDB bytes, and a catalogue that
+differs only as `catalogue_listening` allows). A batch read again takes each
+file the refused attempt read whole, between two stats of it that agreed, as
+read while the file keeps that stat (`stat_of_earlier_read`), as a verified
+copy's stat is taken, so a long batch is not read whole again for every song
+that ends. `pull` reads its covers back
+the same way; a library that changed beyond listening stops it before any
+journal is written. A recovery that proves a single insertion keeps every
+proof on one exact state and takes no fresh capture.
+
 Removal verifiers accept positive recent counters in a fresh Before, and record
 each reset. Stale-snapshot refusals say a fresh snapshot is needed because
 playing music changes the library.
@@ -1329,7 +1448,8 @@ After to compare with: the later-run catalogue rule applies.
 So does `resume` of an insert batch: its catalogue check
 takes the same rule, keeps every other statistic of a listened track exact and
 lets its play or skip date move only forward, with new plays or skips. The
-batch's own run stays exact. CONFIRMED: a batch left Started
+batch's own run takes the same rule when its exact check refuses. CONFIRMED:
+a batch left Started
 absorbed 2 plays and 1 skip on three tracks, besides 13 recent counters its
 own session cleared.
 
@@ -1352,8 +1472,12 @@ the entries whose track is in the library, per media type, in
 `container_item_media_type`: 118 of 459 entries, exactly, in one capture.
 Plays move the count with the entries. A deletion leaves it unchanged
 ([chapter 5](05-receiver-operations.md), "What the phone does to one track"),
-yet it matched exactly after 295 played tracks had been removed. When
-the phone corrects it is OPEN; a later run that finds it corrected refuses.
+yet it matched exactly after 295 played tracks had been removed. CONFIRMED:
+deleting the track that was playing made the player append an entry for it
+as it stopped, and the phone counted the history again in the same write, to
+its entries whose track is in the library. The rule takes that recount only
+together with such an entry. Whether the phone corrects the count at other
+times is OPEN; a later run that finds it corrected otherwise refuses.
 
 The phone also finishes its own work of an earlier session in the next one. An
 insert batch killed mid-upload left its new album unevaluated
@@ -1449,7 +1573,9 @@ system daemon. DESIGN: the project adds crates, never system packages.
   older phones.
 - It then confirms that a paired session reports the record's device
   identifier before any other connection is made.
-- The tool remembers each phone's last address.
+- The tool remembers each phone's last address and the Wi-Fi MAC its
+  instance name carried, both saved once a paired session has confirmed the
+  phone. It wakes the phone by them (section 8.3).
 - One discovery per command. An engine step that runs inside another with the
   same configuration shares the phone the outer one found and holds, which
   saves about 7 s a step. Over Wi-Fi, `sync` reads its sources while the phone
@@ -1463,8 +1589,24 @@ CONFIRMED.
   connection when it does. The heartbeat service sends a sleep notice about
   two seconds after connecting.
 - A unicast datagram to the echo or discard port wakes it (a magic packet to
-  UDP port 9 works). Broadcasts and other ports do not. The tool sends a
-  magic packet before discovery and before every TCP connection.
+  UDP port 9 works). So does Apple's own wake, which needs no address: a
+  magic packet multicast to 224.0.0.251, UDP port 9, for the MAC the phone
+  uses now, the one before the `@` of its instance name. Broadcasts, other
+  ports and a magic packet for any other MAC do not (chapter 03, section
+  5.4). The tool sends a unicast magic packet to the last address before
+  discovery and before every TCP connection, and Apple's three bursts of the
+  multicast on each interface while it browses; after a wake it browses for
+  up to 10 s instead of 4 s.
+- DESIGN: no privileges. The tool wakes the phone only with ordinary UDP
+  datagrams, as Apple's Windows host does, and takes the address from the
+  Bonjour answer that follows. It does not sweep the subnet (a sleeping
+  phone answers ARP late or not at all), does not send raw frames as Apple's
+  macOS code does, and does not use the IPv6 address in the instance name,
+  which the phone makes from the MAC (chapter 03, sections 5.2 to 5.4 and
+  11).
+- Its heartbeat answers each `Marco` with `Polo`, but on a sleep notice it
+  stops without the `NightNight` reply Apple's host sends. Whether the phone
+  cares is OPEN (chapter 03, section 5.9).
 - The assertion service and the ATC service close the connection on the first
   message unless the host also holds a heartbeat connection. With a heartbeat
   kept open, a wireless-sync power assertion is accepted.
@@ -1990,6 +2132,11 @@ its details.
 | `audio_index_retained` | info | `tracks`, `bytes` |
 | `artwork_proofs_reused` | info | `reused`, `total` |
 | `journal_carried` | info | `earlier`, `journal`, `installed` (false on a dry run, whose `journal` is in its run directory), `carried`, `matched`, `unbound`, `gone`, `covers_proven`, `covers_unproven`, `unfinished` |
+| `leftover_files_found` | info | `files`, `bytes`, `paths`: a dry run of `sync` found song files no song uses, which a real sync offers to remove (section 4.5) |
+| `leftover_files_kept` | info | `files`, `bytes`, `paths`, `asked` (false when there was no terminal to ask on and no `--yes`): `sync` kept them and went on |
+| `leftover_files_removed` | info | `files`, `bytes`, `paths`, `kept` (the paths left because they changed after they were found) |
+| `leftover_files_unchecked` | warning | `error`: `sync` could not look for, or finish removing, such files, and went on |
+| `tracks_deleted_on_phone` | info | `tracks`, `journal`, `installed` (false on a dry run, whose `journal` is in its run directory): the journal was written again without the tracks the phone no longer holds (section 3.5) |
 | `journal_started` | info | `journal`, `installed` (false on a dry run, whose `journal` is in its run directory): with none to carry, the journal of a phone `init` prepared that holds no track was started, binding nothing (section 3.5) |
 | `updates_scheduled` | info | `tracks`, `sessions` |
 | `sync_continuing` | info | `remaining`: actions a fresh sync runs one per session |
@@ -2005,6 +2152,7 @@ its details.
 | `pong` | info | `session` (`probe --ping`) |
 | `cache_counts` | info | `cache` (`fingerprints`, `cover_proofs`, `source_reads`), `reused`, `stored` |
 | `runs_pruned` | info | `removed`, `trimmed`, `bytes`: after the command, earlier run directories no journal needs were removed and finished ones trimmed to what planning reads. Each phone's latest `init` run, named in `devices/<device>/init-run`, is kept whole |
+| `leftover_item_rows` | warning | `stray`: per table, the rows of `item_extra`, `item_store`, `item_stats` or `item_state` whose track is gone; `songs`: how many gone tracks they were left for; `songs_until_cleared`: about how many new tracks take them all over, or null when every stray pid is not above the highest track's or more than 1,000 would be needed. The reader passes over them (chapter 04, section 4.6). Once per command. The text says in plain words that they don't affect the music, and when new songs clear them |
 | `sync_blocked` | warning | `holds`: what must be fixed first, each with its source `path` (`null` for the journal), `code` and plain `reason`; `hint`: how to send the rest now, or `null` |
 | `removal_blocked` | warning | |
 | `removals_held` | warning | `tracks`, `sources`: `sync` could not read or fingerprint these sources, so it removes nothing this run and sends the rest; exit code 3 |
@@ -2037,6 +2185,7 @@ see the proposal.
 | Code | Asked by | Details |
 |------|----------|---------|
 | `remove_tracks` | `delete`, `prune`, `clear`, `sync` | `tracks`, `playlists`, `selection` |
+| `remove_leftover_files` | `sync` | `files`, `bytes`, `paths`: the song files no song uses (section 4.5). Declining keeps them and the sync goes on |
 | `replace_tracks` | `sync --replace-library`, `--replace-changed` | `tracks`, `sources` |
 | `apply_change_plan` | `apply` of a plan that removes tracks | `removals`, `additions`, `updates` |
 | `send_edit` | `metadata set` | `tracks` |
@@ -2181,6 +2330,11 @@ Known limits (all DESIGN unless noted):
   modelled but has not been observed.
 - Only one tool process per host at a time: one heartbeat per host (section
   8.3) and one journal writer.
+- Over Wi-Fi the tool wakes a locked phone by the MAC its Bonjour name
+  carried when it last saw the phone awake. After the phone rotates its
+  private Wi-Fi address, the tool must see it awake once more on that
+  network before it can wake it (chapter 03, section 5.4). Apple's saved
+  wake token, which nothing refreshes, goes stale the same way (INFERRED).
 - Each batch pays a fixed cost for its captures and checks, so tiny syncs pay
   it too. An insert batch of twelve short tones takes about 28 s over Wi-Fi
   (section 8.6).

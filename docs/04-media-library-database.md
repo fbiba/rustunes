@@ -198,6 +198,8 @@ Columns below are those the observations name. Other columns exist.
 - `entity_revision.entity_pid` also has the default 0 in a database built new and none in the migrated one. No other column of the 45 tables differs (CONFIRMED).
 - How `rustunes` reads both shapes is in chapter 09, section 11.
 
+The item tables are keyed by `item_pid` with one row per track, but the phone can leave rows in them whose track is gone (section 4.6).
+
 ### 4.2 Group tables
 
 | Table | Columns named | Notes |
@@ -251,6 +253,50 @@ The library right after `rustunes init`'s first session, on a phone whose librar
 `entity_revision`, `_MLDatabaseProperties`, `sort_map`.
 
 `db_info` holds one row: the database PID (`db_pid`), the PID of the primary library container, and language and Genius fields. Only the host's `update_db_info` operation creates or replaces it. A Reset does not touch it.
+
+### 4.6 Rows whose track is gone
+
+`item_extra`, `item_store`, `item_stats` and `item_state` hold one row per `item` row, keyed by `item_pid`, but nothing in the database enforces it: there are no foreign keys. The phone keeps the tables in step when it adds or deletes a track. It does not when it writes a property of a track that is already gone. Such writes leave rows whose `item_pid` has no `item` row, here called stray rows. The phone removes some of them later and never removes the `item_state` row. The findings come from static analysis of iOS 27.2 (24B119), the MusicLibrary framework, `medialibraryd` and the Music sync bundle, from a replay on a copy of a phone database, and from deletions on a phone. On a phone, songs deleted in the Music app while their files were still being copied left stray rows (the second case below, OBSERVED on iOS 27.2.1).
+
+**Adding and deleting keep the tables in step.** CONFIRMED (static) unless marked.
+
+- Every path that creates an `item` row also writes `item_extra`, `item_store` and `item_stats`, whatever the media type or source. `item_state` follows from the triggers (section 4.1) or, in a sync import with the triggers off, from the import's repopulation of `item_state`.
+- A sync import runs in one transaction, including the dropping and re-creation of the triggers and the repopulation of `item_state`. A cancel, an unplug or a killed session rolls the whole import back (chapter 02, section 14.3).
+- Every deletion path removes the track's rows from all of these tables: a host's Delta or Reset, the Music app, removing a source, the maintenance task. Deleting a host-synced song in the Music app, and deleting one while it played, left the five tables with equal counts (OBSERVED on iOS 27.2.1).
+- So a track without a row in one of the four tables has no ordinary cause. The one path found is an incremental repopulation of `item_state` whose chunk fails on a SQLite error (I/O, a full disk) while the import still commits. `item_state` is then short by the tracks of the failed chunks. The path is CONFIRMED in code; that it happens is INFERRED, and it was never seen.
+
+**A write for a track that is gone.** CONFIRMED (static), and replayed on a copy.
+
+- Every property write on the phone ends in one operation, `ML3SetValuesForPropertiesOperation` (MusicLibrary, per-table block at `0x1d1aedf18`). For `item` it runs an UPDATE only. For any other table it first runs `SELECT 1 FROM <table> WHERE <pid> = ?`. When the row exists it updates it; otherwise it runs `INSERT OR REPLACE INTO <table> (item_pid, …)` with the columns written. No step checks that the `item` row exists.
+- A write for a track deleted in the meantime therefore leaves a row in each table it writes, and the `item_state_*_insert_sync` triggers add one `item_state` row for the pid. It never creates an `item` row. In the replay, on an `item_state` of the built-new shape (section 4.1), the row held `title` `''`, the written file name in `location`, and NULL in most other columns. A migrated table would give its column defaults instead (INFERRED from its schema).
+- The same operation probably also replaces the pid's deletion tombstone in `entity_revision` (section 3.4) with a live revision (INFERRED from the argument shape of the call; not observed).
+
+**What the phone removes later.** CONFIRMED (static).
+
+- `-[ML3MusicLibrary removeTombstonesForDeletedItems]` deletes the `item_store` and `item_stats` rows whose track is gone. The sync bundle calls it whenever a file-transfer task ends or is cancelled (chapter 02, section 14.3). A session that transfers files ends with it, and a session without files never runs it. Despite the name, no deletion path on iOS 27.2 leaves such rows behind.
+- The phone's sanitize step deletes the stray rows of `item_extra`, `item_stats`, `item_store`, `item_search`, `item_playback` and `item_video`. It runs on a schema migration (an iOS update) and once per iOS build from the maintenance task, and only when the phone's own count check fails. That check (`itemTablesEntryCountsUsingConnection:`) compares `item`, `item_extra`, `item_stats`, `item_store` and `item_video`. It does not count `item_state`.
+- Nothing deletes a stray `item_state` row.
+
+The counts a write for `k` gone tracks leaves, in a library of `n` tracks:
+
+| State | `item` | `item_extra` | `item_store` | `item_stats` | `item_state` |
+| --- | --- | --- | --- | --- | --- |
+| Right after the write | n | n+k | n+k | n+k | n+k |
+| After a session that transferred files | n | n+k | n | n | n+k |
+| After the sanitize | n | n | n | n | n+k |
+
+The replay ran the phone's three writes on a copy of a phone database, with its own triggers, for a pid the library had deleted. It then ran the two cleanups' statements, and the counts came out as in the table (OBSERVED on the copy). The phone regards each of these states as consistent. A writer that touches only `item_store` or only `item_stats` leaves that table, and `item_state`, above `item`.
+
+A new track takes the internal pid `max(item_pid) + 1` (section 3.1). Deleted tracks are often the newest, so a stray row can hold exactly that pid. The import's `INSERT OR REPLACE` then replaces the stray rows of the tables it writes, and the new track takes over the stray `item_state` row. Each `item_state` trigger's conflict clause sets exactly the columns it inserts. OBSERVED on iOS 27.2.1: on a phone with stray `item_extra` and `item_state` rows for pids above its highest track's, a push of new tracks numbered them one by one from that highest pid, the tracks that took the stray pids took the rows over (their title, location and flags became the new tracks'), and afterwards the five tables had equal counts. So when every stray pid is above the highest track's, adding as many new tracks as the highest stray pid lies above it clears them all. A stray pid at or below it is never reached this way.
+
+**What writes for a track that is gone.** Only the second has been seen on a phone. Ranked by how well each fits a phone synced once with Apple's host:
+
+1. A file that arrives for a track deleted while the sync was still copying. When a file the host sent completes, the sync bundle writes its location (`ML3ProcessDownloadedAssetsOperation`, `populateLocationPropertiesWithPath:`) for the `item_pid` it noted when the session's transfer list was built, with no existence check (CONFIRMED in code). A sync cancelled or started again mid-copy fits. A cancel gives the unfinished files ATError 2, and the phone then deletes each such host-synced track (chapter 02, section 14.3). That the next session's transfer list can be built before those deletions have all run is INFERRED. This leaves `item_extra` and `item_state` above `item`, and later `item_state` alone.
+2. Songs deleted on the phone while a sync is still copying their files. Same writer. OBSERVED on iOS 27.2.1, with `rustunes` as the host: the Music app lists a song whose file has not arrived, with a placeholder cover and a progress indicator, and lets one delete it. Deleting it does not cancel its outstanding file. A file that landed after its song was deleted left `item_extra` and `item_state` above `item` once the session ended, as the second row of the table gives; one that landed first was removed with its song. The late file itself stays in its music folder, named by no row (section 9.3).
+3. Apple Music: Sync Library turned off, or songs removed, while the assignment of cloud IDs or a download is still queued. Both write by pid without checking the track (control flow CONFIRMED; the database write not traced). Cloud IDs leave `item_store` above `item`; a download leaves the same as case 1.
+4. A play, a like or a rating written for a track removed under the player. The write path has no guard. The Music app wrote nothing for a song deleted in the app while it played (OBSERVED once).
+
+How `rustunes` reads such a library is in chapter 09, section 11, and how its checks allow for the phone's cleanups is in chapter 07, section 6.
 
 ## 5. Metadata mapping: source tag to plist key to column
 
@@ -789,7 +835,7 @@ CONFIRMED. The phone trims the spare allocation of a recently written file some 
 
 The phone deletes the files of removed tracks itself, minutes after the session; they are present right after it. Once a file is gone, an AFC stat of its path returns status 8 (object not found), which is the reliable "absent" answer. Files that were uploaded and renamed into `Airlock/Media` but never completed stay there; nothing claims them.
 
-The phone also deletes media files that no track names, in its daily maintenance. CONFIRMED statically (iOS 27.2); when the task runs on a given phone is INFERRED. `medialibraryd` registers the background task `com.apple.medialibraryd.maintainence`, every 86,400 s and only while the user is idle (`medialibraryd` `0x100024d18`, `0x100011e64`). It calls `-[ML3MusicLibrary removeOrphanedTracksOnlyInCaches:]` (MusicLibrary `0x1d1a414a0`), which collects every `item_extra.location` per base location and walks `Music/F00` to `F49`, `Music/Downloads` and `Podcasts`, among others, but not `Airlock`, looking only at media extensions. A file that no committed row names is deleted once its modification time is more than 300 s old; a newer one is skipped with "Ignoring new unaccounted file" (`0x1d1a42004`). The routine does nothing when the database version is not 2410000 (`0x1d1a415a4`). So a file that reaches a music folder without a committed row, as after an interrupted batch, goes at the next run, and one whose row is committed is safe.
+The phone also deletes media files that no track names, in its daily maintenance. CONFIRMED statically (iOS 27.2); when the task runs on a given phone is INFERRED. `medialibraryd` registers the background task `com.apple.medialibraryd.maintainence`, every 86,400 s and only while the user is idle (`medialibraryd` `0x100024d18`, `0x100011e64`). It calls `-[ML3MusicLibrary removeOrphanedTracksOnlyInCaches:]` (MusicLibrary `0x1d1a414a0`), which collects every `item_extra.location` per base location and walks `Music/F00` to `F49`, `Music/Downloads` and `Podcasts`, among others, but not `Airlock`, looking only at media extensions. A file that no committed row names is deleted once its modification time is more than 300 s old; a newer one is skipped with "Ignoring new unaccounted file" (`0x1d1a42004`). The routine does nothing when the database version is not 2410000 (`0x1d1a415a4`). So a file that reaches a music folder without a committed row, as after an interrupted batch, goes at the next run, and one whose row is committed is safe. A stray `item_extra` row (section 4.6) names its file as any row does, so the sweep keeps a late file while that row is there (INFERRED from the walk above). OBSERVED on iOS 27.2.1: files that landed after their songs were deleted were still in their music folders hours later. `rustunes sync` offers to remove such files itself (chapter 07, section 4.5).
 
 Nothing on the phone imports audio by scanning folders: none of its importers enumerates `Music/Fnn` (CONFIRMED statically). The only path that adopts a file already on disk, `-[ML3ITunesSyncImportOperation _recoverExistingAsset:forTrackId:]` (MusicLibrary `0x1d1b9765c`), serves a track whose insert carried `location` (`0x1d1b95934`-`0x1d1b959b4`).
 
@@ -987,9 +1033,9 @@ CONFIRMED.
 
 A verifier should accept "unchanged" or "complete reset of both recent counters" and refuse partial resets, increases, and any change to lifetime counts, dates or ratings.
 
-### 11.3 Playback happens between syncs
+### 11.3 Playback happens between and during syncs
 
-CONFIRMED. Music is played on the phone between sync runs. Play and skip counts, recent counters, date-played and the related statistics revisions will therefore differ from any state saved earlier. Separately, the phone renumbers all item revisions and drops statistics revision rows a few minutes after a sync even with no playback (section 3.4). No playback happens during a single run's capture, write and verify window; changes inside that window are unexpected.
+CONFIRMED. Music is played on the phone between sync runs, and during them. Play and skip counts, recent counters, date-played and the related statistics revisions will therefore differ from any state saved earlier, even one a run captured moments before. Each song that ends writes the catalogue and its log once, so with music playing a run's captures, guards and checks can each see the state change (chapter 7, section 7.3). Separately, the phone renumbers all item revisions and drops statistics revision rows a few minutes after a sync even with no playback (section 3.4).
 
 ### 11.4 Playback History and library containers
 
@@ -998,6 +1044,7 @@ CONFIRMED.
 - Three built-in containers exist: the primary library playlist (named after the device), Photos Memories and Playback History. The primary container holds a `container_item` row for every track (399 rows in one library). Playback History held 250 rows.
 - Playback History has no wire sync ID, and no host operation creates or edits it. Its rows appear to be written by the phone's own playback (INFERRED). Do not manufacture history rows.
 - Tracks that had been played had Playback History entries (one track had one, another two). Deleting a track does **not** remove its `container_item` rows in the primary container or in Playback History. Afterwards three Playback History rows pointed at deleted items. `container_item_media_type` and all container rows were unchanged, and a capture several minutes later showed no further change.
+- Deleting the track that is playing differs: the player stops and appends one more Playback History entry for the deleted track, and in the same write the phone counts `container_item_media_type` again for Playback History, to the entries whose track is still in the library. Entries of tracks removed earlier, which the count had kept, drop out of it. The deleted track keeps its tombstone revision, so the entry names a track the database records as deleted (CONFIRMED, with music playing). When that recount finds no entry for a track still in the library (a Clear deleted every track), the phone deletes the Playback History's `container_item_media_type` row and sets its `contained_media_type` to 0 (CONFIRMED, once). When the library is sent again and the next song is played, the phone sets `contained_media_type` back to 8 and adds the row again, counting the new entries from none rather than the older entries that name tracks in the library again (CONFIRMED, once). A track sent again may reuse the id of a removed track that older entries name, so those entries then name it.
 - This differs from ordinary playlists, whose member rows are removed by `delete_track` (see chapter 05).
 - Whether `delete_playlist` works on the built-in containers was not tested (OPEN).
 - On a library `rustunes init` prepared, the primary container had no `container_item` row after several hundred tracks, and there was no Photos Memories container (OBSERVED on two phones, on iOS 27.2.1 and 26.7.3). So the primary container's rows above came with Apple's sync, not from the phone's import (INFERRED).
@@ -1015,6 +1062,7 @@ CONFIRMED:
 - A `delete_track` operation removes the target's rows in `item`, `item_extra`, `item_store`, `item_stats`, `item_playback`, `item_search`, `item_state`, `item_video`, `chapter`, `lyrics`, plus its `artwork_token` and `best_artwork_token` rows (entity type 0). The item's live revision becomes a tombstone (`deleted` = 2) and its statistics revision row (type 1) goes. Representatives of groups it led move to the lowest surviving member.
 - Rows that stay: the track's `container_item` rows in the primary library container and in Playback History; emptied albums, album artists, item artists, composers and genres (representative 0); cover tokens of emptied albums until the next session; every `artwork` row; the track's cached original and renditions were not reported removed; `sort_map` rows; empty playlists after their members are removed; an orphan `container_item_media_type` count row after `delete_playlist`; empty test-named item-artist rows.
 - The phone removes the audio files of deleted tracks itself, after the session.
+- Deleting a track in the Music app removes its rows from the item tables as a host's deletion does (OBSERVED for a host-synced song, also while it played). A later write for the deleted track can leave rows behind (section 4.6).
 - A one-track deletion in a library whose survivors included two MP3 files changed 15 of the 45 tables and left 30 exact. All 650 membership rows and five containers were preserved. MP3 survivors need no special handling in the data model.
 - Removal sessions of 16 to 499 targets collected the groups they emptied, and a 100-target one collected every empty group and dropped orphan tokens. Sessions of up to 8 targets, and one of 90 that emptied the library, collected no group (section 7.6).
 - In none of the observations did the phone reclaim the library-container rows, the Playback History rows, the unreferenced `artwork` rows, or the cached renditions. Reclamation by the Music app, a maintenance task or a later sync was not seen within the observation windows (minutes after each session). Whether it ever happens is OPEN. For files the code answers part of it: the daily maintenance deletes an original only when no `artwork` row names it, together with its renditions, and never a rendition alone (section 10.4). As deletions keep every `artwork` row, a deleted track's cover files stay too (INFERRED).
@@ -1041,6 +1089,7 @@ These recommendations are explicitly supported by the observations above.
 16. Treat a changed audio file under an existing PID as a new track plus a removal, not as an update. Nothing shows that an update or a bare `update_track` makes the phone fetch new audio (section 9.6).
 17. Read the phone's container rows from a fresh capture before editing a playlist. Send the complete ordered member list at creation. A playlist's SQL `filepath` is not evidence of a file.
 18. Recompute nothing the phone derives: `sort_key`, orders, sections, integrity values and dates are receiver outputs. Verify them relationally.
+19. Read the item tables from `item`. Do not require `item_extra`, `item_store`, `item_stats` and `item_state` to have as many rows as `item`. Pass over rows whose track is gone, and expect the phone to delete those of every table but `item_state` later, at the end of a session that transfers files or in its sanitize (section 4.6). A track without a row in one of the four tables has no known ordinary cause; refuse it.
 
 Client-side policy built on these rules (planning, verification and recovery) is in [chapter 07](07-sync-engine-design.md).
 
@@ -1066,11 +1115,12 @@ Client-side policy built on these rules (planning, verification and recovery) is
 - OPEN: in a database built new (section 4.1), what rewrote the purchase-history entries' rows with NULL in columns the triggers write; what makes a session repopulate `item_state` for all items, as `rustunes init`'s did, rather than for the items it modified, as a track insert's did; what a later session writes into the rows of entries the phone added itself.
 - OPEN: a title edit to a label already present in `sort_map`; where the phone stores `container_ui` values; what the `item_extra` integrity value encodes.
 - OPEN: the receiver request that makes the phone fetch new audio for an installed PID, and the meaning of the host's "store version" (section 9.6).
+- OPEN: which event leaves rows whose track is gone on a given phone (section 4.6); which ATError a cancel in Apple's host gives the unfinished files on the phone, and whether the next session's transfer list can be built before the previous session's deletions have run; whether a write for a gone track also makes its `entity_revision` row live again, and whether one can register artwork for it.
 - INFERRED only: ICU-like behaviour of `sort_key` beyond Latin text; `name_section` for non-Latin scripts.
 
 ## 15. Evidence
 
-All evidence in this chapter comes from one phone (iPhone17,2) and was gathered on iOS 27.0.1 (build 24A446) except the captures after the update and of a rebuilt library, on iOS 27.2 (build 24B119). It falls into four kinds.
+All evidence in this chapter comes from one phone (iPhone17,2) and was gathered on iOS 27.0.1 (build 24A446) except the captures after the update and of a rebuilt library, on iOS 27.2 (build 24B119), and the deletions of section 12 in the Music app, on iOS 27.2.1. It falls into five kinds.
 
 **Phone database captures.** Read-only copies of `MediaLibrary.sqlitedb` and its WAL (section 2.2). Each receiver experiment compared database plus WAL before and after across all 45 tables (44 in the earliest captures). Main series:
 
@@ -1086,6 +1136,7 @@ All evidence in this chapter comes from one phone (iPhone17,2) and was gathered 
 - PNG and progressive or greyscale JPEG covers read back; an unevaluated album recomputed by a metadata session.
 - The last capture on iOS 27.0.1 and the first on iOS 27.2: the schema of section 2.3 and the effects of the update (chapter 09).
 - On iOS 27.2, the library before its database was removed and the one the phone rebuilt, captured twice, minutes apart: the two `item_state` shapes of section 4.1.
+- On iOS 27.2.1, before and after deleting a host-synced song in the Music app, and before and after deleting one while it played (sections 4.6 and 12).
 
 **Windows traces of Apple Devices 1.1540.23042.0.** Captured under Windows with hooks on the operation builder, the file writers and the ATC channel.
 
@@ -1095,6 +1146,8 @@ All evidence in this chapter comes from one phone (iPhone17,2) and was gathered 
 - A tag survey of 796 ALAC source files (four carried a `©cmt` comment, none carried sort atoms).
 
 **Static analysis of the host binaries.** AMPDevicesAgent.exe 1.6.4.90 (Apple Devices 1.1540.23042.0, SHA-256 `ad957f32107b7177969b3cb11b91e3922d27e622b53f9240b65cb457522111f9`) and 1.6.4.94 (Apple Devices 1.1540.24088.0, SHA-256 `f5e0f2115283e8719df383baf59d9b8a6f5a2ec39e566fbe802357f2d11e6fa9`). Disassembly was inspected, never executed, for the builder, tag readers, the grouping code, the AFC call sites and the replacement path. Function matching between the two builds is described in section 6.9. `MobileDevice.dll` 1827.100.17.2 and `AirTrafficHost.dll` 4025.400.1.5 and 4026.110.1.6 were searched for hashing and AFC use (section 9.2).
+
+**Static analysis of the phone's binaries.** For section 4.6: the MusicLibrary framework and `medialibraryd` of iOS 27.2 (24B119), the Music sync bundle and AirTrafficDevice, read from the firmware and disassembled, never executed. The writes and cleanups found there were replayed with their SQL on a copy of a phone database, with its own triggers.
 
 **Controlled Linux experiments.** Operation files built on Linux and sent over USB or Wi-Fi, followed by a full 45-table comparison and a read of the permanent files and cover renditions: the 41-session metadata matrix, the batch inserts and removals, the playlist experiments, the artwork read-backs, the clearing tests, and the comment and sort inserts and updates. Repairs of the three damaged shared groups (section 8.5) are included.
 

@@ -92,7 +92,7 @@ A bare `update_track` (only `operation` and `pid`) is what the Apple Devices hos
 | Counters | `MLSyncClientSyncAnchor` and the other sync properties move once per session. |
 | Collections | One album, one album artist and one item artist are created once, shared by the batch, each with the first inserted item as representative. A new album has `keep_local_status` 2. |
 | Items | One new item per `insert_track`, with internal pid `max(item_pid) + 1`, `+2`, `+3` in operation order. If the phone holds an earlier tombstone for that pid the row is revived (`deleted` 2 to 0) with a new revision. The sent `pid` is stored as `item_store.sync_id`. |
-| Item side tables | The usual rows in `item_extra` (location file name, size, integrity), `item_playback`, `item_search`, `item_state`, `item_stats`, `item_store`, `item_video`, `chapter`, `lyrics`. |
+| Item side tables | The usual rows in `item_extra` (location file name, size, integrity), `item_playback`, `item_search`, `item_state`, `item_stats`, `item_store`, `item_video`, `chapter`, `lyrics`. Rows a write for a deleted track left under the new pid are replaced, and its `item_state` row is taken over (INFERRED; chapter 04, section 4.6). |
 | Sort map | One new `sort_map` row per distinct new name (album, artist, each title). |
 | Not created | No `container_item` row is added to the library container. Single inserts behave the same. |
 

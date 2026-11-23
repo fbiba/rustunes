@@ -20,7 +20,7 @@ This chapter describes how a host reaches the stock iPhone Music sync services a
 
 ## 1. Scope and provenance
 
-Phone: iPhone17,2, iOS 27.0.1, build 24A446. Sections 3.2 and 5.8 describe the phone's own code. They come from a static reading of the firmware of iOS 27.2 (24B119) for the same model (chapter 09, section 13.1). Addresses there are those of `lockdownd` (`0x1000...`) and of the AirTrafficDevice framework in the dyld shared cache (`0x22b7...`).
+Phone: iPhone17,2, iOS 27.0.1, build 24A446; the multicast wake trials of section 5.4 ran on iOS 27.2.1. Sections 3.2 and 5.8, and the paragraphs of sections 5.1 to 5.4 and 6.2 marked as static readings of `lockdownd`, describe the phone's own code. They come from a static reading of the firmware of iOS 27.2 (24B119) for the same model (chapter 09, section 13.1). Addresses there are those of `lockdownd` (`0x1000...`) and of the AirTrafficDevice framework in the dyld shared cache (`0x22b7...`). Where a binary's behaviour needed Apple's own source to interpret, the open-source mDNSResponder and XNU were read (section 13.4).
 
 Host binaries analysed (Windows "Apple Devices" app, static analysis with objdump, strings and a small PE parser; nothing was executed for the static findings):
 
@@ -32,8 +32,14 @@ Host binaries analysed (Windows "Apple Devices" app, static analysis with objdum
 | AMP2 | AMPDevicesAgent.exe | 1.6.4.94, Apple Devices 1.1540.24088.0 | `0x140000000` |
 | AT2 | AirTrafficHost.dll | 4026.110.1.6, Apple Devices 1.1540.24088.0 | `0x180000000` |
 | MD2 | MobileDevice.dll | 1860.2.5.1, Apple Devices 1.1540.24088.0 | `0x180000000` |
+| MDNS | mDNSResponderDLL.dll | 3.1.0.2 (mDNSResponder-2096), Apple Devices 1.1540.24088.0 | `0x180000000` |
+| MUX2 | AppleMobileDeviceProcess_main.dll | mux source tree 571.0.0.0.1, Apple Devices 1.1540.24088.0 | `0x180000000` |
+| IMUX | AppleMobileDeviceService_main.dll | mux source tree 571.0.0.0.1, Apple Mobile Device Support 1860.49.2.1 (iTunes 12.13 for Windows) | `0x180000000` |
+| MD64 | MobileDevice64.dll | 1860.49.2.1, Apple Mobile Device Support 1860.49.2.1 (iTunes 12.13 for Windows) | `0x180000000` |
 
-The newer package (1.1540.24088.0) ships its own MobileDevice.dll (x64 at the package root, x86 under `AMDS32/`); an earlier version of this chapter said it shipped none. Its transport code was not re-read. Only the Wi-Fi sync switch of section 5.8 was read in it. Its AMP contains the same key strings as AMP and the same hash call-site structure (section 8), but its copy and connection code was not re-read. Findings about AMP below refer to 1.6.4.90 unless stated. The binaries are not redistributed; this chapter gives only addresses and findings. A `VA` is the objdump address; `RVA` is the VA minus the image base. Function names are the DLL export where one exists, otherwise `sub_<RVA>` (labels chosen by the analyst).
+The newer package (1.1540.24088.0) ships its own MobileDevice.dll (x64 at the package root, x86 under `AMDS32/`); an earlier version of this chapter said it shipped none. Its Wi-Fi connect and wake code (sections 5.1 and 5.4) and the Wi-Fi sync switch of section 5.8 were read in it; the rest of its transport code was not re-read. The package also carries its own Bonjour daemon (MDNS), which sends the wake of section 5.4. Its AMP contains the same key strings as AMP and the same hash call-site structure (section 8), but its copy and connection code was not re-read. Findings about AMP below refer to 1.6.4.90 unless stated. The binaries are not redistributed; this chapter gives only addresses and findings. A `VA` is the objdump address; `RVA` is the VA minus the image base. Function names are the DLL export where one exists, otherwise `sub_<RVA>` (labels chosen by the analyst).
+
+MUX2, from the same package, is Apple's Windows counterpart of usbmuxd: it finds Wi-Fi phones by Bonjour and runs their heartbeat (sections 5.2 and 5.9). IMUX and MD64 are the mux and the device library of the support package that iTunes 12.13 for Windows installs. They were read only to compare iTunes' Wi-Fi discovery and wake with those of Apple Devices (sections 5.4 and 5.9). Addresses in MDNS, MUX2, IMUX and MD64 are RVAs.
 
 Live observations come from a Linux host (Fedora, usbmuxd running) and the phone, over USB and over Wi-Fi. Section 13 lists the evidence by kind.
 
@@ -148,7 +154,9 @@ CONFIRMED (phone on the same network and not plugged in). With only the pairing 
 
 The lockdown domain `com.apple.mobile.wireless_lockdown` reads `SupportsWifi` and `SupportsWifiSyncing`, `EnableWifiDebugging` true, and a `BonjourFullServiceName`. No `EnableWifiConnections` key was needed. Setting `EnableWifiConnections` to true (what Finder's "Show this iPhone when on Wi-Fi" does) made no difference.
 
-Apple's host does the same. `_connect_to_port` (MD sub_e8830, string "_connect_to_port") branches on the device's interface type: type 0 (the usbmux `ConnectionType` `Network`) calls `_AMDeviceConnectByAddressAndPort` (MD RVA `0xe6280`), a plain `socket()` and `connect()` to the device `NetworkAddress`; otherwise `USBMuxConnectByPort`. CONFIRMED. No separate Windows service sits in the Wi-Fi data path. NOT FOUND otherwise.
+CONFIRMED (static, `lockdownd` of iOS 27.2). `lockdownd` serves a client on a wireless interface only while at least one of `EnableWifiConnections`, `EnableWifiDebugging` and `EnableWifiPairing` is true; otherwise it drops the connection at once ("Killing the WiFi connection immediately.", `socket_accept_callback` `0x100025270`, at `0x1000255e8`). It advertises the phone over Bonjour only while `EnableWifiDebugging` or `EnableWifiConnections` is true (section 5.3). A phone with `EnableWifiDebugging` true therefore needs no other key. A passcode change sets `EnableWifiDebugging` to false (`password_changed_callback`, `0x1000267c0`, at `0x1000268c8`). INFERRED: a phone that had only that key then stops advertising and refuses Wi-Fi clients until a host sets one of the keys again.
+
+Apple's host does the same. `_connect_to_port` (MD2 RVA `0xea690`) branches on the device's interface type: type 0 (the usbmux `ConnectionType` `Network`) calls `_AMDeviceConnectByAddressAndPort` (MD2 RVA `0xe80e0`), a plain `socket()` and blocking `connect()` to the device's `NetworkAddress`; otherwise `USBMuxConnectByPort`. The connect sends no wake, has no retry or timeout of its own and never looks the address up again; waking is a separate operation (section 5.4). CONFIRMED. An earlier version of this section gave `sub_e8830` and `0xe6280`, read in MD; in MD2, `0xe6280` is a pairing-record function. No separate Windows service sits in the Wi-Fi data path. NOT FOUND otherwise.
 
 ### 5.2 Finding the phone: Bonjour and the authTag
 
@@ -161,18 +169,34 @@ host     : <device-name>.local
 TXT      : identifier=<UUID>, authTag=<...>, authTag#1=<...>
 ```
 
-- The MAC in the instance name is the phone's private (per-network) Wi-Fi address, not the pairing record's `WiFiMACAddress` (the hardware address). Matching by the hardware MAC, as older tools do, finds nothing. The private address can rotate; matching followed it.
+- The MAC in the instance name is the phone's private (per-network) Wi-Fi address, not the pairing record's `WiFiMACAddress` (the hardware address). Matching by the hardware MAC, as older tools do, finds nothing. The private address can rotate; matching followed it. That MAC is also the one the phone's wake answers to (section 5.4).
 - iOS 26.4 and later publish one `authTag` per paired host. The value is the base64 of the first 8 bytes of `HMAC-SHA256(key, identifier)` where `key = HKDF-SHA512(ikm = HostID, salt = "", info = "", L = 32)`. MobileDevice implements the check as `AMDIsTXTRecordForUDID`. On the test phone `authTag` matched this host's record and `authTag#1` belonged to another paired host.
 - Port 32498 is not open. Lockdown is on 62078 regardless of the advertised port.
 - A host browses with an in-process mDNS client (no avahi or system daemon is required), matches by authTag (falling back to the MAC for phones that predate per-host tags), and then confirms that a paired session reports the record's UDID before using the address.
 
+**What the phone publishes** (CONFIRMED static, `lockdownd` of iOS 27.2). `lockdownd` does not call `DNSServiceRegister`. It hands launchd a registration event (`com.apple.bonjour.registration`, name `LOCKDOWN.BONJOUR`, at `0x100004ae8`) whose dictionary the phone's Bonjour daemon registers (INFERRED: that daemon was not read). The dictionary holds:
+
+- flags 0 and interface 0 (any);
+- port 32498, a constant (`0x100004a84`). `lockdownd` listens only on 62078, and 32498 was found closed (above);
+- the type `_apple-mobdev2._tcp` with one subtype per pair record: eight hex digits of zlib's `adler32` over that host's `SystemBUID`, started from 0 instead of the usual 1 (`copy_mdns_service_string`, `0x100028eb4`). With no pair record there is no type, and nothing is registered;
+- the TXT record (`build_bonjour_TXTRecord`, `0x100004c84`), only while the feature flag `MobileLockdown/EnablePrivatizedBonjourAdvertisement` is on. Its `identifier` is a new random UUID each time the record is built, so it changes at every registration (section 5.3) and a host must not keep it. There is one `authTag` per pair record;
+- the instance name (`update_bonjour_service_instance_name`, `0x100009b58`): `<mac>@<ipv6>-supportsRP-<n>` when remote pairing is enabled, where `n` is the RemotePairing wire protocol version (26 here, not the iOS major version), and `<mac>@<ipv6>` otherwise. `lockdownd` also stores the name as `InstanceName`, and the full service name as `BonjourFullServiceName`, in `com.apple.mobile.wireless_lockdown`.
+
+The IPv6 address in the name is not the interface's. `createV6Address` (`0x1000096f0`) derives it from the MAC as a modified EUI-64 link-local address: `fe80::`, the MAC's first byte with bit `0x02` flipped, the next two bytes, `ff:fe`, and the last three. INFERRED: iOS gives its real link-local address another interface identifier, which would explain why a datagram to the name's address got no neighbour answer (section 5.4). The MAC comes from two places: when `lockdownd` starts it makes up a random locally administered MAC (`initialize_wifi_syncing`, `0x100009890`), and at each Wi-Fi link-up it takes the MAC of the Wi-Fi interface (`wifi_link_up_callback`, `0x100026700`), which is the private address on that network. In every observation the name carried the private address. The pairing service `_apple-pairable._tcp` is registered the same way, under the same name and port, and only while `EnableWifiPairing` is true.
+
+**How Apple's host browses** (CONFIRMED static, MUX2; IMUX has the same code). MUX2 browses `_apple-mobdev._tcp` and `_apple-mobdev2._tcp,<checksum>`, where the checksum is the same `adler32` over its own `SystemBUID`, so the second browse hears only phones paired with it. Both browses use flags 0 and every interface (`USBMuxBonjourDeviceListenerCreate`, `0x19e08`). A third browse, for `_apple-pairable._tcp`, depends on a byte that nothing writes, so it never runs. For each new instance MUX2 resolves the name (flags 0, `0x1ac7e`) and then asks for its IPv4 and IPv6 addresses (`DNSServiceGetAddrInfo`, protocol 3, `0x1b2c1`), each step with a 30 s limit. The address callback (`0x1b55c`) replaces the port with 62078 and takes the MAC as the text before the `@` of the instance name. It matches a pairing record first by `AMDIsTXTRecordForUDID` (the authTag) and then by that MAC against the record's `WiFiMACAddress` (`0x1cadc`). It probes the address with a non-blocking TCP connect, which fails only on a local error: one SYN, not a wake. The first address that passes wins, IPv4 or IPv6. Before it tells any client that the phone has attached, MUX2 connects to Lockdown, starts a session and starts the heartbeat service (`HandleDeviceAttach`, `0xdcac`; `start_heartbeat`, `0x14e34`), and it ignores the phone if either fails. It sends no wake: it relies on the phone being awake when its announcement arrives. Section 5.9 describes what MUX2 keeps afterwards.
+
 ### 5.3 A locked phone sleeps within seconds
 
-CONFIRMED. With the phone locked, it answered for a few minutes after it was locked, then stopped answering ping, Bonjour and TCP SYNs to 62078 (15 s timeouts), while its radio still answered ARP. A 60 s reachability log over several hours showed it asleep in every sample not caused by an experiment.
+CONFIRMED. With the phone locked, it answered for a few minutes after it was locked, then stopped answering ping, Bonjour and TCP SYNs to 62078 (15 s timeouts). Its radio answers broadcast ARP late or not at all, so a sweep of the subnet does not find a sleeping phone reliably; an earlier version of this section said it still answered ARP. A sweep of a /24 with ordinary sockets missed it: the phone answered ARP late (once after 3.3 s) or not within 9 s, and Linux dropped the failed neighbour entries during the sweep (by default it prunes its neighbour table once it holds more than 128 entries), so a late answer was lost. A 60 s reachability log over several hours showed it asleep in every sample not caused by an experiment.
+
+CONFIRMED (static, `lockdownd` of iOS 27.2). `lockdownd` withdraws its `_apple-mobdev2._tcp` and `_apple-pairable._tcp` services when the system is about to sleep and registers them again, with a new `identifier`, once it has woken (`_sleep_wake_notification_callback`, `0x1000050d8`; withdrawal at `0x1000051ac`, registration at `0x1000052e8`). It keeps its wake-on-wireless registration across sleep (section 5.4). It registers again only while `EnableWifiDebugging` or `EnableWifiConnections` is true; without either, the phone neither advertises nor registers for wake at all. Losing the Wi-Fi link does not withdraw the service ("WiFi link down; keeping Bonjour advertisement active.", `0x1000267b4`). A host with an open session can make it register both services again, with a new `identifier`, by reading the key `reset_adverts` of `com.apple.mobile.wireless_lockdown` (`0x10001d828`). A host therefore finds a sleeping phone by Bonjour only after it has woken it.
+
+INFERRED from the open-source mDNSResponder (the phone's own Bonjour daemon was not read). iOS builds have no Bonjour Sleep Proxy client (`MDNSRESPONDER_SUPPORTS_COMMON_SPS_CLIENT` is 0 for iOS in `mDNSShared/mDNSFeatures.h`). When the phone sleeps, its daemon sends goodbyes for all its records instead of handing them to a proxy, so a Sleep Proxy on the network does nothing for an iPhone. On waking it probes and announces its records again, within about 1 to 3 s. Neither `lockdownd` nor that daemon sets up ARP or neighbour answers for sleep; the late ARP answers come from the Wi-Fi firmware.
 
 ### 5.4 What wakes it
 
-CONFIRMED. Each trial waited until ping stopped, sent one datagram and timed the first reply.
+CONFIRMED. Each unicast and broadcast trial waited until ping stopped, sent one datagram and timed the first reply. Each multicast trial (iOS 27.2.1) waited until Lockdown on 62078 had stopped answering and then stayed silent through a control period, sent one burst on the Wi-Fi interface and timed Lockdown's first answer.
 
 | Datagram | Woke |
 | --- | --- |
@@ -185,8 +209,39 @@ CONFIRMED. Each trial waited until ping stopped, sent one datagram and timed the
 | `hello` x 20, UDP 40000, unicast | no |
 | Magic packet (hardware MAC), UDP 40000, unicast | no |
 | TCP SYN to 62078 (repeated) | no |
+| Magic packet (MAC from its Bonjour name), UDP 9, multicast to 224.0.0.251, 18 packets 100 ms apart | yes, about 2 s |
+| Same burst, hardware MAC (the pairing record's `WiFiMACAddress`) | no (20 s) |
+| Same burst, a made-up MAC | no (20 s) |
+| A datagram to UDP 9 at the IPv6 link-local address in its Bonjour name | no: no neighbour answer (15 s) |
 
-The radio wakes the system for any unicast datagram to the echo or discard port, whatever it carries. Broadcasts and other ports do not wake it, and neither does a TCP connection attempt. A host sends a unicast datagram to UDP 9 (a magic packet for the record's hardware MAC works) at the phone's last known address before discovery and before every TCP connection.
+The radio wakes the system for any unicast datagram to the echo or discard port, whatever it carries, and for a magic packet multicast to 224.0.0.251:9 that carries the MAC the phone uses on this network now: the one before the `@` of its Bonjour instance name (section 5.2). A subnet broadcast, other ports, a multicast magic packet for any other MAC and a TCP connection attempt do not wake it. The multicast wake needs no address, and it wakes only the phone whose MAC it carries. A phone woken by the burst alone, with no address known to the host, answered Bonjour about a second after the burst. The IPv6 address in the name is not one the phone answers at (section 5.2).
+
+**Why.** The `lockdownd` parts are CONFIRMED static (iOS 27.2). The kernel's rules come from XNU's open source, not from the phone's kernel.
+
+- A TCP SYN to 62078 is meant not to wake the phone. `lockdownd` sets `SO_NOWAKEFROMSLEEP` on its listening and accepted sockets (`_disable_wake_from_sleep`, `0x100010a04`; `setsockopt` at `0x100025a90`). XNU leaves such sockets out of the list of ports that a Wi-Fi driver waking on unicast traffic may let through (`bsd/netinet/in_pcblist.c`, `ifnet_get_local_ports` in `bsd/net/kpi_interface.h`). A SYN the host retransmits after a wake is accepted.
+- XNU wakes fully from low-power mode for a UDP datagram that carries six `0xFF` bytes and then the receiving interface's current link-layer address 16 times, whatever its port (`packet_has_magic_pattern`, `bsd/netinet/udp_usrreq.c`). INFERRED: the multicast trials fit a match on the address the interface uses now (the private MAC woke the phone, the hardware MAC did not). The Wi-Fi firmware's own wake filters were not read.
+- Why any unicast datagram to UDP 7 or 9 wakes it was not found. No launchd entry on the phone declares a socket on those ports, and XNU has no rule for them. When `lockdownd` registers its service it asks wifid to turn on the chip's wake-on-wireless mode (`WiFiManagerClientSetWoWState(client, 1)`, `0x100004968`, log "Registered WOL."). INFERRED: wifid programs a pattern for those ports. OPEN.
+- After a wake by a Wi-Fi packet, `lockdownd` reads the packet the driver kept (`IO80211InterfaceWoWWakeUpData` of `AppleBCMWLANCore`; inlined in `0x1000050d8`, `0x100005388` to `0x100005930`). If it is a frame of ethertype `0x0842`, or a UDP datagram to any port, whose 96 bytes after the first six of the payload are 16 copies of the phone's `WifiAddressData` (INFERRED: the hardware address), and it arrived within 2 s, `lockdownd` holds a `PreventUserIdleSystemSleep` assertion named `com.apple.mobile.lockdownd.wake-on-wlan` for 30 s. The phone stayed awake only 2 to 5 s after the wakes measured in section 5.5. Whether any of those packets qualified, and whether this path acts as read, is OPEN.
+
+**Apple's wake** (CONFIRMED static, MDNS). The multicast row is Apple's design. MDNS takes the MAC before the `@` of the instance name, builds a 102-byte magic packet (six `0xFF` bytes, then the MAC 16 times) and sends it to 224.0.0.251, UDP port 9, 18 times 100 ms apart, from a socket on which it sets neither an interface nor a TTL (builder `0x4b930`, length, count and interval at `0x4ba8b` to `0x4baaf`; sender thread `0x48590`). It ignores the IPv6 address after the `@`. It sends one such burst with each of the first three SRV queries of a resolve that asks for a wake (`kDNSServiceFlagsWakeOnResolve`), so the bursts overlap. INFERRED from the open-source mDNSResponder: those queries leave about 0.1 s, 1.1 s and 4.1 s after the resolve starts, so up to 54 datagrams leave in about 6 s.
+
+- MDNS reads the name in `mDNSSendWakeOnResolve` (`0x25367` to `0x254ac`). It takes the first label and stops at its first `@`. It needs exactly five colons before the `@`, at most 17 characters of MAC and at most 46 characters after the `@`; otherwise it logs "Malformed" and sends nothing. The text after the `@`, the `-supportsRP-26` suffix included, only counts toward that length.
+- Only the SRV question of the resolve carries the flag (`0x42997`). Its count of three wakes is set when the question starts (`0x1550d`), and the cached SRV record of the name is purged first, so the query always goes on the wire.
+- A wake resolve must name an interface: in the open-source code the client library and the responder both refuse one on any interface (`dnssd_clientstub.c`, `mDNS.c`).
+- MDNS cannot send raw frames: its raw-packet function returns at once (`0x4b630`). Its Sleep Proxy client serves the PC's own sleep. INFERRED from its only caller, which runs when the PC sleeps: it offers no Sleep Proxy service.
+- Apple's open-source macOS code answers the same resolve with a different wake: a raw Ethernet frame of ethertype `0x0842`, carrying six `0xFF` bytes, the MAC 16 times and six zero bytes, sent through BPF once to the MAC and once to the broadcast address (`SendWakeupPacket`, `mDNSMacOSX/helper.c`). It uses no IP address either. A Linux host can send that frame only with `CAP_NET_RAW`. It was not tried on the phone.
+
+**Apple's wake token** (CONFIRMED static, MD2 and AMP2). Apple's Windows host keeps no address for the phone it wakes. `AMDeviceCreateWakeupToken` (MD2 `0xddc70`) returns `{TokenVersionKey: 5, InterfaceIndexKey, FullServiceNameKey}`, where the full name is the phone's Bonjour full service name (`<instance>._apple-mobdev2._tcp.local.`; for a phone on USB, read from `BonjourFullServiceName` in `com.apple.mobile.wireless_lockdown`). AMP2 stores one token per UDID under the preference key `MobileDeviceWakeupTokens`. To wake the phone, `AMDeviceWakeupOperationSchedule` (MD2 `0xde540`) resolves that name with `DNSServiceResolve` and `kDNSServiceFlagsWakeOnResolve` (`0x40000`, at `0xde6df`), which makes Bonjour send the bursts above; the operation expires after 20 s. The phone's new address comes from the service it registers once awake, so a new DHCP address does not matter to Apple's host.
+
+Where tokens come from and when they are used (CONFIRMED static, AMP2, MD2 and MD64):
+
+- AMP2 makes a token when a phone that supports Wi-Fi is mounted, over whichever interface comes first, and only if Bonjour is available (`sub_557f90`, `0x1405582d0` to `0x1405583c3`). It keeps the token in memory. It saves it under `MobileDeviceWakeupTokens` when the owner turns Wi-Fi syncing on and removes it when they turn it off (`sub_5c5e40`, `sub_5c6134`). Nothing refreshes a saved token. INFERRED: after the phone rotates its private Wi-Fi address, Apple's saved token no longer wakes it either.
+- The name in the token comes from MUX2's record of a Wi-Fi phone (its `EscapedFullServiceName` without the backslashes) or, for a phone on USB, from Lockdown. A token made over USB has interface index 0. A wake resolve on any interface is refused, so the operation then runs one resolve for each interface index from 1 to 25 (MD2 `0xde807` to `0xde81f`).
+- The operation reports the phone awake at the first answer to its resolve, when the phone answers the SRV query, not when a connection succeeds. After 20 s it reports that it expired (`0xdd960`, `0xdd7d0`).
+- AMP2 wakes every saved token once when it starts, without waiting for the result (`sub_4b1154`, `sub_5c62e4`). It also wakes a phone that has gone when it takes the device lock for it, and waits up to 30 s for the wake and up to 60 s in all for the phone to attach ("support> attempting to wake disconnected device %@", `sub_559278`). It never wakes on a timer or before a connect. `AMDeviceWakeupUsingToken` is exported but nothing in the package calls it.
+- iTunes had the same API: MD64's token and wake operation are the same code as MD2's (MD64 `0xddcc0` and `0xde590`). Which part of iTunes calls them was not read.
+
+**What `rustunes` does.** Once a paired session has confirmed a phone, `rustunes` keeps its address and the MAC from its Bonjour instance name, per UDID. Before it browses Bonjour, it sends a unicast datagram to UDP 9 at the last address. While it browses, it sends Apple's three bursts for the kept MAC to 224.0.0.251:9, one copy on each IPv4 interface that is up, not loopback or point-to-point, and multicast-capable, with a TTL of 1, so a VPN that holds the default route does not take them. After a wake it browses for up to 10 s instead of 4 s. With no Bonjour answer it tries the last address, when exactly one paired phone has one. Every TCP connection repeats the unicast datagram each second until the phone accepts it (section 6.3). The limit: the wake needs the MAC the phone uses now. After the phone rotates its private Wi-Fi address, `rustunes` must see it awake once on that network, unlocked or reached by address, to learn the new MAC; the hardware MAC in the pairing record does not wake it.
 
 ### 5.5 It falls asleep again almost at once
 
@@ -248,6 +303,34 @@ Consequences for a client that is not Apple's:
 - A host that wants to be woken needs a stable `LibraryID`, `Wakeable: true` in `HostInfo`, a Bonjour `_atc._tcp` service with that `libid`, and a listener on the port. Whether the lockdown keys above are also needed is OPEN: no reader of them was looked for on the phone.
 - OPEN: whether the power change that starts `atc` also delivers the callback of step 2.
 
+### 5.9 How Apple's host keeps track of a Wi-Fi phone
+
+CONFIRMED static, MUX2. IMUX has the same functions, instruction for instruction (for example `networkDeviceCallback` at MUX2 `0x1cee8` and IMUX `0x1bf3c`). Section 5.2 describes how MUX2 finds a phone and attaches it.
+
+**What it keeps.** For each Wi-Fi phone: its full service name, its UDID, one socket address (IPv4 or IPv6) with port 62078, the interface index and a flag for `SupportsSleepyTime`. The MAC and the TXT record stay with the Bonjour listener. MUX2 keeps no list of addresses and saves nothing about network phones: its registry key holds only logging settings, and the pairing records hold the hardware `WiFiMACAddress` and no address.
+
+**The heartbeat.** Each message on `com.apple.mobile.heartbeat` is a 4-byte big-endian length followed by a binary plist (`_handle_msg`, `0x144a8`).
+
+| The phone sends | The host |
+| --- | --- |
+| `{Command: Marco, Interval: N, SupportsSleepyTime: true}` | answers `{Command: Polo}`, sets its watchdog to 2 × N seconds (30 s before the first `Marco`) and records `SupportsSleepyTime` |
+| `{Command: SleepyTime}` | answers `{Command: NightNight}`; once that is sent, it stops the heartbeat and closes the phone, so its clients see it detach |
+
+Over USB the heartbeat runs only when the host preference `com.apple.usbmuxd` / `USBHeartbeat` is true.
+
+**When it lets a phone go.**
+
+1. The heartbeat fails: the watchdog expires, or a read or a send fails (`_heartbeat_failed`, `0x14a84`). MUX2 asks Bonjour to reconfirm the phone's TXT record and detaches the phone. The reconfirm passes a record of one zero byte (`USBMuxBonjourDeviceReconfirm`, `0x1d9fc`). INFERRED from the open-source responder, which reconfirms only a cached record with exactly that data: it does nothing for a real phone.
+2. The phone says `SleepyTime` (above).
+3. The phone's Bonjour record goes away, unless the phone said `SupportsSleepyTime`. MUX2 then logs "Ignoring bonjour detach because device (%lu) supports SleepyTime", keeps the phone and leaves the decision to the heartbeat.
+4. Its pairing record is removed. MUX2 checks the records when a client asks it to save or delete one, not when the files change (`CheckForChangedPairingRecords`, `0x1db84`).
+
+**A changed address.** MUX2 never updates an address in place. A second Bonjour answer for a name that is already attached is ignored ("... already attached as %@. Ignoring bonjour add event.", `0x1cfb8`), and the same name on another interface first detaches the old one. A client's connect goes to the stored address with no wake, no retry and no new lookup (`MuxNetworkInitiateConnect`, `0x124a8`). A new address comes only from a fresh Bonjour answer after the phone was let go, which for a sleeping phone means after a wake (section 5.4). MUX2 cannot send a wake or ARP itself: it imports no `sendto` and no IP helper functions.
+
+**iTunes and Apple Devices.** IMUX is the same mux built as a Windows service, where MUX2 runs as a process. IMUX loads the system's Bonjour for Windows, while Apple Devices ships its own (MDNS). The differences found are in how each is hosted and how it logs power events, not in discovery, the heartbeat or the wake.
+
+**`rustunes`** answers each `Marco` with `Polo`, but takes `SleepyTime` as the end of the heartbeat and sends no `NightNight`. Whether the phone treats a host that does not answer differently is OPEN (section 12). It looks the phone up again for each command (section 5.4) and keeps none of MUX2's attach state.
+
 ## 6. Keeping a Wi-Fi phone awake
 
 ### 6.1 What Apple's host does
@@ -279,6 +362,8 @@ CONFIRMED.
 | `com.apple.atc` `Ping`, heartbeat open (unlocked) | `Pong`, `Capabilities`, `SyncAllowed` |
 
 The refusals of both services on the locked phone came from the missing heartbeat, not from the lock.
+
+CONFIRMED (static, `lockdownd` of iOS 27.2). For each Wi-Fi client it accepts, `lockdownd` holds a `PreventUserIdleSystemSleep` assertion named `com.apple.mobile.lockdownd.active-connection` ("Servicing a host-side client.") while that connection lasts (`handle_connection_async`, `0x100026bdc`, call at `0x100026e20`). It takes none around sleep. Neither `lockdownd` nor `atc` sends `SleepyTime`: the heartbeat service is `heartbeatd`, which was not read.
 
 ### 6.3 How the keep-awake works in practice
 
@@ -589,10 +674,16 @@ Advice the evidence above supports:
 2. Keep one write or read in flight per connection, as Apple does. A second connection for file data is what Apple does over Wi-Fi; on the 200 Mbit/s link tested here it did not help, because 1 MiB writes already saturate it. Stats may be pipelined (up to 64 were tested): `afcd` answers them in order, and each reply's packet number should be checked against its request (section 10.3).
 3. Do not write a file and then read it back or hash it on the happy path. Rely on per-write status, the close status, a stat of the stored size and the phone's own completion messages. Keep any full read-back for audits, and run it with the host-side cache of stats. A complete audio pass over USB read 8.83 GB for 434 tracks. The whole run, with the cover checks, took about 6 minutes.
 4. Never send GetFileHash or GetFileHashWithRange in routine operation (section 9). Resume by re-sending, or by reading the existing prefix with ordinary reads and comparing on the host.
-5. For Wi-Fi: wake the phone with a unicast UDP datagram to port 9 before each connection; keep a heartbeat connection open; take the `AMDPowerAssertionTypeWirelessSync` assertion (60 s timeout, renew every 20 s on a new connection each time); watch the heartbeat for `SleepyTime` for 6 s after taking the phone; and let only one process per host use the phone.
+5. For Wi-Fi: keep the MAC from the phone's Bonjour instance name and its last address; wake it with Apple's multicast magic packet for that MAC (224.0.0.251:9) while browsing, and with a unicast UDP datagram to port 9 before each connection; keep a heartbeat connection open; take the `AMDPowerAssertionTypeWirelessSync` assertion (60 s timeout, renew every 20 s on a new connection each time); watch the heartbeat for `SleepyTime` for 6 s after taking the phone; and let only one process per host use the phone.
 6. Set `TCP_NODELAY`, use non-blocking I/O with a 60 s operation timeout and 25 s send and receive timeouts on lockdown and service sockets, as Apple does. Apple sets no socket buffer sizes or keepalive on the Wi-Fi sockets. Allow 30 s per AFC request on Wi-Fi: occasional retransmission stalls of 9 to 10 s occur on healthy links.
 7. Accept that `Airlock` folders can be absent (after a restart) and create them before the first upload. Expect a killed upload to leave its partial file in `Airlock/Media`; the phone neither claims nor cleans it (chapter 05). Close every opened AFC handle explicitly, including after errors. Discard ATC connections after any error or cancellation.
 8. Use `ReadDirectory` and `GetSizeOfPathContents` for listings and sizes, and `RemovePathAndContents` for trees, instead of one stat per file.
+9. To find a sleeping phone on Wi-Fi, wake it by the MAC in its Bonjour name and take its address from the Bonjour answer that follows, as Apple's hosts do (sections 5.4 and 5.9). On Linux this needs no privilege: an ordinary UDP socket, with the interface chosen by `IP_MULTICAST_IF` and a TTL of 1. Apple's Windows code leaves both to the system; on Linux that can send the packet out through a VPN that holds the default route. Other approaches and why they fall short:
+   - A sweep of the subnet, one datagram per address while watching the neighbour table, needs no privilege, but the sleeping phone answers ARP late or not at all (section 5.3).
+   - The IPv6 address in the instance name is made from the MAC, not taken from the interface, and got no neighbour answer (section 5.2).
+   - A Bonjour Sleep Proxy does nothing for an iPhone (section 5.3).
+   - Apple's macOS wake, a raw frame of ethertype `0x0842` to the MAC, needs `CAP_NET_RAW` and is untried (section 5.4).
+   - A static neighbour entry for the last address needs `CAP_NET_ADMIN`, and still the address.
 
 ## 12. Open questions
 
@@ -610,6 +701,12 @@ Advice the evidence above supports:
 | 10 | The artwork copy path of AMP (callers of `CopyGenericFile` and `CopyPromisedData`) and the Windows read chunk size. | NOT FOUND |
 | 11 | TLS record size on Apple's AFC connections. | NOT FOUND (assume 16 KiB) |
 | 12 | Does a Music sync need the `com.apple.itunes.lock_sync` lock, and what happens when Apple's host and a second host contend for it? | OPEN. No recorded Linux session took the lock (section 7.9). |
+| 13 | How often does a phone rotate its private Wi-Fi address on a home network? After each rotation the multicast wake fails until a host sees the phone awake once (section 5.4). | OPEN |
+| 14 | Does the phone need `NightNight` in answer to `SleepyTime`? Apple's host sends it; `rustunes` does not (section 5.9). | OPEN |
+| 15 | Do Apple's three overlapping bursts wake a deeply asleep phone more reliably than one? A single burst woke it in every multicast trial (section 5.4). | OPEN |
+| 16 | Does a magic packet for the hardware MAC earn `lockdownd`'s 30 s `wake-on-wlan` assertion, and why do unicast UDP 7 and 9 wake the phone whatever they carry? Both depend on the Wi-Fi firmware and wifid, which were not read (section 5.4). | OPEN |
+| 17 | Does Apple's macOS wake, a raw frame of ethertype `0x0842` to the MAC, wake the phone? | OPEN. Untried: it needs a raw socket (section 5.4). |
+| 18 | What calls the agent's device-lock routine that wakes a phone which has gone, and which part of iTunes used the wake API? | OPEN (section 5.4) |
 
 ## 13. Evidence
 
@@ -625,6 +722,8 @@ Phone: iPhone17,2, iOS 27.0.1, build 24A446.
 - Restore of a 399-track library (8.2 GB) in batches of 100 with 64 KiB requests and read-back, then with 1 MiB requests; removal of phone hashing; timing tables of section 10.
 - Timings before and after pipelined stats and the other speed changes; a deferred sleep watch tried and reverted; a Wi-Fi restore of 398 tracks (section 10.3).
 - A dry run whose capture copied every file over Wi-Fi, then one served from the host cache.
+- A locked phone woken with no address known, by Apple's multicast magic packet for the MAC in its Bonjour name, and left asleep by the same burst for the pairing record's hardware MAC and for a made-up MAC (section 5.4).
+- A sleeping phone missed by an ARP sweep of the subnet, and a datagram to the IPv6 address in its Bonjour name that got no neighbour answer (sections 5.3 and 5.4).
 
 ### 13.2 Windows host
 
@@ -645,14 +744,20 @@ Disassembly (objdump), string extraction and a small PE parser, with no code exe
 | AMPDevicesAgent.exe | 1.6.4.94 (1.1540.24088.0) | `f5e0f2115283e8719df383baf59d9b8a6f5a2ec39e566fbe802357f2d11e6fa9` |
 | AirTrafficHost.dll | 4026.110.1.6 (1.1540.24088.0) | `230445f73c4887ff46adfb7a9a25ed83fb99b6abc9bc341fcb8349bad3a7664b` |
 | MobileDevice.dll | 1860.2.5.1 (1.1540.24088.0) | `929e4c3582eede3cde35eabb31ad8211defcd425448fd75b5353073d6bd46812` |
+| mDNSResponderDLL.dll | 3.1.0.2, mDNSResponder-2096 (1.1540.24088.0) | `7895b46840a39bc05d04748dc609f0803e6859b1a18b9d33bf522ca323df74f8` |
+| AppleMobileDeviceProcess_main.dll | mux 571.0.0.0.1 (1.1540.24088.0) | `5022ca3e850cde5f7bce9246bfb0a658f324cdad589f6809d6d2fffc66d3b157` |
+| AppleMobileDeviceService_main.dll | mux 571.0.0.0.1 (Apple Mobile Device Support 1860.49.2.1) | `9f5f53da4a0f664f2d48281eb0953b8a52d1e99db35ccfb644162fec8009556c` |
+| MobileDevice64.dll | 1860.49.2.1 (Apple Mobile Device Support 1860.49.2.1) | `2f2504bbfe577e296ca2fd8c4661805a04bf0da200fcb7f85b18d2674b48ef60` |
 
-Findings about AMP in sections 7 and 8 were read in 1.6.4.90. The hash and checksum string sets of 1.6.4.94 match, and the two hash call sites exist there too. Its copy and connection code was not re-read. The host's side of section 5.8 was read in the 1.1540.24088.0 binaries.
+Findings about AMP in sections 7 and 8 were read in 1.6.4.90. The hash and checksum string sets of 1.6.4.94 match, and the two hash call sites exist there too. Its copy and connection code was not re-read. The host's side of section 5.8, the Wi-Fi connect of section 5.1, the browse of section 5.2, the wake of section 5.4 and the mux of section 5.9 were read in the 1.1540.24088.0 binaries. The binaries of Apple Mobile Device Support 1860.49.2.1, from iTunes 12.13 for Windows, were compared with them function by function after masking addresses.
 
-Sections 3.2 and 5.8 also rest on the firmware of iOS 27.2 (24B119): `usr/libexec/lockdownd` from the system volume (SHA-256 `1aee64771b85cb3c5be083c3862f9039dd0c0149f9ed224209176531d20b4b22`) and the AirTrafficDevice framework from the dyld shared cache, read as described in chapter 09, section 13.1. Nothing in those two sections was observed on a phone.
+Sections 3.2 and 5.8, and the static paragraphs of sections 5.1 to 5.4 and 6.2, also rest on the firmware of iOS 27.2 (24B119): `usr/libexec/lockdownd` from the system volume (SHA-256 `1aee64771b85cb3c5be083c3862f9039dd0c0149f9ed224209176531d20b4b22`) and the AirTrafficDevice framework from the dyld shared cache, read as described in chapter 09, section 13.1. Nothing in sections 3.2 and 5.8 was observed on a phone.
 
-### 13.4 Open-source clients
+### 13.4 Open-source code
 
 The Rust `idevice` crate 0.1.68 (AFC client, mDNS browsing, `AfcClient` used for the `afcd` probe) and the libimobiledevice `idevicebackup2` sync lock were read for comparison (sections 4.4, 5.2 and 7.9).
+
+Apple's open-source mDNSResponder (tags mDNSResponder-2200.0.8 and mDNSResponder-2600.140.3, the last that still has the macOS platform code, and a 2881.0.25 tree) and XNU (tag xnu-12377.121.6) were read to interpret the binaries in sections 5.3, 5.4 and 5.9. The Windows wake was checked against MDNS itself. Statements that rest on the source alone, such as the phone's Bonjour behaviour and the macOS wake, are marked INFERRED or name the source file.
 
 ### 13.5 Measurements
 
@@ -660,4 +765,4 @@ Transfer, library capture, verification, clear and restore timings (section 10) 
 
 ### 13.6 Strength of the evidence
 
-The Wi-Fi findings (sections 5, 6, 9, 10), including the pipelined stats of section 10.3, were observed on the phone. The AFC, assertion and socket details of Apple's host (sections 6.1, 7, 8) were read from code and not seen on a network. Items marked INFERRED, NOT FOUND or OPEN were not observed.
+The Wi-Fi findings (sections 5, 6, 9, 10), including the pipelined stats of section 10.3, were observed on the phone. The AFC, assertion and socket details of Apple's host (sections 6.1, 7, 8) were read from code and not seen on a network. So were the browse, wake and heartbeat of Apple's hosts and the phone's own advertisement and sleep handling (sections 5.2 to 5.4 and 5.9); of these, only the wake table and the observations in section 5.3 were seen on the phone. Items marked INFERRED, NOT FOUND or OPEN were not observed.

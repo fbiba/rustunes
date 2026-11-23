@@ -102,6 +102,10 @@ The components relevant to Music:
 - `AMPDevicesAgent.exe` is the background agent that performs device sync. It builds the per-track operation dictionaries, writes the operation files, signs them and answers the phone's asset requests.
 - `AirTrafficHost.dll` is Apple's ATC host library.
 - `MobileDevice.dll` is Apple's device library, loaded by the `AppleMobileDeviceProcess` support process. It also contains the Wi-Fi paths studied in the last phase.
+- `AppleMobileDeviceProcess_main.dll`, which that process loads, is Apple's counterpart of usbmuxd. It finds Wi-Fi phones by Bonjour and runs their heartbeat.
+- `mDNSResponderDLL.dll` is the Bonjour responder the package runs in process. It sends the wake for a sleeping Wi-Fi phone.
+
+For the Wi-Fi wake, the Apple Mobile Device Support package (1860.49.2.1) that iTunes 12.13 for Windows installs was also read, for comparison. Chapter 03, section 13.3 gives the hashes of these binaries.
 
 The Windows guest was driven through the QEMU guest agent (files, process queries, command execution), through HMP (keystrokes and framebuffer screenshots) and through a SPICE viewer. The Music source files were exposed to the guest through a read-only SPICE folder share of the Linux Music directory. The iPhone was passed through as a QEMU `usb-host` device (`05ac:12a8`). Moving it between the guest and Linux was done by `device_del` and `device_add` against the device's recorded QOM path, with a restoration command saved first, and one physical re-plug was sometimes needed for Linux to rediscover the phone.
 
@@ -225,7 +229,8 @@ CONFIRMED: the phone's database and host files were unchanged. The capture is th
 - a survey tool that read captured `insert_track` and `update_track` plists and counted item keys per operation, including sort fields and comment-like keys;
 - a read-only dumper of the `ilst` text atoms of M4A files (title, artist, album, album artist, composer, comment, lyrics, the sort atoms, copyright, genre) as JSON lines;
 - an offline model of how `AMPDevicesAgent.exe` 1.6.4.90 derives the MP3 gapless fields sent in `insert_track.avformat_info`, written from static analysis only, in which every place where the binary reads a value that only a real decoder pass could confirm is marked as an assumption;
-- a generator of annotated excerpts for the MP3 gapless region.
+- a generator of annotated excerpts for the MP3 gapless region;
+- a disassembly script on `pefile` and `capstone` for the mux, the Bonjour responder and the iTunes support package, which also compared functions across packages with addresses masked.
 
 **Annotated excerpts** generated from the disassembly covered five areas:
 
@@ -243,6 +248,7 @@ CONFIRMED: the phone's database and host files were unchanged. The capture is th
 - the MP3 gapless computation: delay, drain, duration, resynchronisation and the tail-silence heuristic, down to its float constants (chapter 06);
 - the comment and five sort fields and how they are taken from source tags (chapters 05 and 06);
 - the Wi-Fi transfer strategy of the Windows host (1 MiB transfers, which hash calls it makes and when) and its method for deciding that a file on the phone is intact (chapter 03);
+- how Apple's hosts find, track and wake a phone on Wi-Fi: a Bonjour browse, a heartbeat that decides when a phone has gone, and a wake that multicasts a magic packet for the MAC in the phone's Bonjour name (chapter 03);
 - that the host builds `delete_playlist`, `delete_album` and `delete_artist` as bare `{operation, pid}` dictionaries (chapter 05).
 
 **Limits.**
@@ -313,6 +319,8 @@ Chapter 02 gives the protocol detail. What remains OPEN is the general algorithm
 
 A second reading of the 24B119 files asked a different question: what the phone itself requires of a first sync. It covered `lockdownd`'s rules for starting the sync service, the startup messages, the handling of `RequestingSync` and `FinishedSyncingMetadata`, the import with its Reset branch and `update_db_info`, the creation of a new database, and every folder under `iTunes_Control`. It also searched the whole shared cache and about 3,500 executables for the names of the files Apple's host keeps on the phone. CONFIRMED: the phone reads none of them, compares no anchor and has no notion of a first sync. The results are in chapter 10 and in the phone-side paragraphs of chapters 02 to 05 and 09.
 
+A third reading of `lockdownd` asked how a locked phone stays findable and wakeable on Wi-Fi: its Bonjour advertisement, what it does before sleep and after a wake, and which packets may wake it. The public source of XNU and mDNSResponder was read with it. The results are in chapter 03, sections 5.1 to 5.4.
+
 **Limits.** The code was read, not run. Nothing in chapter 09 was exercised on the phone, and the order in which the phone's processes act after an update is partly INFERRED. Only the two builds were compared. The second reading had the extracted images without the shared stub islands of the cache, so call targets were resolved by hand from the selector tables. Statements that rest on that are marked INFERRED where they are made.
 
 **Not published.** The firmware, the decrypted images, the extracted files and every dump made from them are Apple's code or derived from it. They are retained privately and are not distributed (section 10). Chapter 09, section 1 gives the SHA-256 of every file read. To check a claim, download the same builds for iPhone17,2 and disassemble the cited addresses.
@@ -323,7 +331,7 @@ One paragraph per later chapter (07 describes the CLI rather than Apple's behavi
 
 **Chapter 02, the ATC sync protocol** (`02-atc-sync-protocol.md`). A host opens `com.apple.atc` through Lockdown, sends HostInfo and RequestingSync for the `Media` dataclass with the library identity and the saved anchor, receives `ReadyForSync` in a new session, stages an operation plist (and its `.cig` sidecar) under `iTunes_Control/Sync/Media`, finishes the metadata phase, answers an `AssetManifest` by uploading each requested asset, and receives completion. Operations are `update_db_info`, `insert_track`, `update_track`, `delete_track`, `delete_playlist` and others. The phone's anchor advances once per session. A fixed 84-byte host Grappa request and a signature sidecar are sufficient for the Media class. CONFIRMED in every Linux session, from the first Media handshake on.
 
-**Chapter 03, USB and Wi-Fi transport** (`03-transport-usb-and-wifi.md`). The same Lockdown, AFC and ATC services run over USB through `usbmuxd` and over TCP with only the pairing record the phone saved. The phone advertises `_apple-mobdev2._tcp`; since iOS 26.4 it publishes one `authTag` per paired host (an HMAC-SHA256 over the identifier keyed from the host id), and the instance name carries the phone's private Wi-Fi address rather than its hardware address. A locked phone sleeps within seconds. Throughput over Wi-Fi was about 26 MB/s with 1 MiB requests. `afcd` answers up to 64 pipelined stat requests on one connection in order, which Apple's own host never uses. Hashing files on the phone through AFC `GetFileHash` leaks a resource in `afcd`: after about 2,550 requests every open fails until the phone restarts. The project therefore does not request hashes from the phone. CONFIRMED.
+**Chapter 03, USB and Wi-Fi transport** (`03-transport-usb-and-wifi.md`). The same Lockdown, AFC and ATC services run over USB through `usbmuxd` and over TCP with only the pairing record the phone saved. The phone advertises `_apple-mobdev2._tcp`; since iOS 26.4 it publishes one `authTag` per paired host (an HMAC-SHA256 over the identifier keyed from the host id), and the instance name carries the phone's private Wi-Fi address rather than its hardware address. A locked phone sleeps within seconds and withdraws its Bonjour service first. Apple's hosts keep no address for it: they wake it with a magic packet for the MAC in its Bonjour name, multicast to 224.0.0.251 on UDP port 9, and take its address from its next Bonjour answer. Throughput over Wi-Fi was about 26 MB/s with 1 MiB requests. `afcd` answers up to 64 pipelined stat requests on one connection in order, which Apple's own host never uses. Hashing files on the phone through AFC `GetFileHash` leaks a resource in `afcd`: after about 2,550 requests every open fails until the phone restarts. The project therefore does not request hashes from the phone. CONFIRMED.
 
 **Chapter 04, the media library database** (`04-media-library-database.md`). `MediaLibrary.sqlitedb` has 45 tables. One inserted track writes the usual rows in `item`, `item_extra`, `item_playback`, `item_search`, `item_state`, `item_stats`, `item_store`, `item_video`, `chapter` and `lyrics`, plus collection rows (album, album artist, item artist), sort-map entries and revision bumps. Item ids continue at the previous maximum plus one, and tombstoned ids are revived. The WAL must be read together with the database. Comments and sort names land in fixed columns and the phone strips no articles itself. Readback after each session is built from these rules.
 
@@ -454,6 +462,7 @@ Artwork work started with the artwork registration above and continued in a seri
 | Do Lockdown, AFC and ATC work unchanged over TCP? | Yes, with only the saved pairing record (TLS). `MediaLibrary.sqlitedb` (3,149,824 bytes) read in 0.44 s. |
 | Find the phone without a daemon | Bonjour plus `authTag` match. |
 | Locked-phone sleep | Sleeps within seconds; only specific wake methods work. |
+| Wake a locked phone whose address changed | Apple Devices, the iTunes support package and `lockdownd` read statically: Apple's hosts multicast a magic packet for the MAC in the phone's Bonjour name and keep no address. That burst woke the locked phone in about 2 s; the same burst for its hardware MAC or a made-up MAC did not. See chapter 03, section 5.4. |
 | Faster transfers | 1 MiB requests (about 26 MB/s) and no phone-side hashing; USB restore 482 s for 398 tracks. |
 | Hash leak in `afcd` | About 2,550 `GetFileHash` requests exhaust AFC opens until the phone restarts; the project dropped phone-side hashing. |
 | Can stats be pipelined? | Yes: 64 in flight on one connection, answered in order; a Wi-Fi restore of 398 tracks took 539.7 s. |
