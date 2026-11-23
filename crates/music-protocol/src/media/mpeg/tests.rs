@@ -73,7 +73,9 @@ fn real_frame_bytes_identify_tag_variants_and_distinguish_audio_changes() {
     assert_eq!(x.fingerprint.audio, y.fingerprint.audio);
     assert_eq!(y.metadata.title, ["TRACK", "alternate"]);
     let mut c = b;
-    c.last_mut().map(|b| *b = 1);
+    if let Some(b) = c.last_mut() {
+        *b = 1;
+    }
     assert_ne!(t.read(&c).unwrap().fingerprint.audio, x.fingerprint.audio);
     assert_eq!(x.fingerprint.audio.coded_samples, 2304);
     assert_eq!(

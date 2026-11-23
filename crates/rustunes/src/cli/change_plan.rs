@@ -279,7 +279,7 @@ fn outcome_line(outcome: engine::ChangeApplyOutcome) -> String {
         } => format!(
             "Live preflight passed: the phone's current state gives the same {removals} removals; the {additions} additions are planned once they are gone and checked then, before any is sent; nothing was sent."
         ),
-        Outcome::Cancelled => format!("Cancelled; nothing was sent."),
+        Outcome::Cancelled => "Cancelled; nothing was sent.".to_string(),
         Outcome::Completed {
             removed: 0,
             additions,

@@ -237,7 +237,7 @@ pub fn attributes(bytes: &[u8]) -> Result<Attributes> {
         "odd attribute key/value count"
     );
     let mut map = Attributes::new();
-    for pair in parts.chunks_exact(2) {
+    for pair in parts.as_chunks::<2>().0 {
         ensure!(
             !pair[0].is_empty() && pair[0].len() <= 128 && pair[1].len() <= 4096,
             "attribute component exceeds bound or key is empty"
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn full_attributes_reject_duplicates_unknown_kinds_and_symlinks() {
         assert!(attributes(b"st_size\0").is_err());
-        assert!(attributes(b"st_size\07\0st_size\08\0").is_err());
+        assert!(attributes(b"st_size\x007\0st_size\x008\0").is_err());
         for kind in ["S_IFLNK", "S_IFIFO", "unknown"] {
             assert!(entry("role", attrs(kind)).is_err());
         }

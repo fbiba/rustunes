@@ -251,7 +251,9 @@ fn batch_sources(c: &Connection, unreadable: &mut Vec<String>) -> Result<BTreeMa
         // A schema without insert batches has no batch sources.
         Err(_) => return Ok(sources),
     };
-    let mut targets: BTreeMap<i64, (PathBuf, Vec<u8>, Vec<(i64, Vec<u8>)>)> = BTreeMap::new();
+    // A batch's evidence directory, input receipt and bound (binding, track)s.
+    type Target = (PathBuf, Vec<u8>, Vec<(i64, Vec<u8>)>);
+    let mut targets: BTreeMap<i64, Target> = BTreeMap::new();
     let mut rows = q.query([])?;
     while let Some(r) = rows.next()? {
         let entry = targets

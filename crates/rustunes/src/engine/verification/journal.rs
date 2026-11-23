@@ -1036,6 +1036,7 @@ impl ReadBatch for Transfer {
     }
 }
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn read_batch(
     reader: &mut impl ReadBatch,
     state: &HeldState,

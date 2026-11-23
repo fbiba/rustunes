@@ -547,7 +547,7 @@ async fn a_summary_connection_pipelines_stats_counting_each_as_an_operation() {
             if request.header_payload.ends_with(b"absent") {
                 status(&mut peer, request, 8).await;
             } else {
-                let bytes = b"st_ifmt\0S_IFREG\0st_size\x009\0st_mtime\0123\0".to_vec();
+                let bytes = b"st_ifmt\0S_IFREG\0st_size\x009\0st_mtime\x00123\0".to_vec();
                 reply(&mut peer, request, AfcOpcode::Data, Vec::new(), bytes).await;
             }
         }

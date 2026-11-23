@@ -862,7 +862,7 @@ fn validate_container_checked(
         // SQLite format4.1/4.2: rolling sums use the byte order selected by
         // magic bit0; stored checksums are always big-endian.
         let checksum = |data: &[u8], mut sums: [u32; 2]| {
-            for chunk in data.chunks_exact(8) {
+            for chunk in data.as_chunks::<8>().0 {
                 let word = |v: &[u8]| {
                     if magic & 1 == 0 {
                         u32::from_le_bytes(v.try_into().expect("word"))
@@ -2126,7 +2126,7 @@ fn stats_except_playback(
     connection: &Connection,
     expected_ids: &BTreeSet<u64>,
     control: Option<&ReadControl>,
-) -> Result<(BTreeMap<u64, [u8; 32]>, BTreeMap<u64, PlaybackDates>)> {
+) -> Result<StatsFingerprints> {
     stats_fingerprints(
         connection,
         expected_ids,
@@ -2136,6 +2136,9 @@ fn stats_except_playback(
     )
 }
 
+/// Per-track fingerprints of item_stats rows, and each track's playback dates.
+type StatsFingerprints = (BTreeMap<u64, [u8; 32]>, BTreeMap<u64, PlaybackDates>);
+
 /// Per-track fingerprints of every item_stats column except `excluded`, and
 /// each track's playback dates.
 fn stats_fingerprints(
@@ -2144,7 +2147,7 @@ fn stats_fingerprints(
     domain: &[u8],
     excluded: &[&str],
     control: Option<&ReadControl>,
-) -> Result<(BTreeMap<u64, [u8; 32]>, BTreeMap<u64, PlaybackDates>)> {
+) -> Result<StatsFingerprints> {
     check_control(control)?;
     let mut query = connection.prepare(
         "SELECT s.sync_id AS __wire_id,ps.* FROM item_stats ps JOIN item_store s USING(item_pid) JOIN item i USING(item_pid) WHERE s.sync_id<>0 ORDER BY s.sync_id",

@@ -66,6 +66,8 @@ fn named(parent: &File, name: &CString) -> Result<Option<libc::stat>> {
         Err(error.into())
     }
 }
+// libc's stat fields are narrower on some targets (aarch64 Linux, macOS).
+#[allow(clippy::unnecessary_cast)]
 fn matches(metadata: &Metadata, value: &libc::stat) -> bool {
     metadata.dev() == value.st_dev as u64
         && metadata.ino() == value.st_ino as u64
@@ -73,6 +75,8 @@ fn matches(metadata: &Metadata, value: &libc::stat) -> bool {
         && metadata.uid() == value.st_uid
         && metadata.gid() == value.st_gid
 }
+// libc's stat fields are narrower on some targets (aarch64 Linux, macOS).
+#[allow(clippy::unnecessary_cast)]
 fn stable_named(metadata: &Metadata, value: &libc::stat) -> bool {
     matches(metadata, value)
         && metadata.nlink() == value.st_nlink as u64
@@ -346,7 +350,7 @@ impl Scratch {
             let raw = u16::from_be_bytes([header[16], header[17]]);
             let page = if raw == 1 { 65_536 } else { u64::from(raw) };
             ensure!(
-                page >= 512 && page <= 65_536 && page.is_power_of_two(),
+                (512..=65_536).contains(&page) && page.is_power_of_two(),
                 "catalog scratch SHM page size invalid"
             );
             let frames = wal_bytes.unwrap_or(0).saturating_sub(32) / (page + 24);
@@ -371,23 +375,24 @@ impl Drop for Scratch {
         for copy in &self.copies {
             if let (Ok(held), Ok(Some(named))) =
                 (copy.file.metadata(), named(&self.directory, &copy.name))
+                && identity(&copy.metadata, &held)
+                && matches(&held, &named)
+                && held.nlink() == 1
             {
-                if identity(&copy.metadata, &held) && matches(&held, &named) && held.nlink() == 1 {
-                    unsafe {
-                        libc::unlinkat(self.directory.as_raw_fd(), copy.name.as_ptr(), 0);
-                    }
+                unsafe {
+                    libc::unlinkat(self.directory.as_raw_fd(), copy.name.as_ptr(), 0);
                 }
             }
         }
-        if let Ok(Some(named)) = named(&self.parent, &self.name) {
-            if matches(&self.metadata, &named) {
-                unsafe {
-                    libc::unlinkat(
-                        self.parent.as_raw_fd(),
-                        self.name.as_ptr(),
-                        libc::AT_REMOVEDIR,
-                    );
-                }
+        if let Ok(Some(named)) = named(&self.parent, &self.name)
+            && matches(&self.metadata, &named)
+        {
+            unsafe {
+                libc::unlinkat(
+                    self.parent.as_raw_fd(),
+                    self.name.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                );
             }
         }
     }

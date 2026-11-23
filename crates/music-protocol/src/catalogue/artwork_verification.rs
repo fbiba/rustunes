@@ -1076,7 +1076,7 @@ mod tests {
             ([0, 1, 0, 0], false),
         ] {
             let mut new = old.clone();
-            for (t, c) in new.iter_mut().zip(counts.chunks_exact(2)) {
+            for (t, c) in new.iter_mut().zip(counts.as_chunks::<2>().0) {
                 t.playback.play_count_recent = c[0];
                 t.playback.skip_count_recent = c[1];
             }

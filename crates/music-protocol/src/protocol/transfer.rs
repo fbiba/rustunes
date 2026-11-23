@@ -1628,7 +1628,7 @@ fn attributes_of(packet: AfcPacket) -> Result<Attributes> {
         "odd AFC attribute key/value count"
     );
     let mut attributes = Attributes::new();
-    for pair in parts.chunks_exact(2) {
+    for pair in parts.as_chunks::<2>().0 {
         ensure!(
             attributes
                 .insert(pair[0].clone(), pair[1].clone())

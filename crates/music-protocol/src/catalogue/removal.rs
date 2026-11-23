@@ -421,23 +421,22 @@ fn verify_with(
         typed::replace(&mut expected, "entity_revision", old_revision, tombstone)?;
         receipt.tombstone_revision_before = old_number;
         receipt.tombstone_revision_after = new_number;
-        if let Some((stats_row, number)) = target_stats_revision(before, item)? {
-            if !table(after, "entity_revision")?
+        if let Some((stats_row, number)) = target_stats_revision(before, item)?
+            && !table(after, "entity_revision")?
                 .rows
                 .contains_key(stats_row)
-            {
-                ensure!(
-                    new_number > number
-                        && expected
-                            .get_mut("entity_revision")
-                            .context("revisions absent")?
-                            .rows
-                            .remove(stats_row)
-                            == Some(1),
-                    "removal target {item} stats revision is not dominated"
-                );
-                receipt.removed_stats_revision = Some(number);
-            }
+        {
+            ensure!(
+                new_number > number
+                    && expected
+                        .get_mut("entity_revision")
+                        .context("revisions absent")?
+                        .rows
+                        .remove(stats_row)
+                        == Some(1),
+                "removal target {item} stats revision is not dominated"
+            );
+            receipt.removed_stats_revision = Some(number);
         }
     }
     // A collected group's revisions follow the same rule as a target's.

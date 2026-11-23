@@ -226,8 +226,7 @@ fn rows_without_audio_belong_to_the_unfinished_insertion() {
     earlier(&t).only_unfinished(&rows(&[target])).unwrap();
     let error = earlier(&t)
         .only_unfinished(&rows(&[target, 99]))
-        .err()
-        .expect("a row no batch explains was accepted");
+        .expect_err("a row no batch explains was accepted");
     assert!(error.to_string().contains("0000000000000063"), "{error:#}");
 }
 

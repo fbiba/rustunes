@@ -163,7 +163,7 @@ fn ordinary_playback_entry_keeps_original_cancel_and_deadline_before_output() {
 fn binding(temp: &Temp) -> Binding {
     Binding {
         content: temp.prepared().content,
-        receipt_kind: BindingReceiptKind::InsertVerification,
+        receipt_kind: BindingReceiptKind::Insert,
         receipt_sha256: [4; 32],
         media_anchor: 13,
     }

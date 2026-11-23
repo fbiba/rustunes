@@ -155,9 +155,11 @@ fn a_pull_carries_an_earlier_journals_bindings_sources_and_reservations() {
     let j = Journal::open(&later.path(), &test_support::identity()).unwrap();
     let bindings = j.active_verified_bindings().unwrap();
     assert_eq!(bindings.len(), 2);
-    assert!(bindings
-        .iter()
-        .all(|b| b.receipt_kind == BindingReceiptKind::PullVerification && b.media_anchor == 20));
+    assert!(
+        bindings
+            .iter()
+            .all(|b| b.receipt_kind == BindingReceiptKind::Pull && b.media_anchor == 20)
+    );
     assert!(
         j.lookup_active_verified(&covered.source.audio)
             .unwrap()

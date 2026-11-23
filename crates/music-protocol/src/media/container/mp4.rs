@@ -448,12 +448,15 @@ pub(crate) fn audio_specific_config(bytes: &[u8]) -> Result<AudioConfig> {
     }
     let _extension = bits.read(1)?;
     // Backward-compatible SBR / PS signalling.
-    if sbr.is_none() && bits.left() >= 16 && bits.read(11)? == 0x2b7 {
-        if bits.object_type()? == 5 && bits.read(1)? == 1 {
-            sbr = Some(bits.rate(4)?);
-            if bits.left() >= 12 && bits.read(11)? == 0x548 {
-                ps = bits.read(1)? == 1;
-            }
+    if sbr.is_none()
+        && bits.left() >= 16
+        && bits.read(11)? == 0x2b7
+        && bits.object_type()? == 5
+        && bits.read(1)? == 1
+    {
+        sbr = Some(bits.rate(4)?);
+        if bits.left() >= 12 && bits.read(11)? == 0x548 {
+            ps = bits.read(1)? == 1;
         }
     }
     Ok(match sbr {

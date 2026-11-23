@@ -154,8 +154,7 @@ pub(crate) fn native_origin(
         false,
     )?;
     ensure!(
-        initial.receipt_kind == BindingReceiptKind::InsertVerification
-            && initial.content.artwork.is_none(),
+        initial.receipt_kind == BindingReceiptKind::Insert && initial.content.artwork.is_none(),
         "initial native insertion receipt/content differs"
     );
     let id = AttemptId(first.context("native insertion attempt missing")?);

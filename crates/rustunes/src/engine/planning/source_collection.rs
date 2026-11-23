@@ -585,6 +585,8 @@ pub(crate) fn refused_m4a(alac: anyhow::Error, other: &anyhow::Error) -> anyhow:
 }
 
 /// Which reader took a selected source, and what it found.
+// One at a time, taken apart at once.
+#[allow(clippy::large_enum_variant)]
 enum Inspected {
     Alac(Result<SourceTrack>),
     Other(Result<music_protocol::media::mpeg::Source>),

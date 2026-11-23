@@ -814,8 +814,9 @@ fn reconcile(
     prior: Option<&Prior>,
     library: Option<&Library>,
 ) -> Reconciled {
-    let mut by_audio: HashMap<[u8; 32], Vec<(PathBuf, TransferredSource)>> = HashMap::new();
-    let mut by_file: HashMap<([u8; 32], u64), Vec<(PathBuf, TransferredSource)>> = HashMap::new();
+    type Files = Vec<(PathBuf, TransferredSource)>;
+    let mut by_audio: HashMap<[u8; 32], Files> = HashMap::new();
+    let mut by_file: HashMap<([u8; 32], u64), Files> = HashMap::new();
     for (path, source) in library
         .map_or(&[][..], |l| l.files.as_slice())
         .iter()

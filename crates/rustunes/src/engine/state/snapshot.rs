@@ -200,7 +200,7 @@ fn digest(value: &Value) -> Result<[u8; 32]> {
         "snapshot hash must be canonical SHA256"
     );
     let mut hash = [0; 32];
-    for (i, part) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (i, part) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         hash[i] = u8::from_str_radix(std::str::from_utf8(part)?, 16)?;
     }
     ensure!(hash != [0; 32], "missing snapshot evidence hash");

@@ -102,6 +102,8 @@ pub(crate) struct Member {
 }
 
 /// A member's source, read again from its file after planning.
+// One per member of a batch.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Audio {
     /// An ALAC M4A: its fingerprint and tags.
     Alac {

@@ -700,7 +700,7 @@ fn coordination_lifecycle_phases_and_single_active() {
     assert_eq!(c.evidence, evidence);
     assert_eq!(c.outcome, None);
     assert_eq!(j.active_coordination().unwrap(), Some(c.clone()));
-    assert_eq!(j.coordinations().unwrap(), [c.clone()]);
+    assert_eq!(j.coordinations().unwrap(), std::slice::from_ref(&c));
     assert_eq!(j.route_owner().unwrap(), Some(id.as_i64()));
     // Only one Active coordination.
     let error = failure(j.begin_coordination(CoordinationKind::Clear, b"two", evidence, 14));
@@ -1028,7 +1028,7 @@ fn removed_targets_stay_reserved_and_are_never_reallocated() {
     assert_eq!(j.active_bindings().unwrap().len(), 1);
     // Reservation encodings match the observed ones: 8-byte ids, folded paths.
     let ids = reservation_values(&j.connection, 1).unwrap();
-    assert!(ids.contains(&track.to_be_bytes().to_vec()));
+    assert!(ids.contains(track.to_be_bytes().as_slice()));
     let paths = reservation_values(&j.connection, 3).unwrap();
     assert!(paths.contains(path.to_ascii_lowercase().as_bytes()));
     drop(j);

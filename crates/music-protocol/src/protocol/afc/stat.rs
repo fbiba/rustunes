@@ -71,7 +71,7 @@ pub fn decode_stat(request: &[u8], reply: &[u8], path: &str) -> Result<AssetStat
         "AFC attribute count"
     );
     let mut attrs = BTreeMap::new();
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         ensure!(
             !pair[0].is_empty()
                 && pair[0].len() <= 256
@@ -144,7 +144,7 @@ pub fn parse_attributes(bytes: &[u8]) -> Result<Attributes> {
         "invalid attribute field count"
     );
     let mut attrs = Attributes::new();
-    for pair in fields.chunks_exact(2) {
+    for pair in fields.as_chunks::<2>().0 {
         ensure!(
             !pair[0].is_empty()
                 && attrs
@@ -647,16 +647,16 @@ mod tests {
             frame.extend(payload);
             frame
         };
-        let valid = make(b"st_ifmt\0S_IFREG\0st_size\059890\0st_mtime\0100\0");
+        let valid = make(b"st_ifmt\0S_IFREG\0st_size\x0059890\0st_mtime\x00100\0");
         let AssetStat::Present(attributes) = decode_stat(&request, &valid, path).unwrap() else {
             panic!("not present")
         };
         assert_eq!(attributes.get("st_size").unwrap(), "59890");
         for invalid in [
-            b"st_size\059890\0st_size\059890\0".as_slice(),
-            b"st_size\059890",
-            b"\059890\0",
-            b"st_size\059890\0dangling\0",
+            b"st_size\x0059890\0st_size\x0059890\0".as_slice(),
+            b"st_size\x0059890",
+            b"\x0059890\0",
+            b"st_size\x0059890\0dangling\0",
         ] {
             assert!(decode_stat(&request, &make(invalid), path).is_err());
         }

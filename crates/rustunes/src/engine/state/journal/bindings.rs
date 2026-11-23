@@ -284,12 +284,12 @@ pub(super) fn validate(c: &Connection) -> Result<()> {
                     attempt.prepared.kind == AttemptKind::Insert
                         && parent.is_none()
                         && prior.is_none()
-                        && binding.receipt_kind == BindingReceiptKind::InsertVerification
+                        && binding.receipt_kind == BindingReceiptKind::Insert
                 } else {
                     attempt.prepared.kind == AttemptKind::Artwork
                         && parent == Some(id)
                         && prior == Some(version - 1)
-                        && binding.receipt_kind == BindingReceiptKind::ArtworkVerification
+                        && binding.receipt_kind == BindingReceiptKind::Artwork
                 },
                 "binding version lifecycle/receipt kind differs from attempt"
             );
@@ -298,8 +298,8 @@ pub(super) fn validate(c: &Connection) -> Result<()> {
             let provenance: i64 = r.get(9)?;
             ensure!(
                 match provenance {
-                    2 => binding.receipt_kind == BindingReceiptKind::InsertBatchVerification,
-                    3 => binding.receipt_kind == BindingReceiptKind::PullVerification,
+                    2 => binding.receipt_kind == BindingReceiptKind::InsertBatch,
+                    3 => binding.receipt_kind == BindingReceiptKind::Pull,
                     _ => false,
                 },
                 "unlinked binding receipt kind differs from provenance"

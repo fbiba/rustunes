@@ -1494,10 +1494,12 @@ impl Catalogue {
                 group.rep = next;
             }
         }
-        if new != 0 && !created && self.members(class, new, item).is_empty() {
-            if let Some(group) = self.groups.get_mut(&class).and_then(|g| g.get_mut(&new)) {
-                group.rep = item;
-            }
+        if new != 0
+            && !created
+            && self.members(class, new, item).is_empty()
+            && let Some(group) = self.groups.get_mut(&class).and_then(|g| g.get_mut(&new))
+        {
+            group.rep = item;
         }
         if let Some(record) = self.items.get_mut(&item) {
             file_under(record, class, new);

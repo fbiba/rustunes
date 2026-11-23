@@ -189,7 +189,7 @@ fn endpoint(
                             &request,
                             AfcOpcode::Data,
                             vec![],
-                            b"st_ifmt\0S_IFREG\0st_size\00\0".to_vec(),
+                            b"st_ifmt\0S_IFREG\0st_size\x000\0".to_vec(),
                         )
                         .await;
                         continue;

@@ -100,6 +100,8 @@ enum MessageFormat {
     Json,
 }
 
+// Parsed once per run.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum MetadataCommand {
     /// Plan a complete typed metadata request against saved owned audio; never execute.
@@ -149,6 +151,8 @@ enum ConfigCommand {
     Library { directory: Option<PathBuf> },
 }
 
+// Parsed once per run.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Edit explicit fields of a track on the phone, or plan a typed metadata request.
@@ -1870,6 +1874,7 @@ async fn verify_command(
     Ok(success)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_command(
     path: &std::path::Path,
     saved: &std::path::Path,

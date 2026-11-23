@@ -591,7 +591,9 @@ fn decode_text(encoding: u8, data: &[u8], version: u8) -> Result<String> {
             };
             ensure!(raw.len() % 2 == 0, "odd UTF16 span");
             let words: Vec<u16> = raw
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| {
                     if le {
                         u16::from_le_bytes([b[0], b[1]])

@@ -32,7 +32,7 @@ pub fn digest(s: &str) -> Result<[u8; 32]> {
         "noncanonical SHA256"
     );
     let mut out = [0; 32];
-    for (i, p) in s.as_bytes().chunks_exact(2).enumerate() {
+    for (i, p) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         out[i] = u8::from_str_radix(std::str::from_utf8(p)?, 16)?;
     }
     ensure!(out != [0; 32], "zero evidence hash");

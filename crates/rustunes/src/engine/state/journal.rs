@@ -229,28 +229,28 @@ pub struct Attempt {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BindingReceiptKind {
-    InsertVerification,
-    ArtworkVerification,
+    Insert,
+    Artwork,
     /// The first version of a binding that an insert batch created.
-    InsertBatchVerification,
+    InsertBatch,
     /// The first version of a binding a pull recorded from a fresh capture.
-    PullVerification,
+    Pull,
 }
 impl BindingReceiptKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::InsertVerification => "insert_verification",
-            Self::ArtworkVerification => "artwork_verification",
-            Self::InsertBatchVerification => "insert_batch_verification",
-            Self::PullVerification => "pull_verification",
+            Self::Insert => "insert_verification",
+            Self::Artwork => "artwork_verification",
+            Self::InsertBatch => "insert_batch_verification",
+            Self::Pull => "pull_verification",
         }
     }
     fn from_number(n: i64) -> Result<Self> {
         Ok(match n {
-            1 => Self::InsertVerification,
-            2 => Self::ArtworkVerification,
-            3 => Self::InsertBatchVerification,
-            4 => Self::PullVerification,
+            1 => Self::Insert,
+            2 => Self::Artwork,
+            3 => Self::InsertBatch,
+            4 => Self::Pull,
             _ => bail!("invalid binding receipt kind"),
         })
     }

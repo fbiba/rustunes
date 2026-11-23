@@ -96,7 +96,8 @@ fn claim(content: &Content, anchor: u32) -> CompletionEvidence {
         receipt_sha256: [9; 32],
     }
 }
-fn claims(j: &Journal, id: InsertBatchId, ordinals: &[usize]) -> Vec<(usize, CompletionEvidence)> {
+type Claims = Vec<(usize, CompletionEvidence)>;
+fn claims(j: &Journal, id: InsertBatchId, ordinals: &[usize]) -> Claims {
     claims_at(j, id, ordinals, 14)
 }
 fn claims_at(
@@ -293,7 +294,9 @@ fn insert_batch_settles_verified_binds_every_target_and_a_removal_batch_retires_
     assert_eq!(j.outstanding_insert_batch().unwrap().unwrap().id, id);
     assert_eq!(j.insert_batch_counts().unwrap().prepared, 1);
     // Tracks, paths and the new collections are reserved by the batch.
-    let reserved = |j: &Journal| -> Vec<(i64, Vec<u8>, Option<i64>, bool, Option<i64>)> {
+    // namespace, value, attempt, consumed, insert_batch
+    type Reservation = (i64, Vec<u8>, Option<i64>, bool, Option<i64>);
+    let reserved = |j: &Journal| -> Vec<Reservation> {
         j.connection
             .prepare("SELECT namespace,value,attempt,consumed,insert_batch FROM reservations ORDER BY namespace,value")
             .unwrap()
@@ -376,10 +379,7 @@ fn insert_batch_settles_verified_binds_every_target_and_a_removal_batch_retires_
             .unwrap()
             .unwrap();
         assert_eq!(target.binding, Some((active.reference.id, 1)), "{ordinal}");
-        assert_eq!(
-            active.binding.receipt_kind,
-            BindingReceiptKind::InsertBatchVerification
-        );
+        assert_eq!(active.binding.receipt_kind, BindingReceiptKind::InsertBatch);
         assert_eq!(active.binding.receipt_sha256, [9; 32]);
         assert_eq!(active.binding.media_anchor, 14);
         assert!(active.binding.content == target.target.content);
@@ -1068,7 +1068,7 @@ fn settlement_checks_every_claim_and_is_all_or_nothing() {
     let mut j = created(&t);
     let id = started(&mut j, &[4, 5, 6]);
     let good = claims(&j, id, &[0, 1, 2]);
-    let with = |edit: &dyn Fn(&mut Vec<(usize, CompletionEvidence)>)| {
+    let with = |edit: &dyn Fn(&mut Claims)| {
         let mut claims = claims(&j, id, &[0, 1, 2]);
         edit(&mut claims);
         claims

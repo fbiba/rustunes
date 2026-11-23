@@ -108,7 +108,8 @@ impl PendingCompletionReceipt {
 #[derive(Debug)]
 pub struct PendingCompletionFailure {
     error: anyhow::Error,
-    evidence: PendingCompletionEvidence,
+    // Boxed so the `Err` a session returns stays small.
+    evidence: Box<PendingCompletionEvidence>,
 }
 impl PendingCompletionFailure {
     pub fn evidence(&self) -> &PendingCompletionEvidence {
@@ -147,12 +148,16 @@ fn remaining(control: &super::super::transfer::CaptureControl) -> Duration {
     control.deadline.saturating_duration_since(Instant::now())
 }
 fn reserve_frame(frames: &AtomicUsize) -> Result<()> {
-    frames
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-            (value < MAX_FRAMES).then_some(value + 1)
-        })
-        .map(|_| ())
-        .map_err(|_| anyhow::anyhow!("pending ATC frame count exhausted"))
+    // The loop `fetch_update` runs; its successor `try_update` needs a newer
+    // Rust than the crate supports.
+    let mut value = frames.load(Ordering::SeqCst);
+    loop {
+        ensure!(value < MAX_FRAMES, "pending ATC frame count exhausted");
+        match frames.compare_exchange_weak(value, value + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(()),
+            Err(now) => value = now,
+        }
+    }
 }
 
 /// Force the selectable worker to suspend at every mutation boundary. On its
@@ -367,7 +372,10 @@ impl PendingAudioDemand {
         let evidence = snapshot(&evidence);
         match result {
             Ok(()) => Ok(PendingCompletionReceipt { evidence }),
-            Err(error) => Err(PendingCompletionFailure { error, evidence }),
+            Err(error) => Err(PendingCompletionFailure {
+                error,
+                evidence: Box::new(evidence),
+            }),
         }
     }
 }
@@ -546,26 +554,27 @@ impl PendingWriter {
         Ok(())
     }
     fn retain_current(&mut self) -> Result<()> {
-        if let Some(current) = self.current.as_mut() {
-            if !current.retention_attempted && !current.accepted.is_empty() {
-                current.retention_attempted = true;
-                let suffix = if current.accepted.len() == current.frame.len() {
-                    "accepted.atc"
-                } else {
-                    "accepted-partial.atc"
-                };
-                let path = self
-                    .trace
-                    .join(format!("{:03}-{suffix}", current.frame_index));
-                if self.output.is_some() {
-                    current
-                        .accepted_reservation
-                        .take()
-                        .context("missing pending accepted-byte reservation")?
-                        .write(&path, &current.accepted)?;
-                } else {
-                    private_write(&path, &current.accepted)?;
-                }
+        if let Some(current) = self.current.as_mut()
+            && !current.retention_attempted
+            && !current.accepted.is_empty()
+        {
+            current.retention_attempted = true;
+            let suffix = if current.accepted.len() == current.frame.len() {
+                "accepted.atc"
+            } else {
+                "accepted-partial.atc"
+            };
+            let path = self
+                .trace
+                .join(format!("{:03}-{suffix}", current.frame_index));
+            if self.output.is_some() {
+                current
+                    .accepted_reservation
+                    .take()
+                    .context("missing pending accepted-byte reservation")?
+                    .write(&path, &current.accepted)?;
+            } else {
+                private_write(&path, &current.accepted)?;
             }
         }
         Ok(())

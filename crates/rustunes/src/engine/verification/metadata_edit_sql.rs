@@ -687,6 +687,7 @@ impl Model<'_> {
     }
 
     /// Albums and album artists are matched by the wire sync id.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_by_sync(
         &mut self,
         class: Class,

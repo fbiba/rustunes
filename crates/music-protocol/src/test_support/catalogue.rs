@@ -461,10 +461,11 @@ impl NativeFixture {
         }
         for kind in ["table", "index", "view"] {
             for r in &schema {
-                if r[0] == kind && r[1] != "sqlite_stat1" {
-                    if let Some(sql) = r[3].as_str() {
-                        c.execute_batch(sql).unwrap();
-                    }
+                if r[0] == kind
+                    && r[1] != "sqlite_stat1"
+                    && let Some(sql) = r[3].as_str()
+                {
+                    c.execute_batch(sql).unwrap();
                 }
             }
         }
@@ -560,5 +561,11 @@ impl NativeFixture {
             "synthetic fixture differs from exact native schema"
         );
         Self { dir, before, after }
+    }
+}
+
+impl Default for NativeFixture {
+    fn default() -> Self {
+        Self::new()
     }
 }

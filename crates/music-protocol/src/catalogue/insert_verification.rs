@@ -13,6 +13,9 @@ use crate::{
     media::metadata::{Metadata, ScalarMetadata},
 };
 
+/// What takes the changes listening made to a track's statistics.
+type ListeningCheck<'a> = &'a dyn Fn(&PlaybackStatistics, &PlaybackStatistics) -> Result<()>;
+
 pub struct ExpectedInsert<'a> {
     pub track_id: u64,
     pub album_id: u64,
@@ -30,6 +33,8 @@ pub struct ExpectedInsert<'a> {
 /// What an inserted row must say: an ALAC source's own tags and PCM duration,
 /// or the tags another codec's source projects with the display duration its
 /// insert sent (an MP3's coded duration).
+// A `Copy` view passed by value; boxing would take `Copy` away.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 pub enum ExpectedSource<'a> {
     Alac(&'a Metadata),
@@ -250,7 +255,7 @@ fn verify_insert_with_policy(
     after: &Catalog,
     expected: &ExpectedInsert<'_>,
     legacy_composer_sort: bool,
-    listening: Option<&dyn Fn(&PlaybackStatistics, &PlaybackStatistics) -> Result<()>>,
+    listening: Option<ListeningCheck<'_>>,
 ) -> Result<VerifiedInsert> {
     ensure!(
         before.database_pid() == after.database_pid()
@@ -443,7 +448,7 @@ fn preserve_insert_tracks(
     after: &Catalog,
     after_tracks: &BTreeMap<u64, &Track>,
     inserted: &BTreeSet<u64>,
-    listening: Option<&dyn Fn(&PlaybackStatistics, &PlaybackStatistics) -> Result<()>>,
+    listening: Option<ListeningCheck<'_>>,
     declared: &Declared<'_>,
 ) -> Result<(Vec<RecentCounterReset>, Vec<String>, Vec<CaseRename>)> {
     let prior_ids = before
@@ -1196,7 +1201,7 @@ fn verify_batch(
     locationless: &BTreeSet<u64>,
     removed: &BTreeSet<u64>,
     covers: &BTreeMap<u64, u32>,
-    listening: Option<&dyn Fn(&PlaybackStatistics, &PlaybackStatistics) -> Result<()>>,
+    listening: Option<ListeningCheck<'_>>,
 ) -> Result<VerifiedInsertBatch> {
     ensure!(!expected.is_empty(), "insert batch has no targets");
     ensure!(

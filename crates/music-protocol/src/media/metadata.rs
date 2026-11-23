@@ -820,10 +820,7 @@ mod tests {
         };
         let same = read(&["One comment", "One comment"]);
         assert_eq!(same.comment, ["One comment", "One comment"]);
-        assert_eq!(
-            same.projected().unwrap().comment.as_deref(),
-            Some("One comment")
-        );
+        assert_eq!(same.projected().unwrap().comment, Some("One comment"));
         let different = read(&["One comment", "Another"]);
         assert!(
             different

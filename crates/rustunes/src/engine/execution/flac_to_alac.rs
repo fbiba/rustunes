@@ -182,6 +182,8 @@ impl Directory {
 
 /// Free bytes in the directory `path` (where the conversions go), for a
 /// batch's estimate.
+// statvfs's fields are narrower on some targets.
+#[allow(clippy::useless_conversion)]
 pub(crate) fn available(path: &Path) -> Result<u64> {
     let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };

@@ -279,6 +279,8 @@ fn stat_at(parent: &File, name: &CString) -> Result<Option<libc::stat>> {
         }
     }
 }
+// libc's stat fields are narrower on some targets (aarch64 Linux, macOS).
+#[allow(clippy::unnecessary_cast)]
 fn identity(metadata: &Metadata, named: &libc::stat) -> bool {
     metadata.dev() == named.st_dev as u64
         && metadata.ino() == named.st_ino as u64
@@ -297,6 +299,8 @@ fn stable(a: &Metadata, b: &Metadata) -> bool {
         && a.ctime() == b.ctime()
         && a.ctime_nsec() == b.ctime_nsec()
 }
+// libc's stat fields are narrower on some targets (aarch64 Linux, macOS).
+#[allow(clippy::unnecessary_cast)]
 fn stable_named(metadata: &Metadata, named: &libc::stat) -> bool {
     identity(metadata, named)
         && metadata.nlink() == named.st_nlink as u64

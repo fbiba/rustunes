@@ -187,7 +187,7 @@ impl Fixture {
         )
     }
     fn refuses(&self, needle: &str) {
-        let error = self.check().err().expect("must refuse");
+        let error = self.check().expect_err("must refuse");
         assert!(format!("{error:#}").contains(needle), "{error:#}");
     }
 
@@ -452,8 +452,7 @@ fn writable_journal_handle_cannot_produce_historical_attribution() {
         &f.original,
         &f.prior_inputs,
     )
-    .err()
-    .expect("writable must refuse");
+    .expect_err("writable must refuse");
     assert!(format!("{error:#}").contains("read-only"), "{error:#}");
 }
 #[test]

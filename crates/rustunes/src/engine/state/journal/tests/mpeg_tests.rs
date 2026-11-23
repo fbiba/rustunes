@@ -134,8 +134,5 @@ fn mpeg_pending_storage_does_not_grant_start_or_completion() {
     let history = j.binding_history(binding.reference.id, 0, 10).unwrap();
     assert_eq!(history.len(), 1);
     assert!(history[0].binding.content == p.content);
-    assert_eq!(
-        history[0].binding.receipt_kind,
-        BindingReceiptKind::InsertVerification
-    );
+    assert_eq!(history[0].binding.receipt_kind, BindingReceiptKind::Insert);
 }

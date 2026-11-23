@@ -198,6 +198,7 @@ impl Wire {
         })
     }
 }
+#[allow(clippy::too_many_arguments)]
 pub(super) fn verify(
     p: &PreparedAttempt,
     source: &Metadata,

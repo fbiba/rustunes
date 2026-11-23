@@ -338,17 +338,12 @@ async fn continue_run(
         Box::pin(run_ordinary(
             &options,
             &journal,
-            &identity,
+            identity,
             engine,
             |deadline, cancelled| {
-                current::capture_with_artwork_controlled(
-                    &state_path,
-                    &identity,
-                    deadline,
-                    cancelled,
-                )
+                current::capture_with_artwork_controlled(&state_path, identity, deadline, cancelled)
             },
-            || Journal::open(options.journal, &identity),
+            || Journal::open(options.journal, identity),
         ))
         .await?
     };

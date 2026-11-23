@@ -73,10 +73,10 @@ pub fn inspect(input: &mut (impl Read + Seek), size: u64) -> Result<OtherCodec> 
         (8..=MAX_FILE_BYTES).contains(&size),
         "unsupported MPEG input size"
     );
-    if size >= 12 {
-        if let Some(layout) = crate::media::container::inspect(input, size)? {
-            return Ok(OtherCodec::Encoded(layout.encoded));
-        }
+    if size >= 12
+        && let Some(layout) = crate::media::container::inspect(input, size)?
+    {
+        return Ok(OtherCodec::Encoded(layout.encoded));
     }
     input.seek(SeekFrom::Start(0))?;
     let mut first = [0; 10];

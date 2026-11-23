@@ -259,7 +259,7 @@ fn seek_header(frame: &[u8], h: &Header) -> SeekHeader {
                     variable: true,
                     frames: be32(body, at + 14).unwrap_or(0),
                     lame: None,
-                    vbri_delay: if delay > floor { delay - floor } else { 0 },
+                    vbri_delay: delay.saturating_sub(floor),
                 };
             }
             _ => {}
@@ -575,7 +575,7 @@ fn search(
             let at = (i - 1) * channels;
             if i < n {
                 let candidate = (base + 1).saturating_sub(k);
-                if !(cd && candidate % 588 != 0) {
+                if !(cd && !candidate.is_multiple_of(588)) {
                     if fallback == 0 {
                         fallback = candidate;
                     }

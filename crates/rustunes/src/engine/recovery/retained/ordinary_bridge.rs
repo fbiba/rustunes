@@ -12,6 +12,7 @@ pub(super) struct CatalogProof {
     pub(super) managed_preservation_required: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn verify_catalog(
     attempt: &Attempt,
     retained: &RetainedRun,

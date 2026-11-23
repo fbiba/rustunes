@@ -140,7 +140,7 @@ fn metadata_batch_settles_verified_and_changes_no_binding_or_reservation() {
     assert_eq!(batch.evidence, Path::new("/run/metadata-fixture"));
     assert!(batch.ready_receipt.is_none() && batch.signature.is_none());
     assert_eq!(j.outstanding_metadata_batch().unwrap().unwrap(), batch);
-    assert_eq!(j.metadata_batches().unwrap(), [batch.clone()]);
+    assert_eq!(j.metadata_batches().unwrap(), std::slice::from_ref(&batch));
     // Prepared owns the journal.
     assert!(
         failure(try_prepare_insert(&mut j, alac_content(9)))

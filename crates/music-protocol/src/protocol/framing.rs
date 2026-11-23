@@ -42,12 +42,12 @@ impl std::ops::DerefMut for ReceivedBuffer {
 }
 impl Drop for ReceivedBuffer {
     fn drop(&mut self) {
-        if let Some((reservation, path)) = self.retention.take() {
-            if !self.bytes.is_empty() {
-                // A dropped future cannot report this I/O result. The owner
-                // still must treat cancellation as incomplete, never success.
-                let _ = reservation.write(&path, &self.bytes);
-            }
+        if let Some((reservation, path)) = self.retention.take()
+            && !self.bytes.is_empty()
+        {
+            // A dropped future cannot report this I/O result. The owner
+            // still must treat cancellation as incomplete, never success.
+            let _ = reservation.write(&path, &self.bytes);
         }
     }
 }
@@ -68,6 +68,13 @@ impl IdeviceService for Atc {
         })
     }
 }
+
+/// A live transport's halves, and its output allowance.
+type PendingParts = (
+    tokio::io::ReadHalf<Box<dyn ReadWrite>>,
+    tokio::io::WriteHalf<Box<dyn ReadWrite>>,
+    Option<super::trace::OutputAllowance>,
+);
 
 impl Atc {
     /// Attach only at the crate's fresh transport construction seam. The normal
@@ -155,11 +162,7 @@ impl Atc {
     pub(crate) fn into_pending_parts(
         self,
         control: &super::transfer::CaptureControl,
-    ) -> Result<(
-        tokio::io::ReadHalf<Box<dyn ReadWrite>>,
-        tokio::io::WriteHalf<Box<dyn ReadWrite>>,
-        Option<super::trace::OutputAllowance>,
-    )> {
+    ) -> Result<PendingParts> {
         self.ensure_output_control(control)?;
         if self.unusable || !self.received.is_empty() || self.received.retention.is_some() {
             bail!("pending transport split after a failed or partial operation");

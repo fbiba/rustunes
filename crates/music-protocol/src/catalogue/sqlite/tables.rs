@@ -269,6 +269,12 @@ impl Budget {
         Ok(())
     }
 }
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 fn install_progress(
     c: &Connection,
     deadline: Instant,
@@ -649,7 +655,7 @@ fn analyze_copies(
 ) -> Result<(Snapshot, Instant)> {
     b.check()?;
     let c = Connection::open_with_flags(
-        &path,
+        path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -672,7 +678,7 @@ fn analyze_copies(
     }
     let deadline = b.deadline.min(Instant::now() + Duration::from_secs(30));
     install_progress(&c, deadline, b.cancelled.clone())?;
-    let policy = controlled.then_some((&*b, deadline));
+    let policy = controlled.then_some((b, deadline));
     let schema_rows = |sql: &str, cap| match policy {
         None => plain_rows(&c, sql, cap),
         Some(_) => plain_rows_checked(&c, sql, cap, policy),

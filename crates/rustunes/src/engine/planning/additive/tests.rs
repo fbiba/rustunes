@@ -981,7 +981,7 @@ fn composer_plan_preserves_independent_sort_and_reports_bound_canonicalization()
 fn add_only_pending_cover_requires_unchanged_owned_insertion_and_no_cover_or_blocker() {
     let source = fingerprint::read(&fixture()).unwrap();
     let mut binding = Binding {
-        receipt_kind: crate::engine::state::journal::BindingReceiptKind::InsertVerification,
+        receipt_kind: crate::engine::state::journal::BindingReceiptKind::Insert,
         content: Content {
             source: (source.clone()).into(),
             track_pid: 123,
@@ -1046,7 +1046,7 @@ fn ownership_requires_exact_verified_binding() {
     };
     let mut journal = JournalView {
         active_bindings: vec![Binding {
-            receipt_kind: crate::engine::state::journal::BindingReceiptKind::InsertVerification,
+            receipt_kind: crate::engine::state::journal::BindingReceiptKind::Insert,
             content,
             receipt_sha256: [1; 32],
             media_anchor: 13,

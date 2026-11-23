@@ -246,7 +246,9 @@ impl Reader {
                     1 => {
                         ensure!(size.is_multiple_of(2), "odd UTF-16 byte count");
                         let units: Vec<u16> = child[40..]
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|chunk| match self.order {
                                 Order::Little => u16::from_le_bytes([chunk[0], chunk[1]]),
                                 Order::Big => u16::from_be_bytes([chunk[0], chunk[1]]),

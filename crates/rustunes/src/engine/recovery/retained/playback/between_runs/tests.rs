@@ -505,7 +505,8 @@ fn the_history_a_clear_emptied_counts_again_from_none() {
 
 #[test]
 fn changes_listening_cannot_explain_are_refused() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut Tables)>)> = vec![
+    type Edit = Box<dyn Fn(&mut Tables)>;
+    let cases: Vec<(&str, Edit)> = vec![
         (
             "recent counter is neither kept nor cleared before the plays",
             Box::new(|b| change(b, "item_stats", "item_pid", 2, "play_count_recent", i(5))),

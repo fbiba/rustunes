@@ -1647,9 +1647,9 @@ fn reset_tail_cannot_hide_current_checksum_failure_or_uncommitted_transaction() 
     // refusal proves the commit-boundary guard, not incidental corruption.
     let little_endian = be32(&uncommitted, 0) & 1 == 0;
     let mut sums = [be32(&uncommitted, 24), be32(&uncommitted, 28)];
-    for frame in uncommitted[32..end].chunks_exact_mut(4096 + 24) {
+    for frame in uncommitted[32..end].as_chunks_mut::<{ 4096 + 24 }>().0 {
         for part in [&frame[..8], &frame[24..]] {
-            for chunk in part.chunks_exact(8) {
+            for chunk in part.as_chunks::<8>().0 {
                 let word = |bytes: &[u8]| {
                     let array = bytes.try_into().unwrap();
                     if little_endian {

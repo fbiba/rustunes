@@ -166,7 +166,7 @@ fn a_cover_is_proven_against_what_sync_sends_for_its_source_format() {
     let mp3 = t.0.join("covered.mp3");
     let tagged = [b"ID3\x03\x00\x00".as_slice(), &size, &frame, &audio].concat();
     fs::write(&mp3, tagged).unwrap();
-    let sha256: [u8; 32] = Sha256::digest(&image).into();
+    let sha256: [u8; 32] = Sha256::digest(image).into();
     assert_eq!(source_cover(&mp3), Some((image.len() as u64, sha256)));
     // Without a picture, or in a file no reader takes, there is none.
     let bare = t.0.join("bare.mp3");

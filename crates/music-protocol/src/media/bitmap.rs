@@ -106,7 +106,9 @@ pub fn to_jpeg(bytes: &[u8]) -> Result<Vec<u8>> {
     );
     let rgb: Vec<u8> = image
         .as_raw()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]].map(|value| over_white(value, p[3])))
         .collect();
     encode(&rgb, width, height)

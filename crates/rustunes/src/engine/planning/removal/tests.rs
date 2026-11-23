@@ -713,7 +713,10 @@ fn mixed_mpeg_source_coverage_and_possible_transcode_do_not_enable_prune() {
         m.metadata.title,
         [target.metadata.title.to_ascii_uppercase()]
     );
-    assert_eq!(m.metadata.artist, [target.metadata.artist.clone()]);
+    assert_eq!(
+        m.metadata.artist,
+        std::slice::from_ref(&target.metadata.artist)
+    );
     let coded_ms =
         m.fingerprint.audio.coded_samples * 1000 / u64::from(m.fingerprint.audio.sample_rate);
     assert!(coded_ms.abs_diff(u64::from(target.metadata.total_time_ms)) <= 1000);
@@ -780,7 +783,7 @@ fn typed_mpeg_binding(index: &DeviceAudioIndex) -> Binding {
             artwork: None,
             collection: None,
         },
-        receipt_kind: crate::engine::state::journal::BindingReceiptKind::InsertVerification,
+        receipt_kind: crate::engine::state::journal::BindingReceiptKind::Insert,
         receipt_sha256: [32; 32],
         media_anchor: 13,
     }
@@ -990,7 +993,7 @@ impl MpegPruneFixture {
         let binding = journal.active_verified_bindings().unwrap().remove(0);
         assert_eq!(
             binding.receipt_kind,
-            crate::engine::state::journal::BindingReceiptKind::InsertVerification
+            crate::engine::state::journal::BindingReceiptKind::Insert
         );
         Self {
             sources,

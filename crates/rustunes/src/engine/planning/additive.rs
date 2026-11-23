@@ -759,6 +759,8 @@ fn build_inner_with_control(
         );
         // A source this run cannot send is left out whole, so it is never a
         // replacement either: an earlier version's track stays.
+        // Once per source; a `Decision` is the planner's own result.
+        #[allow(clippy::result_large_err)]
         let prepared = unmatched.then(|| {
             if let Some(refusal) = unconvertible(sources, &source.source) {
                 return Err(conflict("flac_conversion_refused", format!("{refusal:#}")));

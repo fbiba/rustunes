@@ -394,7 +394,7 @@ fn actual_frame_parser_accepts_the_exact_native_cap_and_refuses_one_more_byte() 
     let size = usize::try_from(MAX_AUDIO).unwrap();
     let span = size / 417 * 417;
     let offset = size - span;
-    assert!(offset >= 10 && offset < 417);
+    assert!((10..417).contains(&offset));
     let mut bytes = vec![0; size];
     bytes[..6].copy_from_slice(b"ID3\x04\x00\x00");
     let tag = offset - 10;
@@ -404,7 +404,7 @@ fn actual_frame_parser_accepts_the_exact_native_cap_and_refuses_one_more_byte() 
         (tag >> 7) as u8 & 127,
         tag as u8 & 127,
     ]);
-    for frame in bytes[offset..].chunks_exact_mut(417) {
+    for frame in bytes[offset..].as_chunks_mut::<417>().0 {
         frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0]);
     }
     let (_, facts) = mpeg::inspect(&bytes, &control()).unwrap();

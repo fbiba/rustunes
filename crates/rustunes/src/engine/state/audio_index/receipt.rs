@@ -160,7 +160,7 @@ pub(super) fn hash(text: &str) -> Result<[u8; 32]> {
         "noncanonical receipt digest"
     );
     let mut result = [0; 32];
-    for (at, part) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (at, part) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         result[at] = u8::from_str_radix(std::str::from_utf8(part)?, 16)?;
     }
     Ok(result)
@@ -361,6 +361,7 @@ fn record_ids(records: &[String]) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_rows(
     observed_identity_dto: IdentityDto,
     catalog_dto: CatalogDto,
