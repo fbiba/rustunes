@@ -1,6 +1,6 @@
 [package]
 name = "music-protocol"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Reusable ATC protocol, media and catalogue mechanisms for the native iPhone Music library"
 license.workspace = true
